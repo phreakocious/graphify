@@ -53,6 +53,48 @@ def _make_id(*parts: str) -> str:
     return cleaned.strip("_").lower()
 
 
+def _file_stem(path: Path) -> str:
+    """Return a stem qualified with the parent directory name to avoid ID collisions
+    when multiple files share the same filename in different directories (#550)."""
+    parent = path.parent.name
+    if parent and parent not in (".", ""):
+        return f"{parent}.{path.stem}"
+    return path.stem
+
+
+_TSCONFIG_ALIAS_CACHE: dict[str, dict[str, str]] = {}
+
+
+def _load_tsconfig_aliases(start_dir: Path) -> dict[str, str]:
+    """Walk up from start_dir to find tsconfig.json and return compilerOptions.paths aliases.
+
+    Returns a dict mapping alias prefix (e.g. "@/") to resolved base dir (e.g. "src/").
+    Result is cached by tsconfig path string.
+    """
+    current = start_dir.resolve()
+    for candidate in [current, *current.parents]:
+        tsconfig = candidate / "tsconfig.json"
+        if tsconfig.exists():
+            key = str(tsconfig)
+            if key not in _TSCONFIG_ALIAS_CACHE:
+                try:
+                    data = json.loads(tsconfig.read_text(encoding="utf-8"))
+                    paths = data.get("compilerOptions", {}).get("paths", {})
+                    aliases: dict[str, str] = {}
+                    for alias, targets in paths.items():
+                        if not targets:
+                            continue
+                        # Strip trailing /* from alias and target
+                        alias_prefix = alias.rstrip("/*")
+                        target_base = targets[0].rstrip("/*")
+                        aliases[alias_prefix] = str(candidate / target_base)
+                    _TSCONFIG_ALIAS_CACHE[key] = aliases
+                except Exception:
+                    _TSCONFIG_ALIAS_CACHE[key] = {}
+            return _TSCONFIG_ALIAS_CACHE[key]
+    return {}
+
+
 # ── LanguageConfig dataclass ─────────────────────────────────────────────────
 
 @dataclass
@@ -175,6 +217,7 @@ def _import_python(node, source: bytes, file_nid: str, stem: str, edges: list, s
 
 
 def _import_js(node, source: bytes, file_nid: str, stem: str, edges: list, str_path: str) -> None:
+    resolved_path: "Path | None" = None
     for child in node.children:
         if child.type == "string":
             raw = _read_text(child, source).strip("'\"` ")
@@ -190,12 +233,25 @@ def _import_js(node, source: bytes, file_nid: str, stem: str, edges: list, str_p
                 elif resolved.suffix == ".jsx":
                     resolved = resolved.with_suffix(".tsx")
                 tgt_nid = _make_id(str(resolved))
+                resolved_path = resolved
             else:
-                # Bare/scoped import (node_modules) - use last segment; dropped as external
-                module_name = raw.split("/")[-1]
-                if not module_name:
-                    break
-                tgt_nid = _make_id(module_name)
+                # Check tsconfig.json path aliases (e.g. "@/" → "src/") before treating as external (#575)
+                aliases = _load_tsconfig_aliases(Path(str_path).parent)
+                resolved_alias = None
+                for alias_prefix, alias_base in aliases.items():
+                    if raw == alias_prefix or raw.startswith(alias_prefix + "/"):
+                        rest = raw[len(alias_prefix):].lstrip("/")
+                        resolved_alias = Path(os.path.normpath(Path(alias_base) / rest))
+                        break
+                if resolved_alias is not None:
+                    tgt_nid = _make_id(str(resolved_alias))
+                    resolved_path = resolved_alias
+                else:
+                    # Bare/scoped import (node_modules) - use last segment; dropped as external
+                    module_name = raw.split("/")[-1]
+                    if not module_name:
+                        break
+                    tgt_nid = _make_id(module_name)
             edges.append({
                 "source": file_nid,
                 "target": tgt_nid,
@@ -206,6 +262,32 @@ def _import_js(node, source: bytes, file_nid: str, stem: str, edges: list, str_p
                 "weight": 1.0,
             })
             break
+
+    # Emit symbol-level edges for named imports from local/aliased files.
+    # e.g. `import { Foo, type Bar } from './bar'` → file → Foo, file → Bar (EXTRACTED)
+    # Uses the same _make_id(target_stem, name) key that _extract_generic emits when
+    # defining the symbol, so these edges wire importers directly to existing symbol nodes.
+    if resolved_path is not None:
+        target_stem = _file_stem(resolved_path)
+        line = node.start_point[0] + 1
+        for child in node.children:
+            if child.type == "import_clause":
+                for sub in child.children:
+                    if sub.type == "named_imports":
+                        for spec in sub.children:
+                            if spec.type == "import_specifier":
+                                name_node = spec.child_by_field_name("name")
+                                if name_node:
+                                    sym = _read_text(name_node, source)
+                                    edges.append({
+                                        "source": file_nid,
+                                        "target": _make_id(target_stem, sym),
+                                        "relation": "imports",
+                                        "confidence": "EXTRACTED",
+                                        "source_file": str_path,
+                                        "source_location": f"L{line}",
+                                        "weight": 1.0,
+                                    })
 
 
 def _import_java(node, source: bytes, file_nid: str, stem: str, edges: list, str_path: str) -> None:
