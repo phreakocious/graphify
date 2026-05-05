@@ -4,7 +4,7 @@ import networkx as nx
 from pathlib import Path
 from graphify.build import build_from_json
 from graphify.cluster import cluster
-from graphify.analyze import god_nodes, surprising_connections, _is_concept_node, graph_diff, _surprise_score, _file_category
+from graphify.analyze import god_nodes, surprising_connections, _is_concept_node, _is_rationale_node, graph_diff, _surprise_score, _file_category, suggest_questions
 
 FIXTURES = Path(__file__).parent / "fixtures"
 
@@ -230,3 +230,77 @@ def test_graph_diff_empty_diff():
     assert diff["new_edges"] == []
     assert diff["removed_edges"] == []
     assert diff["summary"] == "no changes"
+
+
+# --- rationale-node gap-detection tests ---
+
+def test_is_rationale_node_via_file_type():
+    G = nx.Graph()
+    G.add_node("rat", label="Computes the score.", file_type="rationale", source_file="m.py")
+    assert _is_rationale_node(G, "rat") is True
+
+
+def test_is_rationale_node_via_edge_relation_only():
+    G = nx.Graph()
+    G.add_node("rat", label="Computes the score.", source_file="m.py")
+    G.add_node("fn", label="compute_score", file_type="code", source_file="m.py")
+    G.add_edge("rat", "fn", relation="rationale_for", confidence="EXTRACTED")
+    assert _is_rationale_node(G, "rat") is True
+
+
+def test_is_rationale_node_returns_false_for_code():
+    G = nx.Graph()
+    G.add_node("fn", label="compute_score", file_type="code", source_file="m.py")
+    G.add_node("other", label="other", file_type="code", source_file="m.py")
+    G.add_edge("fn", "other", relation="calls", confidence="EXTRACTED")
+    assert _is_rationale_node(G, "fn") is False
+
+
+def test_suggest_questions_excludes_rationale_from_isolated():
+    """Rationale nodes attached via single rationale_for edge are not gaps."""
+    G = nx.Graph()
+    # Triangle of well-connected code nodes (no isolated code).
+    for nid in ("a", "b", "c"):
+        G.add_node(nid, label=nid, file_type="code", source_file="m.py")
+    G.add_edge("a", "b", relation="calls", confidence="EXTRACTED", source_file="m.py")
+    G.add_edge("b", "c", relation="calls", confidence="EXTRACTED", source_file="m.py")
+    G.add_edge("a", "c", relation="calls", confidence="EXTRACTED", source_file="m.py")
+    # Rationale orbiters — each has degree 1, but they're not gaps
+    for i in range(5):
+        rid = f"rat{i}"
+        G.add_node(rid, label=f"docstring sentence {i}.", file_type="rationale", source_file="m.py")
+        G.add_edge(rid, "a", relation="rationale_for", confidence="EXTRACTED", source_file="m.py")
+    communities = {0: ["a", "b", "c"] + [f"rat{i}" for i in range(5)]}
+    labels = {0: "alpha"}
+    qs = suggest_questions(G, communities, labels)
+    isolated_qs = [q for q in qs if q.get("type") == "isolated_nodes"]
+    assert isolated_qs == [], f"rationale nodes flagged as isolated: {isolated_qs}"
+
+
+def test_report_skips_docstring_pair_thin_community():
+    """A 2-node community of {1 code, 1 rationale} is a docstring pair, not noise."""
+    from graphify.report import generate
+    G = nx.Graph()
+    G.add_node("fn", label="_gap_ratio()", file_type="code",
+               source_file="m.py", source_location="L10")
+    G.add_node("doc", label="λ₃/λ₂ — gap above Fiedler eigenvalue.",
+               file_type="rationale", source_file="m.py", source_location="L9")
+    G.add_edge("doc", "fn", relation="rationale_for", confidence="EXTRACTED",
+               source_file="m.py")
+    # Padding community with ≥3 code nodes so we don't trip a different thin-community case
+    for i, lbl in enumerate(("X", "Y", "Z", "W")):
+        G.add_node(lbl.lower(), label=lbl, file_type="code", source_file="o.py",
+                   source_location=f"L{i+1}")
+    G.add_edge("x", "y", relation="calls", confidence="EXTRACTED", source_file="o.py")
+    G.add_edge("y", "z", relation="calls", confidence="EXTRACTED", source_file="o.py")
+    G.add_edge("z", "w", relation="calls", confidence="EXTRACTED", source_file="o.py")
+    communities = {0: ["fn", "doc"], 1: ["x", "y", "z", "w"]}
+    cohesion = {0: 1.0, 1: 1.0}
+    labels = {0: "GapRatio", 1: "Other"}
+    detection = {"total_files": 2, "total_words": 100, "needs_graph": True, "warning": None}
+    tokens = {"input": 0, "output": 0}
+    report = generate(G, communities, cohesion, labels, [], [], detection, tokens, "./p")
+    assert "Thin community" not in report, "docstring pair flagged as thin community"
+    if "## Knowledge Gaps" in report:
+        gaps = report.split("## Knowledge Gaps")[-1]
+        assert "λ₃/λ₂" not in gaps, "rationale node flagged as isolated"

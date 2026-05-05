@@ -36,6 +36,32 @@ def _is_file_node(G: nx.Graph, node_id: str) -> bool:
     return False
 
 
+def _is_rationale_node(G: nx.Graph, node_id: str) -> bool:
+    """Rationale nodes (extracted docstrings/comments) are connected to the
+    code they document via a single `rationale_for` edge. That's their
+    canonical shape — flagging them as "isolated" or "thin community"
+    misreads design intent as a graph gap.
+
+    Trusts `file_type` when set (the extractor's own classification),
+    falling back to an edge-relation heuristic only when `file_type` is
+    missing — never overrides an explicit non-rationale tag, since a
+    code node with only a single `rationale_for` edge would otherwise
+    be misclassified.
+    """
+    attrs = G.nodes[node_id]
+    ft = attrs.get("file_type")
+    if ft == "rationale":
+        return True
+    if ft:
+        return False  # explicit non-rationale tag wins
+    if isinstance(G, nx.DiGraph):
+        rels = [d.get("relation") for _, _, d in G.in_edges(node_id, data=True)]
+        rels += [d.get("relation") for _, _, d in G.out_edges(node_id, data=True)]
+    else:
+        rels = [d.get("relation") for _, _, d in G.edges(node_id, data=True)]
+    return bool(rels) and all(r == "rationale_for" for r in rels)
+
+
 def god_nodes(G: nx.Graph, top_n: int = 10) -> list[dict]:
     """Return the top_n most-connected real entities - the core abstractions.
 
@@ -417,9 +443,16 @@ def suggest_questions(
             })
 
     # 4. Isolated or weakly-connected nodes → exploration questions
+    # Rationale nodes are excluded — they connect to the code they document
+    # via exactly one `rationale_for` edge by design, so flagging them as
+    # "isolated" produces useless questions like "what connects [docstring
+    # sentence] to the rest of the system?"
     isolated = [
         n for n in G.nodes()
-        if G.degree(n) <= 1 and not _is_file_node(G, n) and not _is_concept_node(G, n)
+        if G.degree(n) <= 1
+        and not _is_file_node(G, n)
+        and not _is_concept_node(G, n)
+        and not _is_rationale_node(G, n)
     ]
     if isolated:
         labels = [G.nodes[n].get("label", n) for n in isolated[:3]]

@@ -132,14 +132,28 @@ def generate(
             ]
 
     # --- Gaps section ---
-    from .analyze import _is_file_node, _is_concept_node
+    from .analyze import _is_file_node, _is_concept_node, _is_rationale_node
 
     isolated = [
         n for n in G.nodes()
-        if G.degree(n) <= 1 and not _is_file_node(G, n) and not _is_concept_node(G, n)
+        if G.degree(n) <= 1
+        and not _is_file_node(G, n)
+        and not _is_concept_node(G, n)
+        and not _is_rationale_node(G, n)
     ]
+
+    def _is_docstring_pair(nodes: list[str]) -> bool:
+        """A 2-node community of {1 code, 1 rationale} is a docstring + the
+        symbol it documents — canonical, not noise."""
+        if len(nodes) != 2:
+            return False
+        a_rat = _is_rationale_node(G, nodes[0])
+        b_rat = _is_rationale_node(G, nodes[1])
+        return a_rat ^ b_rat
+
     thin_communities = {
-        cid: nodes for cid, nodes in communities.items() if len(nodes) < 3
+        cid: nodes for cid, nodes in communities.items()
+        if len(nodes) < 3 and not _is_docstring_pair(nodes)
     }
     gap_count = len(isolated) + len(thin_communities)
 
