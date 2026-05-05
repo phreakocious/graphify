@@ -984,6 +984,8 @@ Then run Steps 5–9 as normal (label communities, generate viz, benchmark, clea
 
 ## For /graphify query
 
+> **Anchor your question with `@<label>` for deterministic traversal.** A query like `query "what calls @probeForward?"` resolves the anchor (using the same matcher as navigate, including path-qualified `@dir/file.ts/Symbol`), uses it as the BFS start, and ignores generic terms in the question. Without an anchor the command falls back to a stopword-filtered term scan that's coarse — the output prints a hint pointing back to navigate. **For most "find X" questions, prefer `graphify navigate "@<label>" out` directly.**
+
 Two traversal modes - choose based on the question:
 
 | Mode | Flag | Best for |

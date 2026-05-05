@@ -1376,6 +1376,20 @@ def main() -> None:
             print("Usage: graphify hook [install|uninstall|status]", file=sys.stderr)
             sys.exit(1)
     elif cmd == "query":
+        if any(a in ("-h", "--help") for a in sys.argv[2:]):
+            print("Usage: graphify query \"<question>\" [--dfs] [--budget N] [--graph path]")
+            print()
+            print("Scoring is term-bag-of-words against node labels + source files.")
+            print("That works well only when the question contains specific identifiers.")
+            print()
+            print("Best results: include `@<label>` tokens directly in the question to")
+            print("anchor the BFS — `query \"what calls @VectorIndex on insertion?\"`")
+            print("starts the traversal at the resolved node and ignores generic terms.")
+            print()
+            print("If no anchor is given, common stopwords (what/how/why/the/is/are/...)")
+            print("are filtered before term-matching, but the result is still a coarse")
+            print("sweep. For deterministic answers, prefer `graphify navigate \"@X\" out`.")
+            return
         if len(sys.argv) < 3:
             print("Usage: graphify query \"<question>\" [--dfs] [--budget N] [--graph path]", file=sys.stderr)
             sys.exit(1)
@@ -1425,12 +1439,62 @@ def main() -> None:
         except Exception as exc:
             print(f"error: could not load graph: {exc}", file=sys.stderr)
             sys.exit(1)
-        terms = [t.lower() for t in question.split() if len(t) > 2]
-        scored = _score_nodes(G, terms)
-        if not scored:
-            print("No matching nodes found.")
-            sys.exit(0)
-        start = [nid for _, nid in scored[:5]]
+        # Anchor extraction: `@<label>` tokens in the question are
+        # explicit traversal starts (resolved via the same matcher
+        # navigate uses). Without anchors `query` is a bag-of-words
+        # term scan that returns generic top-N hits (`.len()`, `.new()`,
+        # `.push()`); with anchors it's a deterministic BFS from a
+        # concrete node, which is what most users actually want.
+        from graphify.navigate import resolve_focus, label_index
+        anchors_raw = [t for t in question.split() if t.startswith("@") and len(t) > 1]
+        anchor_starts: list[str] = []
+        if anchors_raw:
+            idx = label_index(G)
+            for raw in anchors_raw:
+                chosen, candidates, _mt, _alts = resolve_focus(G, idx, raw)
+                if chosen:
+                    anchor_starts.append(chosen)
+                elif candidates:
+                    print(f"warning: anchor `{raw}` is ambiguous "
+                          f"({len(candidates)} matches); ignoring. "
+                          f"qualify with `@<dir>/<file>/<label>` to disambiguate.",
+                          file=sys.stderr)
+
+        # Stopword filter for the term-scoring fallback. The default
+        # English question shape (`what is X?`, `how does Y work?`)
+        # produced low-signal scores: every node with `is` or `does`
+        # in any field tied. Drop the obvious filler so the remaining
+        # nouns/identifiers actually drive ranking.
+        STOPWORDS = {
+            "the", "and", "for", "are", "but", "not", "you", "all",
+            "any", "can", "had", "has", "have", "what", "when", "where",
+            "which", "who", "why", "how", "does", "did", "this", "that",
+            "with", "from", "into", "out", "about", "show", "list", "find",
+            "tell", "give", "look",
+        }
+        terms = [t.lower() for t in question.split()
+                 if len(t) > 2 and t.lower() not in STOPWORDS
+                 and not t.startswith("@")]
+
+        if anchor_starts:
+            start = anchor_starts[:5]
+        else:
+            scored = _score_nodes(G, terms)
+            if not scored:
+                msg = "No matching nodes found."
+                if not terms:
+                    msg += (" Question contained only stopwords — "
+                            "try `query \"what calls @<label>?\"` "
+                            "or use `navigate \"@<label>\" out` instead.")
+                else:
+                    msg += (" Add an `@<label>` anchor to the question "
+                            "for deterministic traversal.")
+                print(msg)
+                sys.exit(0)
+            start = [nid for _, nid in scored[:5]]
+            print(f"_(no `@<label>` anchor — falling back to term scan; "
+                  f"prefer `navigate \"@<label>\"` for focused traversal)_",
+                  file=sys.stderr)
         nodes, edges = (_dfs if use_dfs else _bfs)(G, start, depth=2)
         print(_subgraph_to_text(G, nodes, edges, token_budget=budget))
     elif cmd == "save-result":
