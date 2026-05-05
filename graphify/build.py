@@ -66,7 +66,13 @@ def build_from_json(extraction: dict, *, directed: bool = False) -> nx.Graph:
             edge["target"] = edge["to"]
         if "source" not in edge or "target" not in edge:
             continue
-        src, tgt = edge["source"], edge["target"]
+        # Direction restoration: undirected nx.Graph serialization can swap
+        # source/target. `_src`/`_tgt` attributes (set on add_edge below) are
+        # the authoritative original direction. Prefer them when present so
+        # graphs serialized before the to_json fix still load with correct
+        # edges in DiGraph mode.
+        src = edge.get("_src") or edge["source"]
+        tgt = edge.get("_tgt") or edge["target"]
         # Remap mismatched IDs via normalization before dropping the edge.
         if src not in node_set:
             src = norm_to_id.get(_normalize_id(src), src)

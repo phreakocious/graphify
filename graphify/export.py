@@ -289,6 +289,14 @@ def to_json(G: nx.Graph, communities: dict[int, list[str]], output_path: str) ->
         node["community"] = node_community.get(node["id"])
         node["norm_label"] = _strip_diacritics(node.get("label", "")).lower()
     for link in data["links"]:
+        # Direction restoration: when G is an undirected nx.Graph, NetworkX may
+        # emit source/target in either order — direction is lost. build_from_json
+        # stashes the original direction on `_src`/`_tgt` attributes; restore it
+        # here so every downstream consumer (navigate, MCP, GraphML, neo4j) sees
+        # caller→callee, not the alphabetical-or-insertion-order swap.
+        if "_src" in link and "_tgt" in link:
+            link["source"] = link["_src"]
+            link["target"] = link["_tgt"]
         if "confidence_score" not in link:
             conf = link.get("confidence", "EXTRACTED")
             link["confidence_score"] = _CONFIDENCE_SCORE_DEFAULTS.get(conf, 1.0)
@@ -326,7 +334,9 @@ def to_cypher(G: nx.Graph, output_path: str) -> None:
         ftype = (_ft if _ft and _ft[0].isalpha() else "Entity")
         lines.append(f"MERGE (n:{ftype} {{id: '{node_id_esc}', label: '{label}'}});")
     lines.append("")
-    for u, v, data in G.edges(data=True):
+    # Use directed view so MERGE (a)-[:R]->(b) reflects the original AST direction;
+    # undirected nx.Graph serialization can swap u/v otherwise.
+    for u, v, data in _directed_view(G).edges(data=True):
         rel = re.sub(r"[^A-Za-z0-9_]", "_", data.get("relation", "RELATES_TO").upper())
         conf = _cypher_escape(data.get("confidence", "EXTRACTED"))
         u_esc = _cypher_escape(u)
@@ -385,9 +395,10 @@ def to_html(
             "degree": deg,
         })
 
-    # Build edges list
+    # Build edges list (directed view so vis.js arrows point AST source→target,
+    # not whatever order the undirected adjacency happened to materialise)
     vis_edges = []
-    for u, v, data in G.edges(data=True):
+    for u, v, data in _directed_view(G).edges(data=True):
         confidence = data.get("confidence", "EXTRACTED")
         relation = data.get("relation", "")
         vis_edges.append({
@@ -838,9 +849,10 @@ def to_canvas(
                 "height": 60,
             })
 
-    # Generate edges - only between nodes both in canvas, cap at 200 highest-weight
+    # Generate edges - only between nodes both in canvas, cap at 200 highest-weight.
+    # Directed view so Canvas arrows (fromNode→toNode) match AST direction.
     all_edges_weighted: list[tuple[float, str, str, str]] = []
-    for u, v, edata in G.edges(data=True):
+    for u, v, edata in _directed_view(G).edges(data=True):
         if u in all_canvas_nodes and v in all_canvas_nodes:
             weight = edata.get("weight", 1.0)
             relation = edata.get("relation", "")
@@ -911,7 +923,8 @@ def push_to_neo4j(
             )
             nodes_pushed += 1
 
-        for u, v, data in G.edges(data=True):
+        # Directed view so Neo4j MERGE (a)-[:R]->(b) reflects original direction.
+        for u, v, data in _directed_view(G).edges(data=True):
             rel = _safe_rel(data.get("relation", "RELATED_TO"))
             props = {k: v for k, v in data.items() if isinstance(v, (str, int, float, bool))}
             session.run(
@@ -927,6 +940,26 @@ def push_to_neo4j(
     return {"nodes": nodes_pushed, "edges": edges_pushed}
 
 
+def _directed_view(G: nx.Graph) -> nx.Graph:
+    """Promote an undirected G to a DiGraph using `_src`/`_tgt` edge attributes
+    as the authoritative direction. No-op if G is already directed or carries
+    no direction-tracking attributes. Used by exports where consumers (Gephi,
+    Neo4j, etc.) interpret edge direction — undirected NetworkX serialization
+    can swap source/target arbitrarily.
+    """
+    if G.is_directed():
+        return G
+    has_attrs = any("_src" in d for _, _, d in G.edges(data=True))
+    if not has_attrs:
+        return G
+    D = nx.DiGraph()
+    for n, attrs in G.nodes(data=True):
+        D.add_node(n, **attrs)
+    for u, v, attrs in G.edges(data=True):
+        D.add_edge(attrs.get("_src", u), attrs.get("_tgt", v), **attrs)
+    return D
+
+
 def to_graphml(
     G: nx.Graph,
     communities: dict[int, list[str]],
@@ -936,8 +969,9 @@ def to_graphml(
 
     Community IDs are written as a node attribute so Gephi can colour by community.
     Edge confidence (EXTRACTED/INFERRED/AMBIGUOUS) is preserved as an edge attribute.
+    Direction is preserved via _directed_view (Gephi otherwise sees swapped edges).
     """
-    H = G.copy()
+    H = _directed_view(G).copy()
     node_community = _node_community_map(communities)
     for node_id in H.nodes():
         H.nodes[node_id]["community"] = node_community.get(node_id, -1)
