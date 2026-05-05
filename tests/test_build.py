@@ -39,3 +39,50 @@ def test_build_merges_multiple_extractions():
     G = build([ext1, ext2])
     assert G.number_of_nodes() == 2
     assert G.number_of_edges() == 1
+
+
+def test_imports_to_external_module_creates_stub_node():
+    """Edges with `imports`/`imports_from` relations whose target is an
+    external module (numpy, sys, …) must survive the dangling-edge filter:
+    a synthetic stub node is created so `who-imports-numpy` is queryable.
+    """
+    ext = {
+        "nodes": [{"id": "foo_py", "label": "foo.py", "file_type": "code",
+                   "source_file": "foo.py", "source_location": "L1"}],
+        "edges": [
+            {"source": "foo_py", "target": "numpy", "relation": "imports",
+             "confidence": "EXTRACTED", "source_file": "foo.py",
+             "source_location": "L3", "weight": 1.0},
+            {"source": "foo_py", "target": "json", "relation": "imports_from",
+             "confidence": "EXTRACTED", "source_file": "foo.py",
+             "source_location": "L4", "weight": 1.0},
+        ],
+        "input_tokens": 0, "output_tokens": 0,
+    }
+    G = build_from_json(ext, directed=True)
+    assert "numpy" in G.nodes
+    assert "json" in G.nodes
+    assert G.nodes["numpy"]["file_type"] == "external"
+    assert G.nodes["numpy"]["node_kind"] == "external_module"
+    assert G.has_edge("foo_py", "numpy")
+    assert G.has_edge("foo_py", "json")
+    assert G.edges["foo_py", "numpy"]["relation"] == "imports"
+
+
+def test_non_import_edges_to_unknown_target_still_dropped():
+    """Only `imports`/`imports_from` get the stub treatment. A `calls` edge
+    pointing at an unknown target is a genuine extraction bug and should
+    still be dropped — auto-creating stubs there would mask the bug."""
+    ext = {
+        "nodes": [{"id": "foo_py", "label": "foo.py", "file_type": "code",
+                   "source_file": "foo.py", "source_location": "L1"}],
+        "edges": [
+            {"source": "foo_py", "target": "unknown_fn", "relation": "calls",
+             "confidence": "EXTRACTED", "source_file": "foo.py",
+             "source_location": "L3", "weight": 1.0},
+        ],
+        "input_tokens": 0, "output_tokens": 0,
+    }
+    G = build_from_json(ext, directed=True)
+    assert "unknown_fn" not in G.nodes
+    assert G.number_of_edges() == 0

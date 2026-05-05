@@ -59,6 +59,12 @@ def build_from_json(extraction: dict, *, directed: bool = False) -> nx.Graph:
     # slightly different casing or punctuation than the AST extractor.
     # e.g. "Session_ValidateToken" maps to "session_validatetoken".
     norm_to_id: dict[str, str] = {_normalize_id(nid): nid for nid in node_set}
+    # Edges with `imports`/`imports_from` relations whose target is an
+    # external module (`numpy`, `sys`, …) get a synthetic stub node so the
+    # edge survives the dangling-edge filter below and `who-imports-X` is
+    # answerable. Internal-only edges (`calls`, `uses`, …) still drop on
+    # missing targets — those would be genuine extraction bugs.
+    IMPORT_RELATIONS = {"imports", "imports_from"}
     for edge in extraction.get("edges", []):
         if "source" not in edge and "from" in edge:
             edge["source"] = edge["from"]
@@ -78,8 +84,18 @@ def build_from_json(extraction: dict, *, directed: bool = False) -> nx.Graph:
             src = norm_to_id.get(_normalize_id(src), src)
         if tgt not in node_set:
             tgt = norm_to_id.get(_normalize_id(tgt), tgt)
-        if src not in node_set or tgt not in node_set:
-            continue  # skip edges to external/stdlib nodes - expected, not an error
+        if src not in node_set:
+            continue
+        if tgt not in node_set:
+            if edge.get("relation") in IMPORT_RELATIONS:
+                # Use the raw ID as the label so `numpy` displays as numpy
+                # rather than a normalized stub. file_type=external lets
+                # navigate filter these out of code-only listings.
+                G.add_node(tgt, label=tgt, file_type="external", node_kind="external_module")
+                node_set.add(tgt)
+                norm_to_id[_normalize_id(tgt)] = tgt
+            else:
+                continue
         attrs = {k: v for k, v in edge.items() if k not in ("source", "target")}
         # Preserve original edge direction - undirected graphs lose it otherwise,
         # causing display functions to show edges backwards.
