@@ -1025,6 +1025,8 @@ def main() -> None:
         print("    --graph <path>          path to graph.json (default graphify-out/graph.json)")
         print("  explain \"X\"             plain-language explanation of a node and its neighbors")
         print("    --graph <path>          path to graph.json (default graphify-out/graph.json)")
+        print("  changed [ref]           list code files added/modified/removed since graph extract (or vs git ref)")
+        print("    --graph <path>          path to graph.json (default graphify-out/graph.json)")
         print("  add <url>               fetch a URL and save it to ./raw, then update the graph")
         print("    --author \"Name\"         tag the author of the content")
         print("    --contributor \"Name\"    tag who added it to the corpus")
@@ -1573,6 +1575,119 @@ def main() -> None:
                 print(f"  ... and {len(neighbors_filtered) - limit} more")
         elif dropped > 0:
             print(f"\nNo EXTRACTED edges. {dropped} INFERRED edges hidden (use --include-inferred).")
+
+    elif cmd == "changed":
+        # Lap-3 wishlist #1: surface nodes added/modified/removed since a
+        # reference point (git ref or graph extract). After commits the
+        # agent wants to navigate to the diff, not blind-search for new
+        # symbols.
+        ref: str | None = None
+        graph_path = "graphify-out/graph.json"
+        args = sys.argv[2:]
+        i = 0
+        while i < len(args):
+            a = args[i]
+            if a == "--graph" and i + 1 < len(args):
+                graph_path = args[i + 1]; i += 2
+            elif a.startswith("--"):
+                i += 1
+            else:
+                ref = a; i += 1
+        gp = Path(graph_path).resolve()
+        if not gp.exists():
+            print(f"error: graph file not found: {gp}", file=sys.stderr)
+            sys.exit(1)
+        from collections import defaultdict
+        from graphify.build import build_from_json
+        _raw = json.loads(gp.read_text(encoding="utf-8"))
+        G = build_from_json(_raw, directed=True)
+        # Build resolved-path → [node_ids] index from the graph.
+        file_to_nodes: dict[str, list[str]] = defaultdict(list)
+        for nid, attrs in G.nodes(data=True):
+            sf = attrs.get("source_file")
+            if not sf:
+                continue
+            try:
+                key = str(Path(sf).resolve())
+            except OSError:
+                key = str(sf)
+            file_to_nodes[key].append(nid)
+        root = Path(".").resolve()
+        if ref:
+            import subprocess
+            try:
+                res = subprocess.run(
+                    ["git", "diff", "--name-only", ref],
+                    cwd=str(root), capture_output=True, text=True, timeout=15,
+                )
+                if res.returncode != 0:
+                    print(f"git diff failed: {res.stderr.strip()}", file=sys.stderr)
+                    sys.exit(1)
+                changed_files = [p.strip() for p in res.stdout.splitlines() if p.strip()]
+            except (subprocess.TimeoutExpired, FileNotFoundError):
+                print("git not available or timed out", file=sys.stderr)
+                sys.exit(1)
+            since_label = f"vs {ref}"
+        else:
+            from graphify.detect import CODE_EXTENSIONS
+            graph_mtime = gp.stat().st_mtime
+            changed_files = []
+            for f in root.rglob("*"):
+                if not f.is_file():
+                    continue
+                # Skip hidden and graphify output dirs to keep this fast on
+                # repos with large vendored trees.
+                rel_parts = f.relative_to(root).parts
+                if any(p.startswith(".") and p != "." for p in rel_parts):
+                    continue
+                if "graphify-out" in rel_parts:
+                    continue
+                if f.suffix.lower() not in CODE_EXTENSIONS:
+                    continue
+                try:
+                    if f.stat().st_mtime > graph_mtime:
+                        changed_files.append(str(f.relative_to(root)))
+                except OSError:
+                    continue
+            since_label = "since graph extract"
+        # Bucket files relative to the graph's known set.
+        modified: list[tuple[str, list[str]]] = []
+        added: list[str] = []
+        seen_resolved: set[str] = set()
+        for rel in changed_files:
+            full = (root / rel).resolve()
+            seen_resolved.add(str(full))
+            if str(full) in file_to_nodes and full.exists():
+                modified.append((rel, file_to_nodes[str(full)]))
+            elif full.exists():
+                added.append(rel)
+        removed: list[tuple[str, list[str]]] = []
+        for resolved, nids in file_to_nodes.items():
+            if not Path(resolved).exists():
+                try:
+                    pretty = str(Path(resolved).relative_to(root))
+                except ValueError:
+                    pretty = resolved
+                removed.append((pretty, nids))
+        if not (modified or added or removed):
+            print(f"changed {since_label}: no code files changed.")
+        else:
+            print(f"changed {since_label}: "
+                  f"{len(modified)} modified · {len(added)} added · {len(removed)} removed")
+            for rel, nids in sorted(modified):
+                labels = [G.nodes[n].get("label", n) for n in nids[:5]]
+                more = f" +{len(nids)-5}" if len(nids) > 5 else ""
+                print(f"  M {rel}  ({len(nids)} nodes: {', '.join(labels)}{more})")
+            for rel in sorted(added):
+                print(f"  A {rel}  (not in graph — `graphify update .` to index)")
+            for rel, nids in sorted(removed):
+                labels = [G.nodes[n].get("label", n) for n in nids[:5]]
+                more = f" +{len(nids)-5}" if len(nids) > 5 else ""
+                print(f"  D {rel}  ({len(nids)} stale nodes: {', '.join(labels)}{more})")
+            if added or removed:
+                print("  re-run `graphify update .` to refresh added/removed nodes.")
+            if modified:
+                print("  jump: `graphify navigate \"@<label>\"` for any modified node.")
 
     elif cmd == "add":
         if len(sys.argv) < 3:

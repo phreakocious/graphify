@@ -1324,6 +1324,8 @@ The `files:` table dedups repeated paths — refer to file `a:368` rather than t
 
 **Recency-aware substring ranking.** Substring/fuzzy hits are tie-broken by file recency: matches in files modified within the last week float above same-shape matches in stale files. Combined with the public-name and degree heuristics, the most likely target lands first.
 
+**Find what changed.** `graphify changed [ref]` lists code files added/modified/removed since the last graph extract (or vs a git ref). For each modified file it surfaces the labels of the contained graph nodes — jump straight to the diff with `navigate "@<label>"` rather than blind-search for new symbols.
+
 ### Worked example — recon before commitment (one-shot chain)
 
 You've been asked to extend a class you've never seen. Scout it in a single atomic call:
