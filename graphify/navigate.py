@@ -357,12 +357,24 @@ def _render_frontier_text(data: dict, cursor: Cursor, *, show_ops: bool) -> str:
 
     # Steering hint: if the focus node has no semantic edges but is structurally
     # parental, point at `contains`/`methods` so the agent doesn't bounce off
-    # an apparently-empty file or class. Common case: focusing a file directly.
+    # an apparently-empty file or class. Files-as-nodes are script leaves —
+    # the actual call edges live one hop in via `contains`. Tell the agent to
+    # drill, not just pivot.
+    cur = data.get("current") or {}
+    is_code_file = cur.get("file_type") == "code"
     if p['in']['count'] == 0 and p['out']['count'] == 0:
         if p['contains']['count'] > 0:
-            out.append(f"  hint: no semantic edges. use `contains` ({p['contains']['count']}) to enter.")
+            kind = ("script-leaf — call edges live in the contained nodes"
+                    if is_code_file else "no direct edges")
+            out.append(
+                f"  hint: {kind}. drill: `contains` ({p['contains']['count']}) "
+                f"→ pick a function → then `out`."
+            )
         elif p['methods']['count'] > 0:
-            out.append(f"  hint: no semantic edges. use `methods` ({p['methods']['count']}) to enter.")
+            out.append(
+                f"  hint: no direct call edges. drill: `methods` ({p['methods']['count']}) "
+                f"→ pick a method → then `in`/`out`."
+            )
 
     if data.get("last_listing_size") and data.get("last_pivot"):
         out.append(f"  last: {data['last_pivot']}({data['last_listing_size']}) · pick [N]")
@@ -589,21 +601,38 @@ def resolve_focus(G: nx.DiGraph, idx: dict[str, list[str]],
         matches_sorted = sorted(matches, key=lambda n: _rank_match(G, key, n))
         return None, matches_sorted, "exact", []
 
-    # 2. substring fallback (rank: public-first, shorter, higher degree)
+    # 2. substring fallback (rank: public-first, shorter, higher degree).
+    # Distinguish "prefix" (label starts with key) from generic "substring" so
+    # the agent can gauge match strength — `@multi_axis_fingerprint` matching
+    # `multi_axis_fingerprint.py` is a prefix hit (very high confidence) vs
+    # `@axis` matching `score_source_by_axis()` (substring, weaker signal).
     substring_hits: list[str] = []
+    prefix_hits: list[str] = []
     for nid in G.nodes():
         label = _norm(G.nodes[nid].get("label", nid))
         if key in label:
             substring_hits.append(nid)
+            if label.startswith(key):
+                prefix_hits.append(nid)
     substring_hits.sort(key=lambda n: _rank_match(G, key, n))
+    prefix_hits.sort(key=lambda n: _rank_match(G, key, n))
+    # Single canonical hit: prefer the prefix-hit set if it's exactly one,
+    # otherwise fall through to whatever the substring set produced.
+    if len(prefix_hits) == 1:
+        all_labels = {_norm(G.nodes[n].get("label", n)): n for n in G.nodes()}
+        close = get_close_matches(key, list(all_labels.keys()), n=ALT_LIMIT + 2, cutoff=0.6)
+        alt_ids = [all_labels[lbl] for lbl in close if all_labels[lbl] != prefix_hits[0]][:ALT_LIMIT]
+        return prefix_hits[0], [], "prefix", alt_ids
     if len(substring_hits) == 1:
-        # Single substring hit — gather fuzzy near-misses as pivot suggestions
         all_labels = {_norm(G.nodes[n].get("label", n)): n for n in G.nodes()}
         close = get_close_matches(key, list(all_labels.keys()), n=ALT_LIMIT + 2, cutoff=0.6)
         alt_ids = [all_labels[lbl] for lbl in close if all_labels[lbl] != substring_hits[0]][:ALT_LIMIT]
         return substring_hits[0], [], "substring", alt_ids
     if substring_hits:
-        return None, substring_hits[:LIST_LIMIT], "substring", []
+        # Multi-hit: tag the listing as "prefix" if every hit is a prefix-hit
+        # (cleaner signal to the agent), else "substring".
+        match_type = "prefix" if prefix_hits and len(prefix_hits) == len(substring_hits) else "substring"
+        return None, substring_hits[:LIST_LIMIT], match_type, []
 
     # 3. fuzzy (typo) fallback — labels only. difflib returns close matches in
     # similarity-desc order; preserve that ordering rather than re-ranking,
@@ -851,6 +880,26 @@ def navigate(ops: list[str] | str, *,
                                          "in · out · methods · contains · coc · rat · inh · "
                                          "parent · back · reset · [N]")}
             _summarize_step(op_str, last_data)
+
+            # Abort the chain on hard failures so a downstream op doesn't
+            # silently overwrite the listing/error and mask the failure.
+            # Two cases:
+            #   1. error: nothing useful for downstream to build on.
+            #   2. @-disambig: a pick is required before pivots make sense.
+            if last_data and last_data.get("type") == "error":
+                if len(ops) > 1:
+                    trace.append(
+                        f"  chain aborted at `{op_str}` — fix and rerun "
+                        f"(remaining: {' '.join(o for o in ops[ops.index(op) + 1:])})"
+                    )
+                break
+            if cursor.last_pivot == "@-disambig":
+                if len(ops) > 1 and op != ops[-1]:
+                    trace.append(
+                        f"  chain aborted at `{op_str}` — pick [N] then resume "
+                        f"(remaining: {' '.join(o for o in ops[ops.index(op) + 1:])})"
+                    )
+                break
 
     # Render a chain summary line when there were 2+ ops — mid-chain results
     # otherwise vanish ("output is the last op's result"), leaving the agent
