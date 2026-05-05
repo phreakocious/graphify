@@ -241,3 +241,44 @@ def test_resolve_phantom_nodes_drops_redirected_self_loop():
     new_nodes, new_edges = _resolve_phantom_nodes(nodes, edges)
     assert "phantom_x" not in {n["id"] for n in new_nodes}
     assert new_edges == [], f"self-loop should be dropped, got {new_edges}"
+
+
+def test_resolve_phantom_nodes_preserves_unrelated_edges():
+    """Regression: when a phantom exists, all NON-phantom edges must
+    survive the rewrite. Earlier dedup logic seeded the existing-pairs
+    set with every real edge upfront, then skipped any edge already in
+    the set during the rewrite loop — silently dropping every contains/
+    method/calls edge whenever any phantom triggered the pass."""
+    from graphify.extract import _resolve_phantom_nodes
+    nodes = [
+        {"id": "file_foo", "label": "foo.py", "file_type": "code",
+         "source_file": "foo.py", "source_location": "L1"},
+        {"id": "foo_helper", "label": "helper()", "file_type": "code",
+         "source_file": "foo.py", "source_location": "L10"},
+        {"id": "foo_runner", "label": "runner()", "file_type": "code",
+         "source_file": "foo.py", "source_location": "L20"},
+        {"id": "foo_base", "label": "Base", "file_type": "code",
+         "source_file": "foo.py", "source_location": "L30"},
+        # Phantom from another file's `class Sub(Base):` — triggers the pass
+        {"id": "base", "label": "Base", "file_type": "code",
+         "source_file": "", "source_location": ""},
+        {"id": "bar_sub", "label": "Sub", "file_type": "code",
+         "source_file": "bar.py", "source_location": "L1"},
+    ]
+    edges = [
+        {"source": "file_foo", "target": "foo_helper", "relation": "contains",
+         "confidence": "EXTRACTED"},
+        {"source": "file_foo", "target": "foo_runner", "relation": "contains",
+         "confidence": "EXTRACTED"},
+        {"source": "foo_runner", "target": "foo_helper", "relation": "calls",
+         "confidence": "EXTRACTED"},
+        {"source": "bar_sub", "target": "base", "relation": "inherits",
+         "confidence": "EXTRACTED"},
+    ]
+    new_nodes, new_edges = _resolve_phantom_nodes(nodes, edges)
+    pairs = {(e["source"], e["target"], e["relation"]) for e in new_edges}
+    assert ("file_foo", "foo_helper", "contains") in pairs, pairs
+    assert ("file_foo", "foo_runner", "contains") in pairs, pairs
+    assert ("foo_runner", "foo_helper", "calls") in pairs, pairs
+    assert ("bar_sub", "foo_base", "inherits") in pairs, pairs
+    assert "base" not in {n["id"] for n in new_nodes}

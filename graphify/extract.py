@@ -3659,24 +3659,31 @@ def _resolve_phantom_nodes(all_nodes: list[dict],
     if not phantom_ids:
         return all_nodes, all_edges
 
-    # Rewrite edges. (src, tgt) pair-dedup: if the redirected edge would
-    # collide with an existing real edge, drop the duplicate.
-    existing_pairs = {(e["source"], e["target"]) for e in all_edges
-                      if e["source"] not in phantom_ids
-                      and e["target"] not in phantom_ids}
+    # Pass 1: keep all real (non-phantom-touching) edges as-is and seed
+    # the dedup set with their (src, tgt) pairs. Pass 2: redirect phantom
+    # edges and skip the redirected pair if it collides with a real edge
+    # or a previously-redirected phantom.
     rewritten: list[dict] = []
+    real_pairs: set[tuple[str, str]] = set()
+    phantom_edges: list[dict] = []
     for e in all_edges:
         src = e.get("source")
         tgt = e.get("target")
-        new_src = redirect.get(src, src)
-        new_tgt = redirect.get(tgt, tgt)
+        if src in phantom_ids or tgt in phantom_ids:
+            phantom_edges.append(e)
+        else:
+            rewritten.append(e)
+            real_pairs.add((src, tgt))
+    for e in phantom_edges:
+        new_src = redirect.get(e.get("source"), e.get("source"))
+        new_tgt = redirect.get(e.get("target"), e.get("target"))
         if new_src == new_tgt:
             # Self-loop after redirect — drop. A class inheriting from
             # itself via the resolver is never meaningful.
             continue
-        if (new_src, new_tgt) in existing_pairs:
+        if (new_src, new_tgt) in real_pairs:
             continue
-        existing_pairs.add((new_src, new_tgt))
+        real_pairs.add((new_src, new_tgt))
         ne = dict(e)
         ne["source"] = new_src
         ne["target"] = new_tgt
