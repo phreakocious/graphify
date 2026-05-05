@@ -1286,6 +1286,7 @@ Op forms:
 - `rat` — rationale anchors (docstring/comment nodes attached to this entity)
 - `inh` — inherits edges
 - `siblings` (or `sib`, `s`) — structural peers under the same parent file/class (disjoint from `coc`, which is the Leiden cluster). Use this for "what else is in this file?" without pivoting through `parent` then `contains`.
+- `callers` / `callees` — sugar for `in --kind=calls` / `out --kind=calls`. Most pivots want call edges; this drops `uses`/`imports`/`references` noise without typing the flag.
 - Single-letter aliases for chained calls: `i`=in, `o`=out, `m`=methods, `p`=parent, `s`=siblings, `r`=rat (no alias for `c` to keep `coc` and `contains` unambiguous).
 - `[N]` — focus on the Nth item from the most recent listing (e.g. `[3]`)
 - `back` — pop history (returns to the previous focus)
@@ -1296,12 +1297,16 @@ Op forms:
 
 Frontier (after focus or `back`):
 ```
-@ <label> · c<community> · deg=<N> · <file>:<line> [file_type if not code]
-  ↗in(N: confidence-mix)  ↘out(N: confidence-mix)  ◉methods(N)  ◇contains(N)
+@ <label> · c<cid>=<auto-name> · deg=<N> · <file>:<line> [file_type] · <age> · <lines>ln [· !stale]
+  ↗in(N: confidence-mix [; +M via methods])  ↘out(N: confidence-mix)  ◉methods(N)  ◇contains(N)
   ⊕coc(N)  ←rat(N)  →inh(N)  ⇡parent(N)  ◈sib(N)  ↺(history-depth)
 ```
 
-Confidence mix breaks down as `Next ext, Minf@lo-hi` — extracted edges (ground truth from AST) versus inferred edges with their score range. EXTRACTED edges are higher signal. **By default, navigate only shows EXTRACTED edges** — pass `--include-inferred` to widen the result set when you need cross-language or doc-linked breadth.
+- **Community auto-name** (`c5=GeometryAnalyzer`): each community is labeled with its top-degree member so you don't have to look up what a bare integer means.
+- **Per-file metadata** (` · 3d · 482ln`): age = git last-commit time when in a repo (prefixed `g`, e.g. `g3d`), else filesystem mtime; line count for code files <= 1MB. Saves a `stat`/`git log` roundtrip on the most common follow-up questions.
+- **`!stale` marker**: source file mtime > graph.json mtime. The AST extraction may not match the file's current state — `graphify update .` is probably due.
+- **`+M via methods` rollup** on `↗in` for class-shaped nodes: number of unique callers reachable through the class's methods (deduped). Guards against the trust-bug where `↗in(0)` on a class whose methods are called 50 times reads as "nobody uses this".
+- **Confidence mix** breaks down as `Next ext, Minf@lo-hi` — extracted edges (ground truth from AST) versus inferred edges with their score range. EXTRACTED edges are higher signal. **By default, navigate only shows EXTRACTED edges** — pass `--include-inferred` to widen the result set when you need cross-language or doc-linked breadth.
 
 Pivot listing (after `in`/`out`/`methods`/`coc`/...):
 ```
@@ -1374,6 +1379,12 @@ graphify navigate "@MyClass" in --kind=calls,uses
 # separate Read — the body preview is anchored at source_location so it's
 # faithful to what's actually there.
 graphify navigate "@scripts/atlas.py" contains --bodies=2
+
+# Walk N hops along non-structural edges instead of stopping at depth 1.
+# `out --depth=2` from a function shows everything it calls, plus what those
+# call — single-call blast-radius queries. Combine with --kind=calls to
+# get pure call-chain reachability.
+graphify navigate "@MyClass" out --depth=3 --kind=calls
 ```
 
 ### Trust signals to watch for

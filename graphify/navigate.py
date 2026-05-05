@@ -409,6 +409,21 @@ def _format_hidden(drops: dict[str, int]) -> str:
 
 # --- structured data builders ----------------------------------------------
 
+def _is_test_path(src: str | None) -> bool:
+    """Heuristic: is this source path a test file? Cheap path check, no file read."""
+    if not src:
+        return False
+    s = src.lower()
+    parts = Path(s).parts
+    if any(p in ("tests", "test", "__tests__", "spec", "specs") for p in parts):
+        return True
+    name = Path(s).name
+    return (name.startswith("test_") or name.endswith("_test.py")
+            or name.endswith(".test.ts") or name.endswith(".test.js")
+            or name.endswith(".test.tsx") or name.endswith(".spec.ts")
+            or name.endswith(".spec.js"))
+
+
 def _node_summary(G: nx.DiGraph, nid: str) -> dict:
     a = G.nodes[nid]
     src = a.get("source_file")
@@ -424,6 +439,7 @@ def _node_summary(G: nx.DiGraph, nid: str) -> dict:
         "source_file": src,
         "source_location": a.get("source_location"),
         "file_type": a.get("file_type", ""),
+        "is_test": _is_test_path(src),
         # Per-file metadata — saves the agent from running stat/git for the
         # most common follow-up questions ("how stale is this?", "how big?").
         "mtime": meta.get("mtime"),
@@ -724,7 +740,8 @@ def _render_frontier_text(data: dict, cursor: Cursor, *, show_ops: bool) -> str:
         ftype_tag = f" [{ft}]"
 
     p = data["pivots"]
-    header = f"@ {n['label']}  · {cstr} · deg={n['degree']} · {src}{ftype_tag}{_meta_tag(n)}"
+    test_tag = " [test]" if n.get("is_test") else ""
+    header = f"@ {n['label']}  · {cstr} · deg={n['degree']} · {src}{ftype_tag}{test_tag}{_meta_tag(n)}"
 
     def _glyph(prefix: str, pv: dict, with_conf: bool = False) -> str:
         # Format: glyph(count[: conf-mix][; +Ninf hidden][; +M via methods])
@@ -934,6 +951,8 @@ def _render_listing_text(data: dict, *, show_ops: bool) -> str:
 
         ft = item.get("file_type", "")
         ft_tag = f" [{ft}]" if ft and ft != "code" else ""
+        if item.get("is_test"):
+            ft_tag += " [test]"
         edge_tag = ""
         is_extracted = False
         if "edge" in item:
