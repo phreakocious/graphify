@@ -854,6 +854,51 @@ def test_coc_excludes_files_by_default(tmp_path):
     assert "decode.ts" in out2
 
 
+def test_coc_code_only_filters_rationale(tmp_path):
+    """Lap-16 Python field-report: a 514-member coc was mostly rationale
+    nodes. `--code-only` strips file_type=rationale members so the
+    listing is the actual code-symbol neighbourhood. Off by default."""
+    import json as _json
+    from graphify.navigate import navigate
+    nodes = [
+        {"id": "focus", "label": "Geometry", "file_type": "code",
+         "community": 1,
+         "source_file": "geom.py", "source_location": "L1"},
+        # Rationale fragments — should be filtered when --code-only is on.
+        {"id": "rat1", "label": "geometry rationale 1", "file_type": "rationale",
+         "community": 1,
+         "source_file": "geom.py", "source_location": "L40"},
+        {"id": "rat2", "label": "geometry rationale 2", "file_type": "rationale",
+         "community": 1,
+         "source_file": "geom.py", "source_location": "L80"},
+        # Code symbol — should always remain.
+        {"id": "s1", "label": "compute()", "file_type": "code",
+         "community": 1,
+         "source_file": "geom.py", "source_location": "L20"},
+    ]
+    graph_dir = tmp_path / "graphify-out"
+    graph_dir.mkdir()
+    (graph_dir / "graph.json").write_text(_json.dumps(
+        {"directed": True, "multigraph": False,
+         "graph": {}, "nodes": nodes, "links": []}), encoding="utf-8")
+    # Default (no flag): rationale visible.
+    out_default = navigate(["@Geometry", "coc"],
+                           graph_path=str(graph_dir / "graph.json"),
+                           session=False, fmt="text")
+    assert "geometry rationale 1" in out_default
+    # --code-only: rationale filtered, drop count surfaced.
+    out_code = navigate(["@Geometry", "coc"],
+                        graph_path=str(graph_dir / "graph.json"),
+                        session=False, fmt="text", code_only=True)
+    assert "geometry rationale 1" not in out_code, (
+        f"rationale leaked into --code-only listing:\n{out_code}"
+    )
+    assert "compute()" in out_code
+    assert "rationale hidden" in out_code, (
+        f"drop count must surface so the agent knows it filtered:\n{out_code}"
+    )
+
+
 def test_dupe_label_collapse_default(tmp_path):
     """Lap-9 #3: groups of >=5 same-label items collapse into one row.
     `[N]` picks the group's first member; cursor.last_listing length

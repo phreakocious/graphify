@@ -1824,6 +1824,8 @@ def _render_listing_text(data: dict, *, show_ops: bool, md: bool = False) -> str
             bits.append(f"+{drops['archived']} archived hidden")
         if drops.get("files"):
             bits.append(f"+{drops['files']} files hidden — pass --include-files to widen")
+        if drops.get("rationale"):
+            bits.append(f"+{drops['rationale']} rationale hidden via --code-only")
         if bits:
             # Name the actual flag rather than say "drop the filter" — the
             # latter misreads as "remove a filter" when the action is
@@ -1908,6 +1910,8 @@ def _render_listing_text(data: dict, *, show_ops: bool, md: bool = False) -> str
         drop_bits.append(f"+{drops['archived']} archived hidden")
     if drops.get("files"):
         drop_bits.append(f"+{drops['files']} files hidden — pass --include-files to widen")
+    if drops.get("rationale"):
+        drop_bits.append(f"+{drops['rationale']} rationale hidden via --code-only")
     # `where-used` breakdown: split edge-callers from text-mentions in the
     # header so the agent sees the trust split at a glance. Edge hits are
     # AST-grounded; text hits could be string literals, comments, or
@@ -2230,6 +2234,7 @@ def _pivot_data(G: nx.DiGraph, communities: dict[int, list[str]],
                 kinds: set[str] | None = None,
                 depth: int = 1,
                 include_files: bool = False,
+                code_only: bool = False,
                 transitive: bool = False
                 ) -> tuple[str, list[str], dict[str, dict], str, dict[str, int]]:
     """Return (pivot_label, ordered_ids, edge_for_dict, sort_label, drops) for a pivot key.
@@ -2563,6 +2568,19 @@ def _pivot_data(G: nx.DiGraph, communities: dict[int, list[str]],
             members = [n for n in all_members if not _is_file_hub(n)]
             file_count = len(all_members) - len(members)
             file_drops = {"files": file_count} if file_count else {}
+        # Lap-16 Python field-report: a 514-member coc was mostly rationale
+        # nodes (extracted docstring fragments). `--code-only` strips them
+        # so the listing is the actual code-symbol neighbourhood. Off by
+        # default to preserve current callers; agents who want orientation
+        # rather than the megablob pass the flag.
+        if code_only:
+            before = len(members)
+            members = [n for n in members
+                       if G.nodes[n].get("file_type") == "code"]
+            rat_count = before - len(members)
+            if rat_count:
+                file_drops = dict(file_drops)
+                file_drops["rationale"] = rat_count
         members.sort(key=lambda x: -(G.in_degree(x) + G.out_degree(x)))
         labels = G.graph.get("community_labels") if hasattr(G, "graph") else None
         clabel = (labels or {}).get(cid)
@@ -3314,6 +3332,7 @@ def navigate(ops: list[str] | str, *,
              depth: int = 1,
              archived_mode: str = "all",
              include_files: bool = False,
+             code_only: bool = False,
              collapse_dupes: bool = True,
              explain_cost: bool = False,
              md: bool = False,
@@ -3787,6 +3806,7 @@ def navigate(ops: list[str] | str, *,
                         kinds=kinds,
                         depth=depth,
                         include_files=include_files,
+                        code_only=code_only,
                         transitive=False,
                     )
                     # 2. Text-discovered mentions. Strip method/property
@@ -3863,6 +3883,7 @@ def navigate(ops: list[str] | str, *,
                         kinds=kinds,
                         depth=depth,
                         include_files=include_files,
+                        code_only=code_only,
                         transitive=transitive,
                     )
                     # Auto-widen empty in/out to inferred edges. When extracted-only

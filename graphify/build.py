@@ -110,7 +110,54 @@ def build_from_json(extraction: dict, *, directed: bool = False) -> nx.Graph:
     hyperedges = extraction.get("hyperedges", [])
     if hyperedges:
         G.graph["hyperedges"] = hyperedges
+    _backfill_node_kind(G)
     return G
+
+
+def _backfill_node_kind(G: nx.Graph) -> None:
+    """Set `node_kind` on nodes that lack one, so the invariant `every node
+    has a node_kind` holds.
+
+    Without this, ~80% of nodes in a Python corpus end up with kind=None
+    (the Python extractor only tags classes; functions, methods, files,
+    and rationale fragments are untagged), forcing every downstream
+    consumer to re-derive the kind from label/file_type. Tooling that
+    filters on node_kind would silently miss them.
+
+    Rules — applied only when no kind is already set:
+      - file_type=rationale → "rationale"
+      - file_type=external  → "external_module"
+      - label matches the basename of source_file → "file"
+      - label starts with "." and ends with "()" → "method" (AST method stub)
+      - label ends with "()" → "function"
+      - otherwise leave None (likely a class node from a non-tagging pass —
+        we'd rather leave it None than mislabel; classes get caught by
+        explicit-tagging extractors).
+    """
+    from pathlib import Path as _Path
+    for nid, attrs in G.nodes(data=True):
+        if attrs.get("node_kind"):
+            continue
+        ft = attrs.get("file_type") or ""
+        label = attrs.get("label") or ""
+        if ft == "rationale":
+            attrs["node_kind"] = "rationale"
+            continue
+        if ft == "external":
+            attrs["node_kind"] = "external_module"
+            continue
+        src = attrs.get("source_file") or ""
+        if src and label and _Path(src).name == label:
+            attrs["node_kind"] = "file"
+            continue
+        if label.startswith(".") and label.endswith("()"):
+            attrs["node_kind"] = "method"
+            continue
+        if label.endswith("()"):
+            attrs["node_kind"] = "function"
+            continue
+        # Leave kind unset for nodes we can't classify by shape — better
+        # than guessing wrong.
 
 
 def build(extractions: list[dict], *, directed: bool = False) -> nx.Graph:

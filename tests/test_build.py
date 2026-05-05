@@ -74,6 +74,65 @@ def test_imports_to_external_module_creates_stub_node():
     assert G.edges["foo_py", "numpy"]["relation"] == "imports"
 
 
+def test_node_kind_backfill_rules():
+    """Lap-16 Python field-report: ~80% of nodes lack node_kind. Backfill
+    at build time so downstream filters can rely on the invariant.
+
+    Rules:
+      - file_type=rationale → "rationale"
+      - file_type=external  → "external_module"
+      - label == basename(source_file) → "file"
+      - label `.foo()` → "method"
+      - label `foo()` → "function"
+      - existing node_kind preserved (never overwrites)
+    """
+    ext = {
+        "nodes": [
+            # File hub
+            {"id": "foo_py", "label": "foo.py", "file_type": "code",
+             "source_file": "foo.py", "source_location": "L1"},
+            # Top-level function
+            {"id": "fn", "label": "do_thing()", "file_type": "code",
+             "source_file": "foo.py", "source_location": "L10"},
+            # Method (dotted prefix)
+            {"id": "m", "label": ".forward()", "file_type": "code",
+             "source_file": "foo.py", "source_location": "L20"},
+            # Rationale fragment
+            {"id": "r", "label": "doc snippet", "file_type": "rationale",
+             "source_file": "foo.py", "source_location": "L30"},
+            # Pre-tagged class (must NOT be overwritten)
+            {"id": "c", "label": "Geometry", "file_type": "code",
+             "source_file": "foo.py", "source_location": "L40",
+             "node_kind": "class"},
+        ],
+        "edges": [],
+        "input_tokens": 0, "output_tokens": 0,
+    }
+    G = build_from_json(ext, directed=True)
+    assert G.nodes["foo_py"]["node_kind"] == "file"
+    assert G.nodes["fn"]["node_kind"] == "function"
+    assert G.nodes["m"]["node_kind"] == "method"
+    assert G.nodes["r"]["node_kind"] == "rationale"
+    # Pre-tagged class survives the backfill pass.
+    assert G.nodes["c"]["node_kind"] == "class"
+
+
+def test_node_kind_backfill_external_stub():
+    """Synthetic external-module stubs created during the imports-edge
+    pass already get node_kind=external_module. The backfill pass should
+    not change them."""
+    ext = {
+        "nodes": [{"id": "foo_py", "label": "foo.py", "file_type": "code",
+                   "source_file": "foo.py", "source_location": "L1"}],
+        "edges": [{"source": "foo_py", "target": "numpy", "relation": "imports",
+                   "confidence": "EXTRACTED", "source_file": "foo.py",
+                   "source_location": "L3", "weight": 1.0}],
+        "input_tokens": 0, "output_tokens": 0,
+    }
+    G = build_from_json(ext, directed=True)
+    assert G.nodes["numpy"]["node_kind"] == "external_module"
+
+
 def test_external_stub_nodes_pass_revalidation():
     """Round-trip: build a graph with external stubs, serialize like
     navigate would (node_link_data), then revalidate. Must produce zero

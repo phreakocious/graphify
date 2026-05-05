@@ -117,6 +117,7 @@ _HELP_BLOCKS: dict[str, list[str]] = {
         "    --no-archived           hide nodes under frozen/legacy/deprecated/archive(d)/ paths",
         "    --archived-only         show only archived nodes (inverse of --no-archived)",
         "    --include-files         widen `coc` to include file-level hubs (default: symbols only)",
+        "    --code-only             filter rationale nodes from `coc` listings — orient on the code-symbol neighbourhood without docstring fragments",
         "    --no-collapse           expand dupe-label groups in listings (default: collapse ≥5 same-label rows into one)",
         "    --explain-cost          on a pivot, return `would-show N nodes ≈ K bytes` preview without rendering the listing (lets you gate `coc` against a 1000-node community before committing)",
         "    --md                    render labels and src:line as `[label](src:line)` markdown links (clickable in IDE / Claude Code)",
@@ -1869,12 +1870,62 @@ def main() -> None:
                 print(f"No node matching '{label}' found.")
             sys.exit(0 if not candidates else 1)
         d = G.nodes[nid]
+        from graphify.analyze import _is_file_node
+        is_file = _is_file_node(G, nid)
         print(f"Node: {d.get('label', nid)}")
         print(f"  ID:        {nid}")
         print(f"  Source:    {d.get('source_file', '')} {d.get('source_location', '')}".rstrip())
         print(f"  Type:      {d.get('file_type', '')}")
         print(f"  Community: {d.get('community', '')}")
         print(f"  Degree:    {G.degree(nid)}")
+        if is_file:
+            # Lap-16 TS field-report friction 5: file-node `explain` was an
+            # unfiltered import dump that easily hit thousands of tokens.
+            # Replace it with a structural summary: counts by relation,
+            # top contains-children by degree, and import targets grouped
+            # so the agent gets orientation, not a fan-out wall.
+            from collections import Counter
+            DG = G if G.is_directed() else None
+            outgoing = []
+            for nb in G.neighbors(nid):
+                e = G.edges[nid, nb]
+                if not include_inferred and e.get("confidence") != "EXTRACTED":
+                    continue
+                outgoing.append((nb, e))
+            rel_count = Counter(e.get("relation", "") for _nb, e in outgoing)
+            contains_kids = [nb for nb, e in outgoing if e.get("relation") == "contains"]
+            import_targets = [nb for nb, e in outgoing
+                              if e.get("relation") in ("imports", "imports_from")]
+            non_struct = [nb for nb, e in outgoing
+                          if e.get("relation") not in ("contains", "method",
+                                                       "imports", "imports_from")]
+            print(f"\nStructure ({len(outgoing)} extracted edges):")
+            print(f"  Relations: " + ", ".join(f"{r}:{c}"
+                  for r, c in rel_count.most_common()))
+            if contains_kids:
+                top = sorted(contains_kids,
+                             key=lambda x: -G.degree(x))[:min(limit, 10)]
+                print(f"\nTop decls by degree (of {len(contains_kids)}):")
+                for nb in top:
+                    print(f"  --> {G.nodes[nb].get('label', nb)}  d={G.degree(nb)}")
+            if import_targets:
+                # Bucket: external module stubs vs internal file targets.
+                ext = [nb for nb in import_targets
+                       if G.nodes[nb].get("file_type") == "external"]
+                internal = [nb for nb in import_targets
+                            if G.nodes[nb].get("file_type") != "external"]
+                print(f"\nImports: {len(import_targets)} total — "
+                      f"{len(ext)} external, {len(internal)} internal")
+                # Sample top-fanout external imports so the agent sees what
+                # the file pulls from third-party land without listing all.
+                if ext:
+                    sample = sorted(ext, key=lambda x: -G.degree(x))[:5]
+                    print("  external (top-fanout): " +
+                          ", ".join(G.nodes[nb].get("label", nb) for nb in sample))
+            if non_struct:
+                print(f"\nNon-structural edges: {len(non_struct)} "
+                      f"(use `navigate @<file> out` to enumerate)")
+            return
         neighbors = list(G.neighbors(nid))
         # Filter by confidence (matching navigate's default) and sort
         # EXTRACTED-first so the trustworthy edges aren't buried under
@@ -1894,20 +1945,53 @@ def main() -> None:
                 header += f" — {dropped} INFERRED hidden, --include-inferred to show"
             print(header + ":")
             sorted_nbrs = sorted(neighbors_filtered, key=_edge_sort_key)
+            # Lap-16 TS field-report friction 4: explain printed 20 identical
+            # `stagedDecode() [type_ref] [EXTRACTED]` lines. Group adjacent
+            # rows that share (label, relation, confidence) into a single
+            # collapsed entry once the run hits the threshold. Mirrors
+            # navigate's listing-collapse but operates on edge-tuples
+            # instead of node-summaries because explain renders edges, not
+            # nodes.
+            from graphify.navigate import _DUPE_COLLAPSE_THRESHOLD
+            def _row(nb):
+                e = G.edges[nid, nb]
+                return (G.nodes[nb].get("label", nb),
+                        e.get("relation", ""), e.get("confidence", ""))
+            collapsed_rows: list[tuple[str, str, str, int]] = []
+            i_idx = 0
+            while i_idx < len(sorted_nbrs):
+                key_row = _row(sorted_nbrs[i_idx])
+                j_idx = i_idx + 1
+                while j_idx < len(sorted_nbrs) and _row(sorted_nbrs[j_idx]) == key_row:
+                    j_idx += 1
+                count = j_idx - i_idx
+                collapsed_rows.append((*key_row, count))
+                i_idx = j_idx
             prev_extracted: bool | None = None
             boundary_inserted = False
-            for nb in sorted_nbrs[:limit]:
-                edata = G.edges[nid, nb]
-                rel = edata.get("relation", "")
-                conf = edata.get("confidence", "")
+            shown = 0  # rendered lines so far
+            covered = 0  # underlying edges covered by rendered output
+            for label_, rel, conf, count in collapsed_rows:
+                if shown >= limit:
+                    break
                 is_ext = conf == "EXTRACTED"
                 if (not boundary_inserted and prev_extracted is True and not is_ext):
                     print("  ── inferred below ──")
                     boundary_inserted = True
                 prev_extracted = is_ext
-                print(f"  --> {G.nodes[nb].get('label', nb)} [{rel}] [{conf}]")
-            if len(neighbors_filtered) > limit:
-                print(f"  ... and {len(neighbors_filtered) - limit} more")
+                if count >= _DUPE_COLLAPSE_THRESHOLD:
+                    print(f"  --> {label_} [{rel}] [{conf}]  ×{count}")
+                    shown += 1
+                    covered += count
+                else:
+                    # Expand small groups inline, but stop at the line limit.
+                    take = min(count, limit - shown)
+                    for _ in range(take):
+                        print(f"  --> {label_} [{rel}] [{conf}]")
+                    shown += take
+                    covered += take
+            if covered < len(neighbors_filtered):
+                print(f"  ... and {len(neighbors_filtered) - covered} more")
         elif dropped > 0:
             print(f"\nNo EXTRACTED edges. {dropped} INFERRED edges hidden (use --include-inferred).")
 
@@ -2399,6 +2483,7 @@ def main() -> None:
         depth: int = 1
         archived_mode: str = "all"  # --no-archived → "no" / --archived-only → "only"
         include_files: bool = False  # --include-files turns coc back on for file hubs
+        code_only: bool = False  # --code-only filters rationale nodes from coc
         collapse_dupes: bool = True   # --no-collapse expands dupe-label groups
         explain_cost: bool = False    # --explain-cost short-circuits pivots to size preview
         md: bool = False              # --md wraps labels and src:line in markdown links
@@ -2470,6 +2555,8 @@ def main() -> None:
                 archived_mode = "only"; i += 1
             elif a == "--include-files":
                 include_files = True; i += 1
+            elif a == "--code-only":
+                code_only = True; i += 1
             elif a == "--no-collapse":
                 collapse_dupes = False; i += 1
             elif a == "--explain-cost":
@@ -2501,6 +2588,7 @@ def main() -> None:
             depth=depth,
             archived_mode=archived_mode,
             include_files=include_files,
+            code_only=code_only,
             collapse_dupes=collapse_dupes,
             explain_cost=explain_cost,
             md=md,

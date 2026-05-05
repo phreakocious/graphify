@@ -182,13 +182,17 @@ def test_subgraph_to_text_node_limit_caps_rows():
 def test_subgraph_to_text_node_limit_drops_edges_to_dropped_nodes():
     """When `node_limit` cuts a node, edges incident on that node must
     not appear in the output — otherwise the listing has dangling
-    endpoints with no NODE row to match."""
+    endpoints with no NODE row to match.
+
+    `priority_nodes` pins the kept node so this test doesn't depend on
+    nondeterministic degree-tied iteration order."""
     G = nx.Graph()
     G.add_node("keep", label="keep", source_file="a.py", source_location="L1", community=0)
     G.add_node("drop", label="drop", source_file="b.py", source_location="L1", community=0)
     G.add_edge("keep", "drop", relation="calls", confidence="EXTRACTED")
     nodes = {"keep", "drop"}
-    text = _subgraph_to_text(G, nodes, [("keep", "drop")], token_budget=10000, node_limit=1)
+    text = _subgraph_to_text(G, nodes, [("keep", "drop")], token_budget=10000,
+                             priority_nodes=["keep"], node_limit=1)
     assert "NODE keep" in text
     assert "NODE drop" not in text
     assert "EDGE" not in text, f"edge to dropped node should be omitted:\n{text}"
