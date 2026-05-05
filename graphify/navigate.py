@@ -1493,6 +1493,27 @@ def resolve_focus(G: nx.DiGraph, idx: dict[str, list[str]],
         matches_sorted = sorted(matches, key=lambda n: _rank_match(G, key, n))
         return None, matches_sorted, "exact", []
 
+    # 1b. path-qualified query (`tools/metric_diagnostic.py`). The label
+    # index keys off basename, so a `/`-bearing query never hits step 1.
+    # Substring also fails because the key is *longer* than typical labels.
+    # Without this branch we fall through to fuzzy and `tools/foo.py` ends
+    # up "ambiguous" against basename-similar typos (`bar/ab_foo.py`,
+    # `qux/foo_other.py`) — even though the user told us exactly which
+    # file. Match nodes whose label == basename AND whose source_file
+    # ends with the full path; that's a user-confirmed exact resolution.
+    if "/" in key:
+        basename = key.rsplit("/", 1)[-1]
+        path_hits = []
+        for nid in idx.get(basename, []):
+            sf = _norm(G.nodes[nid].get("source_file") or "")
+            if sf == key or sf.endswith("/" + key):
+                path_hits.append(nid)
+        if len(path_hits) == 1:
+            return path_hits[0], [], "exact", []
+        if len(path_hits) > 1:
+            path_hits.sort(key=lambda n: _rank_match(G, key, n))
+            return None, path_hits, "exact", []
+
     # 2. substring fallback (rank: public-first, shorter, higher degree).
     # Distinguish "prefix" (label starts with key) from generic "substring" so
     # the agent can gauge match strength — `@multi_axis_fingerprint` matching
