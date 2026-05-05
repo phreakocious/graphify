@@ -3565,18 +3565,21 @@ def extract(paths: list[Path], cache_root: Path | None = None) -> dict:
 
         # Cross-file type-reference resolution. Type names registered as
         # extracted (interface_declaration, type_alias_declaration, class
-        # declarations) live in `global_label_to_nid`. Same-file matches
-        # were already emitted as `type_ref` edges; this pass picks up
-        # the rest. Marked EXTRACTED at confidence 1.0 because tree-sitter
-        # placed the identifier in a type position — the only ambiguity
-        # is which file the type was declared in, which the global map
-        # resolves uniquely (or skips when there's a name collision the
-        # extractor can't disambiguate).
+        # declarations) live in `global_labels_by_name` (built above).
+        # Same-file matches were already emitted as `type_ref` edges; this
+        # pass picks up the rest. Marked EXTRACTED at confidence 1.0 because
+        # tree-sitter placed the identifier in a type position — the only
+        # ambiguity is which file the type was declared in, which the global
+        # map resolves uniquely. On a name collision (multiple candidates),
+        # skip rather than claim ground-truth on a coin flip.
         for rt in result.get("raw_type_refs", []):
             type_name = rt.get("type_name", "")
             if not type_name:
                 continue
-            tgt = global_label_to_nid.get(type_name.lower())
+            candidates = global_labels_by_name.get(type_name.lower()) or []
+            if len(candidates) != 1:
+                continue
+            tgt = candidates[0]
             caller = rt["caller_nid"]
             if tgt and tgt != caller and (caller, tgt) not in existing_pairs:
                 existing_pairs.add((caller, tgt))
