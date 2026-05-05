@@ -37,13 +37,13 @@ def _refresh_all_version_stamps() -> None:
             vf.write_text(__version__, encoding="utf-8")
 
 _SETTINGS_HOOK = {
-    "matcher": "Glob|Grep",
+    "matcher": "Read|Glob|Grep",
     "hooks": [
         {
             "type": "command",
             "command": (
                 "[ -f graphify-out/graph.json ] && "
-                r"""echo '{"hookSpecificOutput":{"hookEventName":"PreToolUse","additionalContext":"graphify: Knowledge graph exists. Read graphify-out/GRAPH_REPORT.md for god nodes and community structure before searching raw files."}}' """
+                r"""echo '{"hookSpecificOutput":{"hookEventName":"PreToolUse","additionalContext":"graphify-out/graph.json exists. Before reading/grepping unfamiliar code, scout it cheaper: `graphify navigate \"@<symbol>\"` returns a dense affordance frame (~200 tok). Then pivot with in/out/methods/coc/parent/[N], or jump to file:line once a node is load-bearing. See ~/.claude/skills/graphify/SKILL.md."}}' """
                 "|| true"
             ),
         }
@@ -186,12 +186,48 @@ def install(platform: str = "claude") -> None:
 _CLAUDE_MD_SECTION = """\
 ## graphify
 
-This project has a graphify knowledge graph at graphify-out/.
+This project has a graphify knowledge graph at `graphify-out/graph.json`. Use it to keep your context window from collapsing under a heavy codebase.
 
-Rules:
-- Before answering architecture or codebase questions, read graphify-out/GRAPH_REPORT.md for god nodes and community structure
-- If graphify-out/wiki/index.md exists, navigate it instead of reading raw files
-- After modifying code files in this session, run `graphify update .` to keep the graph current (AST-only, no API cost)
+### When you should reach for graphify
+
+Before any of these moves, scout the graph first — it's 50–500x cheaper than the alternative:
+
+- **About to `Read` a source-code file you don't already know.** Run `graphify navigate "@<symbol>"` first. The frontier shows you whether the file is a leaf, hub, or router, and what shape of context you actually need.
+- **About to chain `Grep` / `Glob` calls to trace a call graph or find who-uses-X.** That's literally what `graphify navigate` `in`/`out`/`path` are for.
+- **About to implement, change, or debug something in unfamiliar territory.** Map the blast radius first: focus the entry point, run `in` to see callers, decide what's actually load-bearing.
+- **You don't know where to start.** `graphify navigate "@<best-guess-label>"` is a free probe — a hit returns a frontier, a miss returns real names you can grab onto.
+
+**Don't reach for graphify when reading**: `.json` / `.yaml` / `.toml` / `.csv` / `.md` / `.txt` / `.log` / lockfiles / build output / your own memory or scratch files. graphify only indexes source code — for data, configs, prose, and machine output, just `Read` directly.
+
+### Default workflow
+
+Chain ops in a single call — left-to-right, output is the last op's result. Each call prints a session id at the bottom; pass it back via `--session <id>` to resume the cursor on a later call. Default chains stay one-shot — the next call without `--session` starts fresh under a new id.
+
+```
+graphify navigate "@<symbol>"                    # focus a node, return frontier (~200 tok)
+graphify navigate "@<symbol>" methods            # focus + list methods
+graphify navigate "@<symbol>" methods 6 in       # focus + methods + pick 6th + show callers
+graphify navigate "@<symbol>" --extracted-only   # drop INFERRED edges, AST ground truth only
+graphify navigate "@<symbol>" --json             # structured JSON for programmatic chaining
+graphify navigate --session <id> in              # resume a prior session, run another op
+```
+
+Pivot ops: `in | out | methods | contains | coc | rat | parent | inh`. Pick from previous listing with `N` or `[N]`. Use `--legend` for the column-key on first invocation. Use `--limit N` to widen listings (default 25). Per-id cursor files mean parallel calls don't race on shared state.
+
+Use `graphify path "A" "B"` for reachability between two named things (~50 tok). Use `graphify explain "X"` for a one-shot summary of a single node (~350 tok). Use `graphify query "..."` only when the question is genuinely diffuse and you've already narrowed scope — it returns a flat node dump.
+
+### After editing code
+
+```
+graphify update .
+```
+
+Re-extracts changed files via AST. No LLM cost. Run after a session of edits to keep the graph current.
+
+### What NOT to do
+
+- Don't read `GRAPH_REPORT.md` end-to-end — it's a 40KB+ overview that costs ~10K tokens and the community-list section is filler in AST-only mode. Use `graphify navigate` instead.
+- Don't run `graphify query` on a question you haven't narrowed yet — it caps at ~2K tokens of flat node listings, mostly noise.
 """
 
 _CLAUDE_MD_MARKER = "## graphify"
@@ -201,12 +237,44 @@ _CLAUDE_MD_MARKER = "## graphify"
 _AGENTS_MD_SECTION = """\
 ## graphify
 
-This project has a graphify knowledge graph at graphify-out/.
+This project has a graphify knowledge graph at `graphify-out/graph.json`. Use it to keep your context window from collapsing under a heavy codebase.
 
-Rules:
-- Before answering architecture or codebase questions, read graphify-out/GRAPH_REPORT.md for god nodes and community structure
-- If graphify-out/wiki/index.md exists, navigate it instead of reading raw files
-- After modifying code files in this session, run `graphify update .` to keep the graph current (AST-only, no API cost)
+### When you should reach for graphify
+
+Before any of these moves, scout the graph first — it's 50–500x cheaper than the alternative:
+
+- **About to read a source-code file you don't already know.** Run `graphify navigate "@<symbol>"` first. The frontier shows you whether the file is a leaf, hub, or router.
+- **About to chain greps to trace a call graph or find who-uses-X.** That's what `graphify navigate` `in`/`out`/`path` are for.
+- **About to implement, change, or debug in unfamiliar territory.** Map the blast radius first: focus the entry point, run `in` to see callers.
+- **You don't know where to start.** `graphify navigate "@<best-guess-label>"` is a free probe.
+
+**Don't reach for graphify when reading**: `.json` / `.yaml` / `.toml` / `.csv` / `.md` / `.txt` / `.log` / lockfiles / build output / your own memory or scratch files. graphify only indexes source code — for data, configs, prose, and machine output, just read directly.
+
+### Default workflow
+
+Chain ops left-to-right; output is the last op's result. Each call prints a session id; pass it via `--session <id>` to resume.
+
+```
+graphify navigate "@<symbol>" methods 6 in   # focus, list methods, pick 6th, show its callers
+graphify navigate --session <id> back        # resume + ↺ pop history
+```
+
+Pivots: `in | out | methods | contains | coc | rat | parent | inh`. Pick from listing with `N` or `[N]`.
+
+Use `graphify path "A" "B"` for reachability (~50 tok). Use `graphify explain "X"` for a one-shot node summary (~350 tok). Use `graphify query "..."` only when the question is genuinely diffuse and you've narrowed scope.
+
+### After editing code
+
+```
+graphify update .
+```
+
+AST-only re-extraction, no LLM cost.
+
+### What NOT to do
+
+- Don't read `GRAPH_REPORT.md` end-to-end — it's a 40KB+ overview, ~10K tokens. Use `graphify navigate` instead.
+- Don't run `graphify query` on a question you haven't narrowed yet — flat node dumps, mostly noise.
 """
 
 _AGENTS_MD_MARKER = "## graphify"
@@ -214,12 +282,44 @@ _AGENTS_MD_MARKER = "## graphify"
 _GEMINI_MD_SECTION = """\
 ## graphify
 
-This project has a graphify knowledge graph at graphify-out/.
+This project has a graphify knowledge graph at `graphify-out/graph.json`. Use it to keep your context window from collapsing under a heavy codebase.
 
-Rules:
-- Before answering architecture or codebase questions, read graphify-out/GRAPH_REPORT.md for god nodes and community structure
-- If graphify-out/wiki/index.md exists, navigate it instead of reading raw files
-- After modifying code files in this session, run `graphify update .` to keep the graph current (AST-only, no API cost)
+### When you should reach for graphify
+
+Before any of these moves, scout the graph first — it's 50–500x cheaper than the alternative:
+
+- **About to read a source-code file you don't already know.** Run `graphify navigate "@<symbol>"` first.
+- **About to chain greps to trace a call graph or find who-uses-X.** That's what `graphify navigate` `in`/`out`/`path` are for.
+- **About to implement, change, or debug in unfamiliar territory.** Map the blast radius first.
+- **You don't know where to start.** `graphify navigate "@<best-guess-label>"` is a free probe.
+
+**Don't reach for graphify when reading**: `.json` / `.yaml` / `.toml` / `.csv` / `.md` / `.txt` / `.log` / lockfiles / build output / your own memory or scratch files. graphify only indexes source code — for data, configs, prose, and machine output, just read directly.
+
+### Default workflow
+
+Chain ops left-to-right; output is the last op's result. Each call prints a session id; pass it via `--session <id>` to resume.
+
+```
+graphify navigate "@<symbol>" methods 6 in   # focus, list methods, pick 6th, show its callers
+graphify navigate --session <id> back        # resume + ↺ pop history
+```
+
+Pivots: `in | out | methods | contains | coc | rat | parent | inh`. Pick from listing with `N` or `[N]`.
+
+Use `graphify path "A" "B"` for reachability (~50 tok). Use `graphify explain "X"` for a one-shot summary (~350 tok). Use `graphify query "..."` only for genuinely diffuse questions after narrowing scope.
+
+### After editing code
+
+```
+graphify update .
+```
+
+AST-only, no LLM cost.
+
+### What NOT to do
+
+- Don't read `GRAPH_REPORT.md` end-to-end — ~10K tokens of overview. Use `graphify navigate` instead.
+- Don't run `graphify query` on a question you haven't narrowed yet.
 """
 
 _GEMINI_MD_MARKER = "## graphify"
@@ -231,7 +331,7 @@ _GEMINI_HOOK = {
             "type": "command",
             "command": (
                 "[ -f graphify-out/graph.json ] && "
-                r"""echo '{"decision":"allow","additionalContext":"graphify: Knowledge graph exists. Read graphify-out/GRAPH_REPORT.md for god nodes and community structure before searching raw files."}' """
+                r"""echo '{"decision":"allow","additionalContext":"graphify-out/graph.json exists. Before reading/listing unfamiliar code, scout it cheaper: `graphify navigate \"@<symbol>\"` returns a dense affordance frame (~200 tok). Then pivot with in/out/methods/coc/parent/[N], or jump to file:line once a node is load-bearing. See ~/.gemini/skills/graphify/SKILL.md."}' """
                 r"""|| echo '{"decision":"allow"}'"""
             ),
         }
@@ -848,7 +948,9 @@ def _install_claude_hook(project_dir: Path) -> None:
     hooks = settings.setdefault("hooks", {})
     pre_tool = hooks.setdefault("PreToolUse", [])
 
-    hooks["PreToolUse"] = [h for h in pre_tool if not (h.get("matcher") == "Glob|Grep" and "graphify" in str(h))]
+    # Match by content, not by specific matcher string — so the dedup survives
+    # across versions where the matcher itself changes (e.g. Glob|Grep → Read|Glob|Grep).
+    hooks["PreToolUse"] = [h for h in pre_tool if "graphify" not in str(h)]
     hooks["PreToolUse"].append(_SETTINGS_HOOK)
     settings_path.write_text(json.dumps(settings, indent=2), encoding="utf-8")
     print(f"  .claude/settings.json  ->  PreToolUse hook registered")
@@ -864,7 +966,7 @@ def _uninstall_claude_hook(project_dir: Path) -> None:
     except json.JSONDecodeError:
         return
     pre_tool = settings.get("hooks", {}).get("PreToolUse", [])
-    filtered = [h for h in pre_tool if not (h.get("matcher") == "Glob|Grep" and "graphify" in str(h))]
+    filtered = [h for h in pre_tool if "graphify" not in str(h)]
     if len(filtered) == len(pre_tool):
         return
     settings["hooks"]["PreToolUse"] = filtered
@@ -937,6 +1039,23 @@ def main() -> None:
         print("    --nodes N1 N2 ...       source node labels cited in the answer")
         print("    --memory-dir DIR        memory directory (default: graphify-out/memory)")
         print("  benchmark [graph.json]  measure token reduction vs naive full-corpus approach")
+        print("  navigate [ops...]       cursor-based graph navigation (LLM-friendly)")
+        print("    @<label>                focus on a node by label/id (fuzzy fallback for typos)")
+        print("    in | out | methods | contains    list typed pivots")
+        print("    coc                     co-community siblings (same Leiden cluster)")
+        print("    rat | inh | parent      rationale anchors / inherits / structural parent")
+        print("    [N] | N                 focus on Nth item from previous listing in the chain")
+        print("    back | reset            pop history / clear cursor")
+        print("    --session <id>          resume a prior session (id is printed at the bottom of every output)")
+        print("    --no-session            disable session entirely (no disk, no id printed)")
+        print("    --json                  structured JSON output")
+        print("    --extracted-only        drop INFERRED edges (AST ground truth only)")
+        print("    --min-confidence X      drop INFERRED edges below score X")
+        print("    --limit N               max items per listing (default 25)")
+        print("    --legend                prepend column-key legend")
+        print("    --no-ops-hint           omit the ops cheat-sheet line")
+        print("    --graph <path>          path to graph.json (default graphify-out/graph.json)")
+        print("    Chain ops in one call: graphify navigate @Foo methods 1 in")
         print("  hook install            install post-commit/post-checkout git hooks (all platforms)")
         print("  hook uninstall          remove git hooks")
         print("  hook status             check if git hooks are installed")
@@ -1346,6 +1465,69 @@ def main() -> None:
         else:
             print("Nothing to update or rebuild failed — check output above.", file=sys.stderr)
             sys.exit(1)
+
+    elif cmd == "navigate" or cmd == "nav":
+        from graphify.navigate import navigate, DEFAULT_GRAPH_PATH, LIST_LIMIT
+        # Parse: --graph PATH, --session <id>, --no-session, --json|--format json,
+        # --extracted-only, --min-confidence FLOAT, --legend, --no-ops-hint,
+        # --limit N. Remaining args = op chain.
+        args = sys.argv[2:]
+        graph_path: str | None = None
+        session: str | bool = True  # True = ephemeral with auto-id
+        fmt = "text"
+        extracted_only = False
+        min_confidence: float | None = None
+        show_legend = False
+        show_ops_hint = True
+        limit = LIST_LIMIT
+        i = 0
+        ops: list[str] = []
+        while i < len(args):
+            a = args[i]
+            if a == "--graph" and i + 1 < len(args):
+                graph_path = args[i + 1]; i += 2
+            elif a.startswith("--graph="):
+                graph_path = a.split("=", 1)[1]; i += 1
+            elif a == "--session" and i + 1 < len(args):
+                session = args[i + 1]; i += 2
+            elif a.startswith("--session="):
+                session = a.split("=", 1)[1]; i += 1
+            elif a == "--no-session":
+                session = False; i += 1
+            elif a in ("--json",):
+                fmt = "json"; i += 1
+            elif a == "--format" and i + 1 < len(args):
+                fmt = args[i + 1]; i += 2
+            elif a.startswith("--format="):
+                fmt = a.split("=", 1)[1]; i += 1
+            elif a == "--extracted-only":
+                extracted_only = True; i += 1
+            elif a == "--min-confidence" and i + 1 < len(args):
+                min_confidence = float(args[i + 1]); i += 2
+            elif a.startswith("--min-confidence="):
+                min_confidence = float(a.split("=", 1)[1]); i += 1
+            elif a == "--limit" and i + 1 < len(args):
+                limit = int(args[i + 1]); i += 2
+            elif a.startswith("--limit="):
+                limit = int(a.split("=", 1)[1]); i += 1
+            elif a == "--legend":
+                show_legend = True; i += 1
+            elif a == "--no-ops-hint":
+                show_ops_hint = False; i += 1
+            else:
+                ops.append(a); i += 1
+        out = navigate(
+            ops,
+            graph_path=graph_path or DEFAULT_GRAPH_PATH,
+            session=session,
+            fmt=fmt,
+            extracted_only=extracted_only,
+            min_confidence=min_confidence,
+            show_legend=show_legend,
+            show_ops_hint=show_ops_hint,
+            limit=limit,
+        )
+        print(out)
 
     elif cmd == "benchmark":
         from graphify.benchmark import run_benchmark, print_benchmark

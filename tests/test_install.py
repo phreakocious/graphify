@@ -237,7 +237,7 @@ def test_cursor_install_writes_rule(tmp_path):
     assert rule.exists()
     content = rule.read_text()
     assert "alwaysApply: true" in content
-    assert "graphify-out/GRAPH_REPORT.md" in content
+    assert "GRAPH_REPORT.md" in content
 
 
 def test_cursor_install_idempotent(tmp_path):
@@ -272,7 +272,7 @@ def test_gemini_install_writes_gemini_md(tmp_path):
     gemini_install(tmp_path)
     md = tmp_path / "GEMINI.md"
     assert md.exists()
-    assert "graphify-out/GRAPH_REPORT.md" in md.read_text()
+    assert "GRAPH_REPORT.md" in md.read_text()
 
 def test_gemini_install_writes_hook(tmp_path):
     import json as _json
@@ -295,7 +295,7 @@ def test_gemini_install_merges_existing_gemini_md(tmp_path):
     gemini_install(tmp_path)
     content = (tmp_path / "GEMINI.md").read_text()
     assert "# My project rules" in content
-    assert "graphify-out/GRAPH_REPORT.md" in content
+    assert "GRAPH_REPORT.md" in content
 
 def test_gemini_uninstall_removes_section(tmp_path):
     from graphify.__main__ import gemini_install, gemini_uninstall

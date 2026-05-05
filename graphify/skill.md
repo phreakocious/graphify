@@ -31,12 +31,37 @@ Turn any folder of files into a navigable knowledge graph with community detecti
 /graphify add <url>                                   # fetch URL, save to ./raw, update graph
 /graphify add <url> --author "Name"                   # tag who wrote it
 /graphify add <url> --contributor "Name"              # tag who added it to the corpus
-/graphify query "<question>"                          # BFS traversal - broad context
+/graphify navigate "@<label>"                         # *primary exploration surface* — focus a node, see typed pivots
+/graphify navigate <op>                               # apply pivot: in | out | methods | contains | coc | rat | inh | parent
+/graphify navigate "[N]"                              # focus on Nth item from last listing
+/graphify navigate --session <id>                     # resume a prior session (id is printed in every output)
+/graphify query "<question>"                          # BFS traversal - broad context (use after navigate narrows scope)
 /graphify query "<question>" --dfs                    # DFS - trace a specific path
 /graphify query "<question>" --budget 1500            # cap answer at N tokens
 /graphify path "AuthModule" "Database"                # shortest path between two concepts
-/graphify explain "SwinTransformer"                   # plain-language explanation of a node
+/graphify explain "SwinTransformer"                   # plain-language explanation of a node (one-shot)
 ```
+
+## When you should reach for navigate (self-directed context discipline)
+
+`navigate` is for *you* — the agent — not just for the user. It exists so you can ease into an unfamiliar codebase without spending 50–500x the necessary context to do it. The frontier is a dense affordance frame (~200 tokens) that tells you the shape of a region before you commit to reading it. Cursor state persists across calls, so chains compose at low marginal cost.
+
+**Default to `navigate` before any of these moves:**
+
+- **About to `Read` a source-code file you don't know.** Focus its module or class first. The frontier tells you whether the node is a leaf, a hub, or a router — and what shape of context you actually need before you start scrolling.
+- **About to implement, change, or debug something in unfamiliar territory.** A short navigate chain (focus → in/out/methods → pivot once) maps the blast radius before you touch the keyboard. Cheaper than grep-and-pray, and it surfaces callers you would otherwise miss.
+- **About to chain multiple `Read` or `Grep` calls to trace a call graph or dependency tree.** That is literally what `↗in`, `↘out`, and `path` are for, at 1–5% of the token cost.
+- **You don't know where to start.** `navigate "@<best-guess-label>"` is a cheap probe — a hit gives you a frontier; a miss returns a disambiguation listing of real names to grab onto.
+
+**Skip navigate when reading non-code files.** graphify only indexes source code. For `.json`, `.yaml`, `.toml`, `.csv`, `.md`, `.txt`, `.log`, lockfiles, build artefacts, or your own scratch/memory files, just `Read` directly — calling navigate first will miss every time and waste a tool call.
+
+**Hand off from `navigate` to other tools when:**
+- A specific node looks load-bearing → `Read` it (you now have file:line)
+- You need to know if X reaches Y → `path`
+- The user asked a one-shot factual question with a clear single target → `explain`
+- The question is genuinely diffuse and you've already narrowed the area → `query`
+
+**The dark-alley failure mode this prevents:** opening a 500KB file at line 1 to find a class, burning 14000 tokens of scrollback, then realizing the answer was three function-name hops away. If a graph exists in the working directory, navigate it first.
 
 ## What graphify is for
 
@@ -1219,6 +1244,150 @@ After writing the explanation, save it back:
 
 ```bash
 $(cat graphify-out/.graphify_python) -m graphify save-result --question "Explain NODE_NAME" --answer "ANSWER" --type explain --nodes NODE_NAME
+```
+
+---
+
+## For /graphify navigate
+
+Cursor-based graph navigation. Each call processes an op chain left-to-right and returns a dense affordance frame (~200 tokens) showing pivot counts and confidence mix — so you can prune before committing tokens.
+
+This is the tool you reach for to keep your context window from collapsing under a heavy codebase. Each frame is ~200 tokens; each pivot is another ~200–500. A full reconnaissance chain to map a class's API and find its central method runs ~700 tokens — versus 50–500x that for the equivalent sequence of `Read`/`Grep` calls.
+
+Every call generates a short session id and persists the cursor under it (`graphify-out/.navigate/<id>.json`); the id is printed at the bottom of every output. Pass it back via `--session <id>` to resume that cursor on a later call. Default chains stay one-shot — the next call without `--session` starts fresh under a new id. Per-id files mean parallel calls don't race.
+
+(See the **"When you should reach for navigate"** section near the top of this skill for the full self-directed routing rule. The short version: any time you are about to read a source-code file you don't know, or chain greps, or trace a call graph manually — navigate first. Skip for non-code files like `.json`/`.yaml`/`.md` — graphify doesn't index those.)
+
+First check the graph exists:
+```bash
+$(cat graphify-out/.graphify_python) -c "
+from pathlib import Path
+if not Path('graphify-out/graph.json').exists():
+    print('ERROR: No graph found. Run /graphify <path> first to build the graph.')
+    raise SystemExit(1)
+"
+```
+If it fails, stop and tell the user to run `/graphify <path>` first.
+
+### Operations
+
+```bash
+$(cat graphify-out/.graphify_python) -m graphify navigate <op>
+```
+
+Op forms:
+- `@<label>` — focus on a node by label or id (case-insensitive, falls back to substring match; if multiple match, returns a disambiguation listing — pick from it with `[N]`)
+- `in` — list semantic incoming edges (callers, users). Excludes structural parenthood
+- `out` — list semantic outgoing edges (callees, used). Excludes structural parenthood
+- `methods` — list method-of edges (class→method)
+- `contains` — list contains edges (file→symbol or class→nested)
+- `parent` — structural parent (enclosing file or class)
+- `coc` — co-community siblings, ranked by degree desc (capped at 25 — raise with `--limit N` for more)
+- `rat` — rationale anchors (docstring/comment nodes attached to this entity)
+- `inh` — inherits edges
+- `[N]` — focus on the Nth item from the most recent listing (e.g. `[3]`)
+- `back` — pop history (returns to the previous focus)
+- `reset` — clear cursor state
+- (no arg) or `status` — show current frontier
+
+### Output format
+
+Frontier (after focus or `back`):
+```
+@ <label> · c<community> · deg=<N> · <file>:<line> [file_type if not code]
+  ↗in(N: confidence-mix)  ↘out(N: confidence-mix)  ◉methods(N)  ◇contains(N)
+  ⊕coc(N)  ←rat(N)  →inh(N)  ⇡parent(N)  ↺(history-depth)
+```
+
+Confidence mix breaks down as `Next ext, Minf@lo-hi` — extracted edges (ground truth from AST) versus inferred edges with their score range. EXTRACTED edges are higher signal.
+
+Pivot listing (after `in`/`out`/`methods`/`coc`/...):
+```
+  <pivot-name> (total)
+  files:
+    [a] <path/file1.py>
+    [b] <path/file2.py>
+    [ 1] <label>                                c<cid>  d=<deg>  a:<line> [edge-type/conf]
+    [ 2] <label>                                c<cid>  d=<deg>  a:<line> [edge-type/conf]
+```
+The `files:` table dedups repeated paths — refer to file `a:368` rather than the full path. Listings rank EXTRACTED above INFERRED, code above rationale, then by degree.
+
+### Worked example — recon before commitment (one-shot chain)
+
+You've been asked to extend a class you've never seen. Scout it in a single atomic call:
+
+```bash
+# Chain ops in one invocation. Output is the last op's result.
+$(cat graphify-out/.graphify_python) -m graphify navigate "@GeometryAnalyzer" methods 6 in
+# This applies four ops left-to-right:
+#   @GeometryAnalyzer  → focus the class (frontier shows ◉methods(14))
+#   methods            → list the 14 methods, ranked by degree
+#   6                  → pick #6 (.add_all_geometries(), d=101) — pick is echoed in the output
+#   in                 → show its 62 callers, 60 EXTRACTED — the real call graph
+# Bottom of output prints `session: <id>` — pass `--session <id>` to a later call to resume.
+```
+
+The whole chain runs in one process, costs ~700 tokens, and tells you: where the class lives, what its API looks like, which method is central, and who depends on it. The naive alternative — `Read`-ing a 14000-line file blind, or running 4–6 `Grep` calls — would burn 50–500x more context.
+
+### Useful flags
+
+```bash
+# Drop INFERRED edges, AST ground truth only — silences noise on ↗in/↘out
+graphify navigate "@GeometryAnalyzer" --extracted-only
+
+# Programmatic chaining: structured JSON output for further analysis
+graphify navigate "@GeometryAnalyzer" methods --json
+
+# Drop INFERRED edges below confidence threshold
+graphify navigate "@GeometryAnalyzer" out --min-confidence 0.7
+
+# Raise the per-listing cap (default 25). Useful for large coc / contains pivots.
+graphify navigate "@GeometryAnalyzer" coc --limit 100
+
+# Resume a prior cursor by passing the session id printed on the previous call.
+graphify navigate --session 7a3f1c in
+
+# Show the column-key legend on first invocation
+graphify navigate "@GeometryAnalyzer" --legend
+
+# Suppress the ops cheat-sheet line (saves a few tokens per call when you know the ops)
+graphify navigate "@GeometryAnalyzer" --no-ops-hint
+
+# Disable session entirely (no disk write, no id printed)
+graphify navigate "@GeometryAnalyzer" --no-session
+```
+
+### Trust signals to watch for
+
+The renderer announces non-obvious substitutions so you can verify them, not blindly accept them:
+
+- `> matched \`@xyz\` → <real-label> (substring|fuzzy)` — the @-target wasn't an exact match. Decide whether the rewrite is what you wanted before continuing the chain.
+- `> picked [N] <label>` — confirms which item was promoted from the previous listing. After a long chain this saves you guessing at which one was selected.
+
+### Resuming a session
+
+If you want to keep navigating from where a previous call left off, copy the printed id:
+
+```bash
+$ graphify navigate "@GeometryAnalyzer" methods
+  ◉methods (14)
+  …
+  session: 7a3f1c  (resume with --session 7a3f1c)
+
+$ graphify navigate --session 7a3f1c "[6]" in
+  > picked [6] add_all_geometries
+  ↗in (62)
+  …
+```
+
+Cursors older than 30 minutes are swept on every call. If you pass an id that's been swept (or never existed), the call still proceeds with a fresh cursor under that id and prints a `note:` warning.
+
+### After answering
+
+The cursor file is small (a few hundred bytes) and self-cleaning via TTL — no need to manage it manually. If you want to reset a cursor mid-session:
+
+```bash
+graphify navigate --session 7a3f1c reset
 ```
 
 ---

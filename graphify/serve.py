@@ -232,6 +232,75 @@ def serve(graph_path: str = "graphify-out/graph.json") -> None:
                     "required": ["source", "target"],
                 },
             ),
+            types.Tool(
+                name="navigate",
+                description=(
+                    "Cursor-based graph navigation. Use this BEFORE reading unfamiliar code or "
+                    "chaining greps to map the territory cheaply (~200 tokens per affordance frame). "
+                    "Each call processes an op chain left-to-right and returns the rendered result "
+                    "of the LAST op (frontier, listing, or status).\n\n"
+                    "Sessions: every call generates a short session id and persists the cursor "
+                    "under it (graphify-out/.navigate/<id>.json), printing the id at the bottom of "
+                    "text output (or as `session` in JSON). Pass that id back via `session=<id>` "
+                    "to resume the cursor on a later call. Default chains stay one-shot — the "
+                    "next call without `session` starts fresh under a new id. Per-id files mean "
+                    "parallel calls don't race on shared state. Pass `session=\"\"` to disable "
+                    "session entirely (no disk, no id printed).\n\n"
+                    "Op forms:\n"
+                    "  '@<label>'   focus a node by label or id (substring/fuzzy fallback; substitutions are announced)\n"
+                    "  'in'         semantic incoming edges (callers / users)\n"
+                    "  'out'        semantic outgoing edges (callees / used)\n"
+                    "  'methods'    method-of edges (class→method)\n"
+                    "  'contains'   contains edges (file→symbol or class→nested)\n"
+                    "  'parent'     structural parent (enclosing file/class)\n"
+                    "  'coc'        co-community siblings (same Leiden cluster), ranked by degree\n"
+                    "  'rat'        rationale anchors (docstring/comment nodes attached to focus)\n"
+                    "  'inh'        inherits edges\n"
+                    "  '[N]' or 'N' focus on Nth item from the listing produced by the previous op (the pick is echoed)\n"
+                    "  'back'       pop history (only meaningful when resuming a session)\n"
+                    "  'reset'      clear cursor\n\n"
+                    "Examples:\n"
+                    "  ops=['@GeometryAnalyzer']                 → focus, return frontier\n"
+                    "  ops=['@GeometryAnalyzer', 'methods']      → focus + list methods\n"
+                    "  ops=['@GeometryAnalyzer', 'methods', '6'] → focus + methods + pick 6th\n"
+                    "  ops=['@GeometryAnalyzer', 'methods', '6', 'in'] → ... + show callers of #6"
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "ops": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": "Op chain applied left-to-right.",
+                        },
+                        "session": {
+                            "type": "string",
+                            "description": "Session id to resume (printed in prior output). Omit for a fresh ephemeral session. Pass empty string to disable session entirely.",
+                        },
+                        "format": {
+                            "type": "string",
+                            "enum": ["text", "json"],
+                            "default": "text",
+                            "description": "Output format. 'json' for programmatic chaining.",
+                        },
+                        "extracted_only": {
+                            "type": "boolean",
+                            "default": False,
+                            "description": "Drop INFERRED edges, AST ground truth only.",
+                        },
+                        "min_confidence": {
+                            "type": "number",
+                            "description": "Drop INFERRED edges with score below this threshold (0.0–1.0).",
+                        },
+                        "limit": {
+                            "type": "integer",
+                            "default": 25,
+                            "description": "Max items per listing (raise for full coc dumps).",
+                        },
+                    },
+                    "required": ["ops"],
+                },
+            ),
         ]
 
     def _tool_query_graph(arguments: dict) -> str:
@@ -338,6 +407,30 @@ def serve(graph_path: str = "graphify-out/graph.json") -> None:
             segments.append(f"--{rel}{conf_str}--> {G.nodes[v].get('label', v)}")
         return f"Shortest path ({hops} hops):\n  " + " ".join(segments)
 
+    def _tool_navigate(arguments: dict) -> str:
+        from graphify.navigate import navigate as _navigate, LIST_LIMIT
+        ops = arguments.get("ops") or []
+        if isinstance(ops, str):
+            ops = ops.split()
+        # session semantics: missing → ephemeral (True); "" → no-session (False);
+        # non-empty string → resume that id.
+        sess_arg = arguments.get("session")
+        if sess_arg is None:
+            session: str | bool = True
+        elif sess_arg == "":
+            session = False
+        else:
+            session = str(sess_arg)
+        return _navigate(
+            ops,
+            graph_path=graph_path,
+            session=session,
+            fmt=arguments.get("format", "text"),
+            extracted_only=bool(arguments.get("extracted_only", False)),
+            min_confidence=arguments.get("min_confidence"),
+            limit=int(arguments.get("limit", LIST_LIMIT)),
+        )
+
     _handlers = {
         "query_graph": _tool_query_graph,
         "get_node": _tool_get_node,
@@ -346,6 +439,7 @@ def serve(graph_path: str = "graphify-out/graph.json") -> None:
         "god_nodes": _tool_god_nodes,
         "graph_stats": _tool_graph_stats,
         "shortest_path": _tool_shortest_path,
+        "navigate": _tool_navigate,
     }
 
     @server.call_tool()
