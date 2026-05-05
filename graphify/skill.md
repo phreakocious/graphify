@@ -1299,7 +1299,7 @@ Frontier (after focus or `back`):
   ⊕coc(N)  ←rat(N)  →inh(N)  ⇡parent(N)  ↺(history-depth)
 ```
 
-Confidence mix breaks down as `Next ext, Minf@lo-hi` — extracted edges (ground truth from AST) versus inferred edges with their score range. EXTRACTED edges are higher signal.
+Confidence mix breaks down as `Next ext, Minf@lo-hi` — extracted edges (ground truth from AST) versus inferred edges with their score range. EXTRACTED edges are higher signal. **By default, navigate only shows EXTRACTED edges** — pass `--include-inferred` to widen the result set when you need cross-language or doc-linked breadth.
 
 Pivot listing (after `in`/`out`/`methods`/`coc`/...):
 ```
@@ -1332,14 +1332,16 @@ The whole chain runs in one process, costs ~700 tokens, and tells you: where the
 ### Useful flags
 
 ```bash
-# Drop INFERRED edges, AST ground truth only — silences noise on ↗in/↘out
-graphify navigate "@GeometryAnalyzer" --extracted-only
+# Widen results to include LLM-inferred edges (default is AST-extracted only).
+# INFERRED edges add breadth on cross-language or doc-linked navigation, but
+# are bulk-tagged at confidence ~0.80 and produce false positives on `path`.
+graphify navigate "@GeometryAnalyzer" --include-inferred
 
 # Programmatic chaining: structured JSON output for further analysis
 graphify navigate "@GeometryAnalyzer" methods --json
 
-# Drop INFERRED edges below confidence threshold
-graphify navigate "@GeometryAnalyzer" out --min-confidence 0.7
+# Drop INFERRED edges below a confidence threshold (only meaningful with --include-inferred)
+graphify navigate "@GeometryAnalyzer" out --include-inferred --min-confidence 0.9
 
 # Raise the per-listing cap (default 25). Useful for large coc / contains pivots.
 graphify navigate "@GeometryAnalyzer" coc --limit 100
@@ -1361,8 +1363,11 @@ graphify navigate "@GeometryAnalyzer" --no-session
 
 The renderer announces non-obvious substitutions so you can verify them, not blindly accept them:
 
-- `> matched \`@xyz\` → <real-label> (substring|fuzzy)` — the @-target wasn't an exact match. Decide whether the rewrite is what you wanted before continuing the chain.
+- `> matched \`@xyz\` → <real-label> (prefix|substring|fuzzy)` — the @-target wasn't an exact match. `prefix` (label starts with your key) is high-confidence; `substring` is weaker (the key appears anywhere in the label); `fuzzy` is a Levenshtein near-miss. Decide whether the rewrite is what you wanted before continuing the chain.
+- `> also near: foo, bar, baz  (pivot with @<label>)` — non-exact matches surface 3-4 near-miss candidates inline. Use them to pivot without a second call.
 - `> picked [N] <label>` — confirms which item was promoted from the previous listing. After a long chain this saves you guessing at which one was selected.
+- `chain: @X → methods(14) → 6→@.foo() → in(3)` — one-line summary of multi-op chains. `!err` segments mean an op failed; the chain aborts at the first failure rather than silently overwriting the result.
+- `chain aborted at \`X\` — fix and rerun (remaining: ...)` — the chain stopped because an op errored or returned a disambiguation listing. Address the failure (pick from the list, fix the typo, etc.) before chaining further.
 
 ### Resuming a session
 

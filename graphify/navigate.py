@@ -425,6 +425,12 @@ def _render_listing_text(data: dict, *, show_ops: bool) -> str:
             short = "/".join(Path(src).parts[-2:]) if Path(src).parts else src
             out.append(f"    [{letter}] {short}")
 
+    # Mark the trust boundary: items are sorted EXTRACTED-first, so the
+    # transition from EXTRACTED to non-EXTRACTED is the line below which the
+    # agent should scrutinise more carefully. Only meaningful when both
+    # appear (default is extracted-only, but --include-inferred can mix).
+    boundary_inserted = False
+    prev_was_extracted: bool | None = None
     for i, item in enumerate(items, start=1):
         src = item.get("source_file") or ""
         loc = item.get("source_location") or ""
@@ -438,14 +444,23 @@ def _render_listing_text(data: dict, *, show_ops: bool) -> str:
         ft = item.get("file_type", "")
         ft_tag = f" [{ft}]" if ft and ft != "code" else ""
         edge_tag = ""
+        is_extracted = False
         if "edge" in item:
             e = item["edge"]
             rel = e.get("relation", "?")
-            conf = (e.get("confidence") or "?").lower()[:3]
+            confidence = e.get("confidence") or "?"
+            is_extracted = confidence == "EXTRACTED"
+            conf = confidence.lower()[:3]
             score = e.get("confidence_score")
             if isinstance(score, (int, float)) and conf == "inf":
                 conf = f"inf@{score:.2f}"
             edge_tag = f" [{rel}/{conf}]"
+        if (not boundary_inserted and "edge" in item
+                and prev_was_extracted is True and not is_extracted):
+            out.append("    ── inferred below ──")
+            boundary_inserted = True
+        if "edge" in item:
+            prev_was_extracted = is_extracted
         label = (item.get("label") or item["id"])
         if len(label) > 44:
             label = label[:43] + "…"
@@ -684,7 +699,7 @@ def navigate(ops: list[str] | str, *,
              graph_path: str | None = None,
              session: str | bool = True,
              fmt: str = "text",
-             extracted_only: bool = False,
+             extracted_only: bool = True,
              min_confidence: float | None = None,
              show_legend: bool = False,
              show_ops_hint: bool = True,
@@ -697,7 +712,12 @@ def navigate(ops: list[str] | str, *,
         resume a prior session. False → fully stateless: no disk activity,
         no id printed.
     fmt: "text" or "json".
-    extracted_only: drop INFERRED edges.
+    extracted_only: drop INFERRED edges. Default True — AST ground truth is
+        almost always what an agent wants for navigation. Pass False (or use
+        the CLI `--include-inferred` flag) to widen the result set to include
+        LLM-inferred edges, which are bulk-tagged at confidence ~0.80 and add
+        useful breadth on cross-language or doc-linked navigation but produce
+        false positives on `path` queries (string-match fallthrough).
     min_confidence: drop edges with score below threshold.
     show_legend: prepend a one-line legend before output.
     show_ops_hint: append the ops cheat-sheet (turn off in chained agent calls).

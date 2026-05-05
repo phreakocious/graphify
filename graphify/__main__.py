@@ -207,7 +207,7 @@ Chain ops in a single call — left-to-right, output is the last op's result. Ea
 graphify navigate "@<symbol>"                    # focus a node, return frontier (~200 tok)
 graphify navigate "@<symbol>" methods            # focus + list methods
 graphify navigate "@<symbol>" methods 6 in       # focus + methods + pick 6th + show callers
-graphify navigate "@<symbol>" --extracted-only   # drop INFERRED edges, AST ground truth only
+graphify navigate "@<symbol>" --include-inferred # widen to LLM-inferred edges (default: AST only)
 graphify navigate "@<symbol>" --json             # structured JSON for programmatic chaining
 graphify navigate --session <id> in              # resume a prior session, run another op
 ```
@@ -1049,8 +1049,8 @@ def main() -> None:
         print("    --session <id>          resume a prior session (id is printed at the bottom of every output)")
         print("    --no-session            disable session entirely (no disk, no id printed)")
         print("    --json                  structured JSON output")
-        print("    --extracted-only        drop INFERRED edges (AST ground truth only)")
-        print("    --min-confidence X      drop INFERRED edges below score X")
+        print("    --include-inferred      include LLM-inferred edges (default: AST-extracted only)")
+        print("    --min-confidence X      drop edges below score X (only meaningful with --include-inferred)")
         print("    --limit N               max items per listing (default 25)")
         print("    --legend                prepend column-key legend")
         print("    --no-ops-hint           omit the ops cheat-sheet line")
@@ -1287,7 +1287,7 @@ def main() -> None:
         print(f"Saved to {out}")
     elif cmd == "path":
         if len(sys.argv) < 4:
-            print("Usage: graphify path \"<source>\" \"<target>\" [--graph path]", file=sys.stderr)
+            print("Usage: graphify path \"<source>\" \"<target>\" [--graph path] [--include-inferred]", file=sys.stderr)
             sys.exit(1)
         from graphify.serve import _score_nodes
         from networkx.readwrite import json_graph
@@ -1295,10 +1295,13 @@ def main() -> None:
         source_label = sys.argv[2]
         target_label = sys.argv[3]
         graph_path = "graphify-out/graph.json"
+        include_inferred = False  # default: AST ground truth only
         args = sys.argv[4:]
         for i, a in enumerate(args):
             if a == "--graph" and i + 1 < len(args):
                 graph_path = args[i + 1]
+            elif a == "--include-inferred":
+                include_inferred = True
         gp = Path(graph_path).resolve()
         if not gp.exists():
             print(f"error: graph file not found: {gp}", file=sys.stderr)
@@ -1308,6 +1311,14 @@ def main() -> None:
             G = json_graph.node_link_graph(_raw, edges="links")
         except TypeError:
             G = json_graph.node_link_graph(_raw)
+        # Filter the graph to EXTRACTED edges by default — INFERRED edges
+        # produce string-match shortcuts (path through a docstring fragment
+        # rather than a real call) that mislead more than they help.
+        if not include_inferred:
+            edges_to_drop = [(u, v) for u, v, d in G.edges(data=True)
+                             if d.get("confidence") and d["confidence"] != "EXTRACTED"]
+            G = G.copy()
+            G.remove_edges_from(edges_to_drop)
         src_scored = _score_nodes(G, [t.lower() for t in source_label.split()])
         tgt_scored = _score_nodes(G, [t.lower() for t in target_label.split()])
         if not src_scored:
@@ -1320,7 +1331,8 @@ def main() -> None:
         try:
             path_nodes = _nx.shortest_path(G, src_nid, tgt_nid)
         except (_nx.NetworkXNoPath, _nx.NodeNotFound):
-            print(f"No path found between '{source_label}' and '{target_label}'.")
+            hint = "" if include_inferred else " (try --include-inferred to widen)"
+            print(f"No path found between '{source_label}' and '{target_label}'.{hint}")
             sys.exit(0)
         hops = len(path_nodes) - 1
         segments = []
@@ -1469,13 +1481,14 @@ def main() -> None:
     elif cmd == "navigate" or cmd == "nav":
         from graphify.navigate import navigate, DEFAULT_GRAPH_PATH, LIST_LIMIT
         # Parse: --graph PATH, --session <id>, --no-session, --json|--format json,
-        # --extracted-only, --min-confidence FLOAT, --legend, --no-ops-hint,
-        # --limit N. Remaining args = op chain.
+        # --include-inferred, --extracted-only (no-op alias for back-compat),
+        # --min-confidence FLOAT, --legend, --no-ops-hint, --limit N.
+        # Remaining args = op chain.
         args = sys.argv[2:]
         graph_path: str | None = None
         session: str | bool = True  # True = ephemeral with auto-id
         fmt = "text"
-        extracted_only = False
+        extracted_only = True   # default: AST ground truth only
         min_confidence: float | None = None
         show_legend = False
         show_ops_hint = True
@@ -1500,7 +1513,10 @@ def main() -> None:
                 fmt = args[i + 1]; i += 2
             elif a.startswith("--format="):
                 fmt = a.split("=", 1)[1]; i += 1
+            elif a == "--include-inferred":
+                extracted_only = False; i += 1
             elif a == "--extracted-only":
+                # back-compat alias: was the opt-in flag, is now the default
                 extracted_only = True; i += 1
             elif a == "--min-confidence" and i + 1 < len(args):
                 min_confidence = float(args[i + 1]); i += 2

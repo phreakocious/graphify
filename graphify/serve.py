@@ -283,10 +283,10 @@ def serve(graph_path: str = "graphify-out/graph.json") -> None:
                             "default": "text",
                             "description": "Output format. 'json' for programmatic chaining.",
                         },
-                        "extracted_only": {
+                        "include_inferred": {
                             "type": "boolean",
                             "default": False,
-                            "description": "Drop INFERRED edges, AST ground truth only.",
+                            "description": "Include LLM-inferred edges (default: AST-extracted only). INFERRED edges are bulk-tagged at confidence ~0.80 and add breadth on cross-language or doc-linked navigation but produce false positives on `path` queries.",
                         },
                         "min_confidence": {
                             "type": "number",
@@ -426,7 +426,7 @@ def serve(graph_path: str = "graphify-out/graph.json") -> None:
             graph_path=graph_path,
             session=session,
             fmt=arguments.get("format", "text"),
-            extracted_only=bool(arguments.get("extracted_only", False)),
+            extracted_only=not bool(arguments.get("include_inferred", False)),
             min_confidence=arguments.get("min_confidence"),
             limit=int(arguments.get("limit", LIST_LIMIT)),
         )
