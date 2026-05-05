@@ -1000,11 +1000,51 @@ def _semantic_pass(rel: str, kinds: set[str] | None) -> bool:
     return rel not in _STRUCTURAL
 
 
+def _transitive_walk(G: nx.DiGraph, nid: str, *,
+                     direction: str,  # "out" | "in"
+                     depth: int,
+                     extracted_only: bool,
+                     min_confidence: float | None,
+                     kinds: set[str] | None) -> tuple[list[str], dict[str, dict]]:
+    """BFS from nid along non-structural edges in `direction` for `depth` hops.
+
+    Returns (ordered_ids, edge_for_dict) where edge_for is keyed by the
+    *first* time we saw a node (the closest hop's edge). Cycles are skipped
+    via a visited set. Used by `in`/`out` when `--depth > 1` is passed.
+    """
+    visited = {nid}
+    frontier = {nid}
+    found: list[str] = []
+    edge_for: dict[str, dict] = {}
+    for _ in range(max(1, depth)):
+        new_frontier: set[str] = set()
+        for u in frontier:
+            iterable = (G.successors(u) if direction == "out"
+                        else G.predecessors(u))
+            for v in iterable:
+                e = G.edges[u, v] if direction == "out" else G.edges[v, u]
+                if not _semantic_pass(e.get("relation") or "", kinds):
+                    continue
+                if not _passes_confidence(e, extracted_only, min_confidence):
+                    continue
+                if v in visited:
+                    continue
+                visited.add(v)
+                found.append(v)
+                edge_for[v] = e
+                new_frontier.add(v)
+        frontier = new_frontier
+        if not frontier:
+            break
+    return found, edge_for
+
+
 def _pivot_data(G: nx.DiGraph, communities: dict[int, list[str]],
                 cursor: Cursor, key: str, *,
                 extracted_only: bool,
                 min_confidence: float | None,
-                kinds: set[str] | None = None
+                kinds: set[str] | None = None,
+                depth: int = 1
                 ) -> tuple[str, list[str], dict[str, dict], str, dict[str, int]]:
     """Return (pivot_label, ordered_ids, edge_for_dict, sort_label, drops) for a pivot key.
 
@@ -1028,32 +1068,52 @@ def _pivot_data(G: nx.DiGraph, communities: dict[int, list[str]],
                             if G.edges[u, nid].get("relation") not in _STRUCTURAL]
         all_in = [G.edges[u, nid] for u in G.predecessors(nid)
                   if _semantic_pass(G.edges[u, nid].get("relation") or "", kinds)]
-        preds = [u for u in G.predecessors(nid)
-                 if _semantic_pass(G.edges[u, nid].get("relation") or "", kinds)
-                 and _passes_confidence(G.edges[u, nid], extracted_only, min_confidence)]
-        edge_for = {u: G.edges[u, nid] for u in preds}
-        preds.sort(key=lambda x: _rank_key(G, x, edge_for[x]))
+        if depth > 1:
+            preds, edge_for = _transitive_walk(
+                G, nid, direction="in", depth=depth,
+                extracted_only=extracted_only, min_confidence=min_confidence,
+                kinds=kinds,
+            )
+            preds.sort(key=lambda x: _rank_key(G, x, edge_for[x]))
+            sort_label = f"transitive (depth≤{depth}), extracted-first, then degree desc"
+        else:
+            preds = [u for u in G.predecessors(nid)
+                     if _semantic_pass(G.edges[u, nid].get("relation") or "", kinds)
+                     and _passes_confidence(G.edges[u, nid], extracted_only, min_confidence)]
+            edge_for = {u: G.edges[u, nid] for u in preds}
+            preds.sort(key=lambda x: _rank_key(G, x, edge_for[x]))
+            sort_label = "extracted-first, then degree desc"
         drops = _drop_breakdown(all_in, extracted_only, min_confidence)
         kd = _kind_drops(full_semantic_in, kinds)
         if kd:
             drops["by_rel"] = kd
-        return ("↗in", preds, edge_for, "extracted-first, then degree desc", drops)
+        return ("↗in", preds, edge_for, sort_label, drops)
 
     if key == "out":
         full_semantic_out = [G.edges[nid, v] for v in G.successors(nid)
                              if G.edges[nid, v].get("relation") not in _STRUCTURAL]
         all_out = [G.edges[nid, v] for v in G.successors(nid)
                    if _semantic_pass(G.edges[nid, v].get("relation") or "", kinds)]
-        succs = [v for v in G.successors(nid)
-                 if _semantic_pass(G.edges[nid, v].get("relation") or "", kinds)
-                 and _passes_confidence(G.edges[nid, v], extracted_only, min_confidence)]
-        edge_for = {v: G.edges[nid, v] for v in succs}
-        succs.sort(key=lambda x: _rank_key(G, x, edge_for[x]))
+        if depth > 1:
+            succs, edge_for = _transitive_walk(
+                G, nid, direction="out", depth=depth,
+                extracted_only=extracted_only, min_confidence=min_confidence,
+                kinds=kinds,
+            )
+            succs.sort(key=lambda x: _rank_key(G, x, edge_for[x]))
+            sort_label = f"transitive (depth≤{depth}), extracted-first, then degree desc"
+        else:
+            succs = [v for v in G.successors(nid)
+                     if _semantic_pass(G.edges[nid, v].get("relation") or "", kinds)
+                     and _passes_confidence(G.edges[nid, v], extracted_only, min_confidence)]
+            edge_for = {v: G.edges[nid, v] for v in succs}
+            succs.sort(key=lambda x: _rank_key(G, x, edge_for[x]))
+            sort_label = "extracted-first, then degree desc"
         drops = _drop_breakdown(all_out, extracted_only, min_confidence)
         kd = _kind_drops(full_semantic_out, kinds)
         if kd:
             drops["by_rel"] = kd
-        return ("↘out", succs, edge_for, "extracted-first, then degree desc", drops)
+        return ("↘out", succs, edge_for, sort_label, drops)
 
     if key == "methods":
         all_m = [G.edges[nid, v] for v in G.successors(nid)
@@ -1324,7 +1384,8 @@ def navigate(ops: list[str] | str, *,
              show_ops_hint: bool = True,
              limit: int = LIST_LIMIT,
              kinds: set[str] | None = None,
-             bodies: int | None = None) -> str:
+             bodies: int | None = None,
+             depth: int = 1) -> str:
     """Apply a chain of ops, return rendered output.
 
     ops: list of ops or a single string. Strings get split on whitespace.
@@ -1523,6 +1584,7 @@ def navigate(ops: list[str] | str, *,
                         extracted_only=extracted_only,
                         min_confidence=min_confidence,
                         kinds=kinds,
+                        depth=depth,
                     )
                     # Persist only the rendered window — keeps the cursor file
                     # small (coc on a 1000-node community would otherwise be ~40KB).

@@ -1059,6 +1059,7 @@ def main() -> None:
         print("    --min-confidence X      drop edges below score X (only meaningful with --include-inferred)")
         print("    --kind <rel[,rel,...]>  restrict in/out listings to edges of these relations (e.g. calls,uses)")
         print("    --bodies N              show first N source lines under each contains/methods item")
+        print("    --depth N               for in/out, walk N hops via non-structural edges (default 1)")
         print("    --limit N               max items per listing (default 25)")
         print("    --legend                prepend column-key legend")
         print("    --no-ops-hint           omit the ops cheat-sheet line")
@@ -1623,6 +1624,7 @@ def main() -> None:
         limit = LIST_LIMIT
         kinds: set[str] | None = None
         bodies: int | None = None
+        depth: int = 1
         i = 0
         ops: list[str] = []
         while i < len(args):
@@ -1666,6 +1668,10 @@ def main() -> None:
                 bodies = int(args[i + 1]); i += 2
             elif a.startswith("--bodies="):
                 bodies = int(a.split("=", 1)[1]); i += 1
+            elif a == "--depth" and i + 1 < len(args):
+                depth = max(1, int(args[i + 1])); i += 2
+            elif a.startswith("--depth="):
+                depth = max(1, int(a.split("=", 1)[1])); i += 1
             elif a == "--legend":
                 show_legend = True; i += 1
             elif a == "--no-ops-hint":
@@ -1684,6 +1690,7 @@ def main() -> None:
             limit=limit,
             kinds=kinds,
             bodies=bodies,
+            depth=depth,
         )
         print(out)
 
