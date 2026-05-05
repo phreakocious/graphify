@@ -46,7 +46,12 @@ _STRUCTURAL = ("method", "contains", "rationale_for", "inherits")
 # --- loading ---------------------------------------------------------------
 
 def load_graph(graph_path: str | Path) -> tuple[nx.DiGraph, dict[int, list[str]]]:
-    """Load graph.json as a DiGraph plus a community→[node_ids] map."""
+    """Load graph.json as a DiGraph plus a community→[node_ids] map.
+
+    Also stamps each community's top-degree node label onto the DiGraph as
+    `G.graph['community_labels']` — used by the renderer to print
+    `c5=ExoticGeometryFramework` instead of bare `c5`.
+    """
     path = Path(graph_path)
     data = json.loads(path.read_text(encoding="utf-8"))
     G = build_from_json(data, directed=True)
@@ -55,7 +60,37 @@ def load_graph(graph_path: str | Path) -> tuple[nx.DiGraph, dict[int, list[str]]
         cid = attrs.get("community")
         if cid is not None:
             communities[cid].append(nid)
+    # Auto-name communities by their highest-degree member. Skip rationale
+    # nodes (they're docstrings/comments — labels would be sentence-shaped
+    # rather than identifier-shaped) and cap label length so it stays compact.
+    community_labels: dict[int, str] = {}
+    for cid, members in communities.items():
+        ranked = sorted(
+            (m for m in members
+             if G.nodes[m].get("file_type") != "rationale"),
+            key=lambda n: -(G.in_degree(n) + G.out_degree(n)),
+        )
+        if not ranked:
+            continue
+        raw = G.nodes[ranked[0]].get("label", ranked[0])
+        # Strip whitespace, collapse multi-line, cap length so the label
+        # doesn't blow out frontier/listing line budgets.
+        clean = " ".join(str(raw).split())
+        if len(clean) > 28:
+            clean = clean[:27] + "…"
+        community_labels[cid] = clean
+    G.graph["community_labels"] = community_labels
     return G, dict(communities)
+
+
+def _community_tag(G: nx.DiGraph, cid: int | str | None) -> str:
+    """Render community as `c<cid>=<auto-name>` when a name is available, else `c<cid>`."""
+    if cid is None or cid == "?" or cid == -1:
+        return f"c{cid}"
+    labels = G.graph.get("community_labels") if hasattr(G, "graph") else None
+    if labels and cid in labels:
+        return f"c{cid}={labels[cid]}"
+    return f"c{cid}"
 
 
 def _norm(s: str) -> str:
@@ -378,10 +413,13 @@ def _node_summary(G: nx.DiGraph, nid: str) -> dict:
     a = G.nodes[nid]
     src = a.get("source_file")
     meta = _file_meta(src) if src else {}
+    cid = a.get("community")
+    labels = (G.graph.get("community_labels") if hasattr(G, "graph") else None) or {}
     return {
         "id": nid,
         "label": a.get("label", nid),
-        "community": a.get("community"),
+        "community": cid,
+        "community_label": labels.get(cid) if cid is not None else None,
         "degree": G.in_degree(nid) + G.out_degree(nid),
         "source_file": src,
         "source_location": a.get("source_location"),
@@ -677,6 +715,8 @@ def _render_frontier_text(data: dict, cursor: Cursor, *, show_ops: bool) -> str:
 
     n = data["current"]
     cid = n.get("community", "?")
+    clabel = n.get("community_label")
+    cstr = f"c{cid}={clabel}" if clabel else f"c{cid}"
     src = _short_src(n.get("source_file"), n.get("source_location"))
     ftype_tag = ""
     ft = n.get("file_type", "")
@@ -684,7 +724,7 @@ def _render_frontier_text(data: dict, cursor: Cursor, *, show_ops: bool) -> str:
         ftype_tag = f" [{ft}]"
 
     p = data["pivots"]
-    header = f"@ {n['label']}  · c{cid} · deg={n['degree']} · {src}{ftype_tag}{_meta_tag(n)}"
+    header = f"@ {n['label']}  · {cstr} · deg={n['degree']} · {src}{ftype_tag}{_meta_tag(n)}"
 
     def _glyph(prefix: str, pv: dict, with_conf: bool = False) -> str:
         # Format: glyph(count[: conf-mix][; +Ninf hidden][; +M via methods])
@@ -1109,7 +1149,10 @@ def _pivot_data(G: nx.DiGraph, communities: dict[int, list[str]],
             return ("⊕coc", [], {}, "", {})
         members = [n for n in communities.get(cid, []) if n != nid]
         members.sort(key=lambda x: -(G.in_degree(x) + G.out_degree(x)))
-        return (f"⊕coc(c{cid})", members, {}, "degree desc", {})
+        labels = G.graph.get("community_labels") if hasattr(G, "graph") else None
+        clabel = (labels or {}).get(cid)
+        pname = f"⊕coc(c{cid}={clabel})" if clabel else f"⊕coc(c{cid})"
+        return (pname, members, {}, "degree desc", {})
 
     return ("", [], {}, "", {})
 
