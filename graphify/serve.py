@@ -46,6 +46,25 @@ def _strip_diacritics(text: str) -> str:
 
 
 def _score_nodes(G: nx.Graph, terms: list[str]) -> list[tuple[float, str]]:
+    """Term-bag scoring with lap-7 ranking refinements:
+
+    Base: 1.0 per term in the label, 0.5 per term in the source file path.
+
+    Adjustments:
+      - Archive penalty (×0.5) for files under frozen/legacy/deprecated/
+        archive/archived path segments. Field report: `query` was
+        surfacing 25 archived triadic-*.ts variants before any
+        load-bearing match because co-occurrence in archived siblings
+        was rewarding stale code.
+      - Degree boost (capped) tilts ties toward load-bearing nodes —
+        a high-degree hub is much more likely the answer than a
+        leaf with the same term overlap.
+
+    Imported lazily from navigate to avoid a top-level cycle (navigate
+    pulls in argparse, security, etc.). The function exists exactly to
+    keep this module self-contained at import time.
+    """
+    from graphify.navigate import _is_archived_path
     scored = []
     norm_terms = [_strip_diacritics(t).lower() for t in terms]
     for nid, data in G.nodes(data=True):
@@ -53,6 +72,13 @@ def _score_nodes(G: nx.Graph, terms: list[str]) -> list[tuple[float, str]]:
         source = (data.get("source_file") or "").lower()
         score = sum(1 for t in norm_terms if t in norm_label) + sum(0.5 for t in norm_terms if t in source)
         if score > 0:
+            if _is_archived_path(source):
+                score *= 0.5
+            # Cap degree contribution so it's a tie-breaker, not a dominant
+            # signal — otherwise generic hubs (the project's god node) would
+            # win every query regardless of term match.
+            deg = G.degree(nid)
+            score += min(deg, 20) * 0.05
             scored.append((score, nid))
     return sorted(scored, reverse=True)
 
@@ -89,11 +115,25 @@ def _dfs(G: nx.Graph, start_nodes: list[str], depth: int) -> tuple[set[str], lis
     return visited, edges_seen
 
 
-def _subgraph_to_text(G: nx.Graph, nodes: set[str], edges: list[tuple], token_budget: int = 2000) -> str:
-    """Render subgraph as text, cutting at token_budget (approx 3 chars/token)."""
+def _subgraph_to_text(G: nx.Graph, nodes: set[str], edges: list[tuple],
+                      token_budget: int = 2000,
+                      priority_nodes: list[str] | None = None) -> str:
+    """Render subgraph as text, cutting at token_budget (approx 3 chars/token).
+
+    `priority_nodes` is an ordered list of node ids that should appear first
+    in the output, in the given order. Used by the no-@-anchor `query` path
+    to keep the term-scorer's top-ranked nodes visible at the top — without
+    this, BFS expansion plus degree-sort would surface hub neighbors
+    (`types.ts`, generic helpers) above the actual term-scored hit, even
+    when the start set was correctly chosen.
+    """
     char_budget = token_budget * 3
     lines = []
-    for nid in sorted(nodes, key=lambda n: G.degree(n), reverse=True):
+    priority_set = set(priority_nodes or [])
+    rest = [n for n in nodes if n not in priority_set]
+    rest.sort(key=lambda n: G.degree(n), reverse=True)
+    ordered_nodes = [n for n in (priority_nodes or []) if n in nodes] + rest
+    for nid in ordered_nodes:
         d = G.nodes[nid]
         line = f"NODE {sanitize_label(d.get('label', nid))} [src={d.get('source_file', '')} loc={d.get('source_location', '')} community={d.get('community', '')}]"
         lines.append(line)
@@ -240,10 +280,11 @@ def serve(graph_path: str = "graphify-out/graph.json") -> None:
                     "Each call processes an op chain left-to-right and returns the rendered result "
                     "of the LAST op (frontier, listing, or status).\n\n"
                     "Sessions: every call generates a short session id and persists the cursor "
-                    "under it (graphify-out/.navigate/<id>.json), printing the id at the bottom of "
-                    "text output (or as `session` in JSON). Pass that id back via `session=<id>` "
-                    "to resume the cursor on a later call. Default chains stay one-shot — the "
-                    "next call without `session` starts fresh under a new id. Per-id files mean "
+                    "under it (graphify-out/.navigate/<id>.json). The id is only printed at the "
+                    "bottom of text output (or returned as `session` in JSON) when chaining is in "
+                    "flight: a chain paused at a disambig, `session` was passed in, or the cursor "
+                    "walked more than one step. Pass that id back via `session=<id>` to resume the "
+                    "cursor on a later call. Per-id files mean "
                     "parallel calls don't race on shared state. Pass `session=\"\"` to disable "
                     "session entirely (no disk, no id printed).\n\n"
                     "Op forms:\n"

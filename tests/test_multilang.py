@@ -88,6 +88,124 @@ def test_ts_closure_factory_surfaces_inner_closures():
         )
 
 
+def test_ts_interface_and_class_node_kind(tmp_path):
+    """Lap-6 friction 5: extracted nodes must carry `node_kind` so the
+    disambig listing can annotate `[iface]`/`[impl]`. Without this the
+    agent can't tell a runtime class method from an interface signature
+    that share the same name."""
+    src = tmp_path / "shape.ts"
+    src.write_text("""
+interface Shape {
+  area(): number;
+}
+class Circle implements Shape {
+  area(): number { return 3.14; }
+}
+""")
+    r = extract_js(src)
+    by_label = {n["label"]: n for n in r["nodes"]}
+    assert by_label["Shape"]["node_kind"] == "interface"
+    assert by_label["Circle"]["node_kind"] == "class"
+    assert by_label[".area()"]["node_kind"] in ("iface_method", "impl_method")
+    # Both interface and class have a `.area()` — find them by parent kind
+    iface_method_id = by_label["Shape"]["id"]
+    impl_method_id = by_label["Circle"]["id"]
+    method_targets = {(e["source"], e["target"])
+                      for e in r["edges"] if e["relation"] == "method"}
+    assert any(s == iface_method_id for s, _ in method_targets)
+    assert any(s == impl_method_id for s, _ in method_targets)
+
+
+def test_ts_interface_property_signatures_become_methods(tmp_path):
+    """Lap-12: a callback-typed interface member like
+    `prebuilt: (engine) => void` is a `property_signature` AST node, not a
+    `method_signature`. Both shapes are part of the interface contract, so
+    `methods`/`contains` should surface them. Plain data fields under inline
+    type literals (function param types) must NOT leak as nodes."""
+    src = tmp_path / "iface.ts"
+    src.write_text("""
+export interface TriggerHooks {
+    prebuilt: (engine: any) => void;
+    captureLayer: (n: number) => void;
+    runHook(name: string): boolean;
+}
+function consume(opts: { temp: number }): void { }
+""")
+    r = extract_js(src)
+    by_label = {n["label"]: n for n in r["nodes"]}
+    # All three interface members should land as iface_method.
+    for name in (".prebuilt()", ".captureLayer()", ".runHook()"):
+        assert name in by_label, f"missing {name}, got: {sorted(by_label)}"
+        assert by_label[name]["node_kind"] == "iface_method", (
+            f"{name} should be iface_method, got: {by_label[name]['node_kind']}"
+        )
+    # All three should be method-of the interface.
+    iface_id = by_label["TriggerHooks"]["id"]
+    method_targets = {(e["source"], e["target"])
+                      for e in r["edges"] if e["relation"] == "method"}
+    for name in (".prebuilt()", ".captureLayer()", ".runHook()"):
+        assert (iface_id, by_label[name]["id"]) in method_targets, (
+            f"missing method edge TriggerHooks → {name}"
+        )
+    # Inline type literal in `consume(opts: { temp: number })` must NOT
+    # produce a `.temp()` node.
+    assert ".temp()" not in by_label, (
+        f"inline type-literal property leaked as a node: {sorted(by_label)}"
+    )
+
+
+def test_ts_class_implements_interface_emits_impl_of(tmp_path):
+    """`class Foo implements Bar` should yield an `impl_of` edge (not a
+    raw type_ref) when Bar is in the same file."""
+    src = tmp_path / "iface.ts"
+    src.write_text("""
+interface Pet { name: string; }
+class Dog implements Pet { name = "rex"; }
+""")
+    r = extract_js(src)
+    impl_of = [(e["source"], e["target"]) for e in r["edges"]
+               if e["relation"] == "impl_of"]
+    assert len(impl_of) == 1, f"expected 1 impl_of edge, got: {r['edges']}"
+    by_label = {n["label"]: n["id"] for n in r["nodes"]}
+    assert (by_label["Dog"], by_label["Pet"]) in impl_of
+
+
+def test_ts_interface_extends_emits_inherits(tmp_path):
+    """`interface Pet extends Animal` should yield an `inherits` edge
+    in the same file."""
+    src = tmp_path / "ext.ts"
+    src.write_text("""
+interface Animal { age: number; }
+interface Pet extends Animal { owner: string; }
+""")
+    r = extract_js(src)
+    inh = [(e["source"], e["target"]) for e in r["edges"]
+           if e["relation"] == "inherits"]
+    by_label = {n["label"]: n["id"] for n in r["nodes"]}
+    assert (by_label["Pet"], by_label["Animal"]) in inh
+
+
+def test_ts_type_ref_captures_param_and_return_types(tmp_path):
+    """Lap-6 friction 6: TS interfaces and type aliases used as types
+    in function signatures must produce `type_ref` edges. Without this,
+    `SteeringMode`/`TriggerHooks` show degree=1 even when they're the
+    canonical type surface used everywhere."""
+    src = tmp_path / "use.ts"
+    src.write_text("""
+interface Hook { on(): void; }
+type Mode = "fast" | "slow";
+function run(h: Hook, m: Mode): Hook {
+  return h;
+}
+""")
+    r = extract_js(src)
+    by_label = {n["label"]: n["id"] for n in r["nodes"]}
+    type_refs = {(e["source"], e["target"]) for e in r["edges"]
+                 if e["relation"] == "type_ref"}
+    assert (by_label["run()"], by_label["Hook"]) in type_refs
+    assert (by_label["run()"], by_label["Mode"]) in type_refs
+
+
 def test_ts_closure_factory_intra_call_attributes_correctly():
     """A call inside a nested closure must register the closure as the
     caller, not the outer factory. Without this, `injectForward calls

@@ -461,9 +461,15 @@ _TS_CONFIG = LanguageConfig(
     # `method_signature` registers interface members as method-shaped
     # children of the interface, so `@DecodeEngine methods` lists the
     # interface contract — the same shape `@SomeClass methods` already
-    # gives for runtime classes.
+    # gives for runtime classes. `property_signature` is the form
+    # `prebuilt: (engine) => void` — a callback-typed interface member
+    # that's structurally a method but lacks the `()` syntax, so it
+    # has its own AST node. Registering both means an interface with
+    # mixed `foo()` / `bar: () => T` members surfaces all of them
+    # under `methods`/`contains`.
     function_types=frozenset({
-        "function_declaration", "method_definition", "method_signature",
+        "function_declaration", "method_definition",
+        "method_signature", "property_signature",
     }),
     import_types=frozenset({"import_statement"}),
     call_types=frozenset({"call_expression"}),
@@ -695,18 +701,38 @@ def _extract_generic(path: Path, config: LanguageConfig) -> dict:
     edges: list[dict] = []
     seen_ids: set[str] = set()
     function_bodies: list[tuple[str, object]] = []
+    # Parallel list capturing the full function/class declaration node
+    # (not just its body) so the TS type-ref pass can walk param types,
+    # return types, generic constraints, and extends/implements clauses.
+    # Keyed by the same nid as function_bodies so each scope has at most
+    # one entry per nid (the latest write wins on duplicates, which only
+    # happens when a name is redeclared — already a code-smell).
+    function_decls: list[tuple[str, object]] = []
     pending_listen_edges: list[tuple[str, str, int]] = []
+    # Map class_nid → node_kind so the method walk can stamp method nodes
+    # with the parent kind (impl_method vs iface_method). Captured via the
+    # `add_node` kind kwarg below so it survives across recursion frames
+    # without threading a parent_kind variable through every walk arm.
+    nid_to_kind: dict[str, str] = {}
 
-    def add_node(nid: str, label: str, line: int) -> None:
+    def add_node(nid: str, label: str, line: int, kind: str | None = None) -> None:
         if nid not in seen_ids:
             seen_ids.add(nid)
-            nodes.append({
+            attrs: dict = {
                 "id": nid,
                 "label": label,
                 "file_type": "code",
                 "source_file": str_path,
                 "source_location": f"L{line}",
-            })
+            }
+            # `node_kind` distinguishes class vs interface vs type-alias vs
+            # iface-method vs impl-method. The disambig listing reads this
+            # to annotate `[iface]`/`[impl]` so the agent doesn't pick a
+            # type declaration when they meant the runtime implementation.
+            if kind:
+                attrs["node_kind"] = kind
+                nid_to_kind[nid] = kind
+            nodes.append(attrs)
 
     def add_edge(src: str, tgt: str, relation: str, line: int,
                  confidence: str = "EXTRACTED", weight: float = 1.0) -> None:
@@ -746,8 +772,76 @@ def _extract_generic(path: Path, config: LanguageConfig) -> dict:
             class_name = _read_text(name_node, source)
             class_nid = _make_id(stem, class_name)
             line = node.start_point[0] + 1
-            add_node(class_nid, class_name, line)
+            # Map tree-sitter type → coarse kind for the disambig annotator.
+            # Anything else (rare per-language types) falls back to "class".
+            kind_map = {
+                "interface_declaration": "interface",
+                "type_alias_declaration": "type_alias",
+                "protocol_declaration": "interface",
+                "object_declaration": "object",
+                "object_definition": "object",
+                "class_specifier": "class",
+                "class_definition": "class",
+                "class_declaration": "class",
+                "class": "class",
+            }
+            class_kind = kind_map.get(t, "class")
+            add_node(class_nid, class_name, line, kind=class_kind)
             add_edge(file_nid, class_nid, "contains", line)
+            # Capture the full class declaration too so the type-ref pass
+            # picks up generic constraints and extends/implements idents
+            # at the class level. (Methods inside add their own entries.)
+            function_decls.append((class_nid, node))
+
+            # TS/JS: capture `class Foo implements Bar, Baz` so we can link
+            # the impl class to its iface-decls. The implements_clause is
+            # nested under class_heritage in TS — direct children of the
+            # class node are: class, type_identifier, class_heritage,
+            # class_body. We walk class_heritage too so the dispatch
+            # finds it. Same-file resolution by stem; cross-file would
+            # need an import graph the AST extractor doesn't have.
+            #
+            # Also handles `interface Pet extends Animal` for interface
+            # inheritance — emits an `inherits` edge for that case so the
+            # graph reflects the extension chain.
+            if config.ts_module in ("tree_sitter_javascript",
+                                     "tree_sitter_typescript",
+                                     "tree_sitter_java",
+                                     "tree_sitter_c_sharp"):
+                def _emit_iface_link(iface_text: str, edge_kind: str) -> None:
+                    iface_name = iface_text.split("<", 1)[0].strip()
+                    if not iface_name:
+                        return
+                    iface_nid = _make_id(stem, iface_name)
+                    if iface_nid in seen_ids:
+                        add_edge(class_nid, iface_nid, edge_kind, line)
+
+                def _walk_heritage(parent_node) -> None:
+                    """Look for implements_clause/extends_type_clause/etc.
+                    inside heritage wrappers. TS wraps them in class_heritage;
+                    interface_declaration nests extends_type_clause directly."""
+                    for child in parent_node.children:
+                        ct = child.type
+                        if ct in ("class_heritage",):
+                            _walk_heritage(child)
+                        elif ct in ("implements_clause", "super_interfaces"):
+                            for sub in child.children:
+                                if sub.is_named and sub.type in (
+                                    "type_identifier", "identifier",
+                                    "generic_type", "qualified_name",
+                                ):
+                                    _emit_iface_link(_read_text(sub, source),
+                                                     "impl_of")
+                        elif ct == "extends_type_clause" and t == "interface_declaration":
+                            for sub in child.children:
+                                if sub.is_named and sub.type in (
+                                    "type_identifier", "identifier",
+                                    "generic_type", "qualified_name",
+                                ):
+                                    _emit_iface_link(_read_text(sub, source),
+                                                     "inherits")
+
+                _walk_heritage(node)
 
             # Python-specific: inheritance
             if config.ts_module == "tree_sitter_python":
@@ -876,6 +970,14 @@ def _extract_generic(path: Path, config: LanguageConfig) -> dict:
 
         # Function types
         if t in config.function_types:
+            # `property_signature` is only meaningful as an interface/
+            # type-alias contract member. At file top level (or under any
+            # other parent kind), property_signature would just be noise
+            # — bail before registering a node.
+            if t == "property_signature":
+                parent_kind = nid_to_kind.get(parent_class_nid) if parent_class_nid else None
+                if parent_kind not in ("interface", "type_alias"):
+                    return
             # Swift deinit/subscript have no name field — resolve before generic fallback
             if t == "deinit_declaration":
                 func_name: str | None = "deinit"
@@ -901,8 +1003,22 @@ def _extract_generic(path: Path, config: LanguageConfig) -> dict:
 
             line = node.start_point[0] + 1
             if parent_class_nid:
+                # Method shape depends on parent kind: interface members
+                # are signatures (no body), class methods are impls.
+                # `method_signature` and `property_signature` are
+                # interface/type-alias only; everything else under an
+                # interface parent gets iface_method.
+                parent_kind = nid_to_kind.get(parent_class_nid)
+                if t in ("method_signature", "property_signature"):
+                    method_kind = "iface_method"
+                elif parent_kind == "interface":
+                    method_kind = "iface_method"
+                elif parent_kind in ("class", "object"):
+                    method_kind = "impl_method"
+                else:
+                    method_kind = None
                 func_nid = _make_id(parent_class_nid, func_name)
-                add_node(func_nid, f".{func_name}()", line)
+                add_node(func_nid, f".{func_name}()", line, kind=method_kind)
                 add_edge(parent_class_nid, func_nid, "method", line)
             else:
                 func_nid = _make_id(stem, func_name)
@@ -912,6 +1028,10 @@ def _extract_generic(path: Path, config: LanguageConfig) -> dict:
             body = _find_body(node, config)
             if body:
                 function_bodies.append((func_nid, body))
+            # Capture the full function declaration so the type-ref pass
+            # can see the signature (param types, return type) — those
+            # live OUTSIDE the body in tree-sitter's tree.
+            function_decls.append((func_nid, node))
             return
 
         # JS/TS arrow functions and C# namespaces — language-specific extra handling
@@ -1316,6 +1436,99 @@ def _extract_generic(path: Path, config: LanguageConfig) -> dict:
                 # register grandchild closures under the outer factory).
                 walk_calls(inner_body, inner_nid)
 
+    # ── TS type-reference pass ───────────────────────────────────────────────
+    # Capture `type_identifier` references in type positions (param types,
+    # return types, variable annotations, type alias rhs, generic
+    # constraints, extends/implements). Without this, types like
+    # `SteeringMode` show degree=1 (defined once, used nowhere) when the
+    # codebase actually pivots on them everywhere.
+    #
+    # Two-stage resolution like calls: in-file matches resolve immediately
+    # to `type_ref` edges; the rest go to `raw_type_refs` for the global
+    # cross-file pass to resolve once all files are extracted. This
+    # mirrors the call resolver pattern so type usage works across
+    # imports without a separate import graph.
+    raw_type_refs: list[dict] = []
+    if config.ts_module in ("tree_sitter_javascript", "tree_sitter_typescript"):
+        # Tree-sitter type-position nodes: any of these in the AST
+        # frames the descendants as types-being-referenced, not values.
+        # Type-position nodes for the type-ref pass. Heritage clauses
+        # (extends/implements) are deliberately NOT here — they emit
+        # specialised `impl_of`/`inherits` edges in the class walker.
+        # Including them would double-emit type_ref + impl_of for the
+        # same pair, polluting in/out listings.
+        TYPE_POSITION_TYPES = (
+            "type_annotation", "opting_type_annotation",
+            "type_arguments", "type_parameter",
+            "predefined_type", "lookup_type",
+            "intersection_type", "union_type",
+            "type_predicate", "constraint",
+        )
+        SCOPE_BREAK_TYPES = (
+            "function_declaration", "function_expression",
+            "arrow_function", "method_definition", "method_signature",
+            "class_declaration", "interface_declaration",
+        )
+
+        seen_type_refs: set[tuple[str, str]] = set()
+
+        def _emit_type_ref(ref_nid: str, name: str, line: int) -> None:
+            """Resolve `name` to a node and emit an edge or queue for
+            cross-file resolution."""
+            if not name:
+                return
+            tgt = label_to_nid.get(name.lower())
+            if tgt:
+                if tgt == ref_nid or (ref_nid, tgt) in seen_type_refs:
+                    return
+                seen_type_refs.add((ref_nid, tgt))
+                edges.append({
+                    "source": ref_nid,
+                    "target": tgt,
+                    "relation": "type_ref",
+                    "confidence": "EXTRACTED",
+                    "confidence_score": 1.0,
+                    "source_file": str_path,
+                    "source_location": f"L{line}",
+                    "weight": 1.0,
+                })
+            else:
+                # Defer cross-file resolution to the global pass — the
+                # type may live in another file we haven't extracted yet.
+                raw_type_refs.append({
+                    "caller_nid": ref_nid,
+                    "type_name": name,
+                    "source_file": str_path,
+                    "source_location": f"L{line}",
+                })
+
+        for ref_nid, decl_node in function_decls:
+            # Walk decl_node looking for type-position nodes; for each,
+            # emit edges from every type_identifier descendant. Don't
+            # descend into nested function/class scopes — those are
+            # captured as their own entries in `function_decls`.
+            stack = [decl_node]
+            while stack:
+                n = stack.pop()
+                if n is not decl_node and n.type in SCOPE_BREAK_TYPES:
+                    continue
+                if n.type in TYPE_POSITION_TYPES:
+                    # Pull every type_identifier from this subtree.
+                    sub = [n]
+                    while sub:
+                        m = sub.pop()
+                        if m.type == "type_identifier":
+                            _emit_type_ref(ref_nid, _read_text(m, source),
+                                           m.start_point[0] + 1)
+                            continue
+                        if m.type in SCOPE_BREAK_TYPES:
+                            continue
+                        for c in m.children:
+                            sub.append(c)
+                    continue
+                for c in n.children:
+                    stack.append(c)
+
     # ── Event listener pass ───────────────────────────────────────────────────
     seen_listen_pairs: set[tuple[str, str]] = set()
     for event_name, listener_name, line in pending_listen_edges:
@@ -1346,7 +1559,8 @@ def _extract_generic(path: Path, config: LanguageConfig) -> dict:
         if src in valid_ids and (tgt in valid_ids or edge["relation"] in ("imports", "imports_from")):
             clean_edges.append(edge)
 
-    return {"nodes": nodes, "edges": clean_edges, "raw_calls": raw_calls}
+    return {"nodes": nodes, "edges": clean_edges,
+            "raw_calls": raw_calls, "raw_type_refs": raw_type_refs}
 
 
 # ── Python rationale extraction ───────────────────────────────────────────────
@@ -3290,15 +3504,30 @@ def extract(paths: list[Path], cache_root: Path | None = None) -> dict:
             import logging
             logging.getLogger(__name__).warning("Cross-file import resolution failed, skipping: %s", exc)
 
-    # Cross-file call resolution for all languages
+    # Cross-file call resolution for all languages.
     # Each extractor saved unresolved calls in raw_calls. Now that we have all
     # nodes from all files, resolve any callee that exists in another file.
-    global_label_to_nid: dict[str, str] = {}
+    #
+    # Lap-9 closure-method link pass: build a `name -> [nids...]` map (not
+    # just a single representative). When a call's callee name resolves to
+    # exactly ONE node across the codebase, the binding is unambiguous so
+    # we can mark the edge EXTRACTED instead of INFERRED. The factory
+    # pattern's `obj.probeForward()` calls land here — closure-method names
+    # are usually unique across a project, so a single global hit is the
+    # right binding even without a type checker.
+    #
+    # When multiple candidates exist (common method names like `init`,
+    # `start`, `run`), we keep the previous coarse last-wins behavior with
+    # INFERRED confidence — the binding is ambiguous, so don't claim
+    # ground-truth. The 41-callers-as-INFERRED case the consumer reported
+    # is solved when the closure-method name is unique; the ambiguous
+    # case (real footgun) stays correctly marked INFERRED.
+    global_labels_by_name: dict[str, list[str]] = {}
     for n in all_nodes:
         raw = n.get("label", "")
         normalised = raw.strip("()").lstrip(".")
         if normalised:
-            global_label_to_nid[normalised.lower()] = n["id"]
+            global_labels_by_name.setdefault(normalised.lower(), []).append(n["id"])
 
     existing_pairs = {(e["source"], e["target"]) for e in all_edges}
     for result in per_file:
@@ -3306,18 +3535,59 @@ def extract(paths: list[Path], cache_root: Path | None = None) -> dict:
             callee = rc.get("callee", "")
             if not callee:
                 continue
-            tgt = global_label_to_nid.get(callee.lower())
+            candidates = global_labels_by_name.get(callee.lower()) or []
             caller = rc["caller_nid"]
+            if not candidates:
+                continue
+            if len(candidates) == 1:
+                tgt = candidates[0]
+                confidence = "EXTRACTED"
+                confidence_score = 1.0
+            else:
+                # Ambiguous name — keep the original "last registered wins"
+                # behavior at INFERRED grade. The agent reads INFERRED as
+                # "needs verification" which is correct here.
+                tgt = candidates[-1]
+                confidence = "INFERRED"
+                confidence_score = 0.8
             if tgt and tgt != caller and (caller, tgt) not in existing_pairs:
                 existing_pairs.add((caller, tgt))
                 all_edges.append({
                     "source": caller,
                     "target": tgt,
                     "relation": "calls",
-                    "confidence": "INFERRED",
-                    "confidence_score": 0.8,
+                    "confidence": confidence,
+                    "confidence_score": confidence_score,
                     "source_file": rc.get("source_file", ""),
                     "source_location": rc.get("source_location"),
+                    "weight": 1.0,
+                })
+
+        # Cross-file type-reference resolution. Type names registered as
+        # extracted (interface_declaration, type_alias_declaration, class
+        # declarations) live in `global_label_to_nid`. Same-file matches
+        # were already emitted as `type_ref` edges; this pass picks up
+        # the rest. Marked EXTRACTED at confidence 1.0 because tree-sitter
+        # placed the identifier in a type position — the only ambiguity
+        # is which file the type was declared in, which the global map
+        # resolves uniquely (or skips when there's a name collision the
+        # extractor can't disambiguate).
+        for rt in result.get("raw_type_refs", []):
+            type_name = rt.get("type_name", "")
+            if not type_name:
+                continue
+            tgt = global_label_to_nid.get(type_name.lower())
+            caller = rt["caller_nid"]
+            if tgt and tgt != caller and (caller, tgt) not in existing_pairs:
+                existing_pairs.add((caller, tgt))
+                all_edges.append({
+                    "source": caller,
+                    "target": tgt,
+                    "relation": "type_ref",
+                    "confidence": "EXTRACTED",
+                    "confidence_score": 1.0,
+                    "source_file": rt.get("source_file", ""),
+                    "source_location": rt.get("source_location"),
                     "weight": 1.0,
                 })
 

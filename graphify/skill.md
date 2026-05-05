@@ -48,9 +48,10 @@ Turn any folder of files into a navigable knowledge graph with community detecti
 
 **Default to `navigate` before any of these moves:**
 
-- **About to `Read` a source-code file you don't know.** Focus its module or class first. The frontier tells you whether the node is a leaf, a hub, or a router — and what shape of context you actually need before you start scrolling.
+- **About to `Read` a source-code file you don't know.** Focus its module or class first. The frontier tells you whether the node is a leaf, a hub, or a router — and what shape of context you actually need before you start scrolling. For a one-shot body read without committing to a session, use `graphify peek <symbol>`.
 - **About to implement, change, or debug something in unfamiliar territory.** A short navigate chain (focus → in/out/methods → pivot once) maps the blast radius before you touch the keyboard. Cheaper than grep-and-pray, and it surfaces callers you would otherwise miss.
-- **About to chain multiple `Read` or `Grep` calls to trace a call graph or dependency tree.** That is literally what `↗in`, `↘out`, and `path` are for, at 1–5% of the token cost.
+- **About to trace a dependency tree.** Reach for `dependents` (transitive callers) and `dependencies` (transitive callees) — depth=3 by default, call-edges only. That is what these verbs are for, at 1–5% of the token cost of chained Read/Grep.
+- **About to enumerate a community or large pivot.** Run `coc summary` for the structural shape (top hubs / composition / edge mix) without paying for 1000 rows; or pre-flight any pivot with `--explain-cost` to see `would return N nodes ≈ K bytes` before committing.
 - **You don't know where to start.** `navigate "@<best-guess-label>"` is a cheap probe — a hit gives you a frontier; a miss returns a disambiguation listing of real names to grab onto.
 
 **Skip navigate when reading non-code files.** graphify only indexes source code. For `.json`, `.yaml`, `.toml`, `.csv`, `.md`, `.txt`, `.log`, lockfiles, build artefacts, or your own scratch/memory files, just `Read` directly — calling navigate first will miss every time and waste a tool call.
@@ -1115,6 +1116,25 @@ Replace `QUESTION` with the question, `ANSWER` with your full answer text, `SOUR
 
 Find the shortest path between two named concepts in the graph.
 
+Prefer `graphify path "A" "B"` (the CLI subcommand) over the inline
+networkx snippet below — it does the right thing by default:
+
+- Resolves both endpoints with the same `@<dir>/<file>/<symbol>`
+  qualifier syntax `navigate` accepts (extension optional).
+- Excludes `type_ref` and `rationale_for` edges from
+  symbol-to-symbol reachability so a path doesn't quietly route
+  through a parameter type signature ("compile uses Foo as a
+  parameter" is connectedness, not call-graph reach).
+- Excludes `contains`/`imports` for symbol-to-symbol so the path
+  isn't a file-graph shortcut dressed as a call chain.
+- Surfaces the file-graph or type-ref route as informational when
+  no semantic call chain exists ("only co-location/imports
+  connects them — pass `--edges all` to see it").
+
+Pass `--edges all` to opt back in to literal connectedness when you
+specifically want to see how two things are mentioned in each
+other's signatures.
+
 First check the graph exists:
 ```bash
 $(cat graphify-out/.graphify_python) -c "
@@ -1256,7 +1276,7 @@ Cursor-based graph navigation. Each call processes an op chain left-to-right and
 
 This is the tool you reach for to keep your context window from collapsing under a heavy codebase. Each frame is ~200 tokens; each pivot is another ~200–500. A full reconnaissance chain to map a class's API and find its central method runs ~700 tokens — versus 50–500x that for the equivalent sequence of `Read`/`Grep` calls.
 
-Every call generates a short session id and persists the cursor under it (`graphify-out/.navigate/<id>.json`); the id is printed at the bottom of every output. Pass it back via `--session <id>` to resume that cursor on a later call. Default chains stay one-shot — the next call without `--session` starts fresh under a new id. Per-id files mean parallel calls don't race.
+Every call generates a short session id and persists the cursor under it (`graphify-out/.navigate/<id>.json`). The id only prints at the bottom of the output when chaining is in flight: a chain paused at a disambig (you must pass `--session <id>` to resume), `--session` was supplied, or the cursor has walked more than one step. One-shot focus calls stay quiet — pass `--session new` to force-start a named session for chaining. Per-id files mean parallel calls don't race.
 
 (See the **"When you should reach for navigate"** section near the top of this skill for the full self-directed routing rule. The short version: any time you are about to read a source-code file you don't know, or chain greps, or trace a call graph manually — navigate first. Skip for non-code files like `.json`/`.yaml`/`.md` — graphify doesn't index those.)
 
@@ -1289,6 +1309,8 @@ Op forms:
 - `inh` — inherits edges
 - `siblings` (or `sib`, `s`) — structural peers under the same parent file/class (disjoint from `coc`, which is the Leiden cluster). Use this for "what else is in this file?" without pivoting through `parent` then `contains`.
 - `callers` / `callees` — sugar for `in --kind=calls` / `out --kind=calls`. Most pivots want call edges; this drops `uses`/`imports`/`references` noise without typing the flag.
+- `dependents` / `dependencies` — transitive callers / callees walked via call edges with default depth 3 (override with `--depth N`). `dependents` answers "what depends on X?", `dependencies` answers "what does X depend on?". Sugar over `callers --depth=3` / `callees --depth=3` with verbs that map onto coupling rather than graph direction.
+- `coc summary` — two-token op that returns the structural shape of the focus's coc community (top hubs, file/symbol/rationale composition, dominant edge mix) instead of enumerating members. Cheap on big communities (`coc(1085)` becomes a one-screen answer).
 - `read` (or `body`) — dump the focused node's full body inline (default 200 lines). Folds *find this node* + *Read its source* into one call, so `navigate "@foo" read` returns the function bytes without a separate Read. Pass an explicit cap with `read N` (e.g. `read 30`). On file nodes the indent walker has nothing to walk, so `read` flat-dumps the first N lines verbatim.
 - Single-letter aliases for chained calls: `i`=in, `o`=out, `m`=methods, `p`=parent, `s`=siblings, `r`=rat (no alias for `c` to keep `coc` and `contains` unambiguous).
 - `[N]` — focus on the Nth item from the most recent listing (e.g. `[3]`)
@@ -1328,6 +1350,19 @@ The `files:` table dedups repeated paths — refer to file `a:368` rather than t
 
 **Find what changed.** `graphify changed [ref]` lists code files added/modified/removed since the last graph extract (or vs a git ref). For each modified file it surfaces the labels of the contained graph nodes — jump straight to the diff with `navigate "@<label>"` rather than blind-search for new symbols.
 
+### Default workflow — what to reach for first
+
+Most reconnaissance follows the same pattern: orient on a target, gauge the cost of a follow-up before paying it, then dig in. The ops below are the ones an agent should reach for first; they exist precisely because Read/Grep cycles burn context fast on unfamiliar code.
+
+1. **Focus** with `@<label>` (or `@<dir>/<file>/<symbol>` to disambiguate). The frontier shows where you are, the community/cluster, edge counts, and steering hints.
+2. **Read the body inline** with `peek <symbol>` — one-shot, no cursor / no session / no commitment. "What does this 20-line function do?" should not require a session. For an in-session flow, use `read [N]` after a focus.
+3. **Walk dependency direction with verbs you actually think in:** `dependents` (transitive callers, depth=3 default) and `dependencies` (transitive callees). Both filter to call edges only — no uses/imports/references noise. Override depth with `--depth N`.
+4. **Size before committing on big communities:** `coc summary` returns the structural shape (top hubs / composition / edge mix) without enumerating the 1000 members. The default `coc` listing is now narrower (10 rows) — the cursor caches the resolved set, so a follow-up `coc --limit 30` is a cheap re-render. Pair with `coc --explain-cost` when you want the listing-byte estimate first.
+5. **Script-leaf shortcut:** when `out` from a file node is empty (the call graph lives one hop in via `contains`), pass `--transitive` to walk via contains and aggregate the children's outbound edges in one call.
+6. **Make output clickable** with `--md` — wraps labels and src:line as `[label](file:line)` for IDE / Claude Code jump-through.
+
+**Trust signals on the frontier card:** the inline drop-count cues (`↗in(0+41inf)`) tell you what got filtered. `+Ninf` = INFERRED hidden, `+Nlc` = below `--min-confidence`, `+Nxl` = cross-language inferred filtered (always-on; an INFERRED `.ts` → `.py` edge is almost always an LLM-tagger hallucination on a common method name and gets dropped). `+Nkind` / `+Narch` cover `--kind` and archived-path filters. A `.foo()` method showing `↗in(0+5inf)` plus the `interface method — runtime sites bind to implementations` hint is **not dead code** — it's dispatch through a contract; widen with `--include-inferred --min-confidence 0.85` or pivot via `in --kind=impl_of`.
+
 ### Worked example — recon before commitment (one-shot chain)
 
 You've been asked to extend a class you've never seen. Scout it in a single atomic call:
@@ -1340,10 +1375,27 @@ $(cat graphify-out/.graphify_python) -m graphify navigate "@GeometryAnalyzer" me
 #   methods            → list the 14 methods, ranked by degree
 #   6                  → pick #6 (.add_all_geometries(), d=101) — pick is echoed in the output
 #   in                 → show its 62 callers, 60 EXTRACTED — the real call graph
-# Bottom of output prints `session: <id>` — pass `--session <id>` to a later call to resume.
+# When the cursor has walked >1 step the output ends with `session: <id>` — pass `--session <id>` to a later call to resume.
 ```
 
 The whole chain runs in one process, costs ~700 tokens, and tells you: where the class lives, what its API looks like, which method is central, and who depends on it. The naive alternative — `Read`-ing a 14000-line file blind, or running 4–6 `Grep` calls — would burn 50–500x more context.
+
+### Worked example — gate a `coc` against a 1000-node community
+
+`@GeometryAnalyzer coc` returns 1121 members. Most of those rows aren't picks. Two tools to avoid renderer overrun:
+
+```bash
+# Shape only — no row enumeration. Returns top-5 hubs, composition counts,
+# and the dominant edge mix in 4-5 lines.
+graphify navigate "@GeometryAnalyzer" coc summary
+
+# Cost preview — `would return 1121 node(s), render ≈ 2.4 kB (top 25 after
+# --limit)`. Cursor unchanged; rerun without --explain-cost to commit.
+graphify navigate "@GeometryAnalyzer" coc --explain-cost
+
+# When you do commit, raise --limit only as far as you need.
+graphify navigate "@GeometryAnalyzer" coc --limit 50
+```
 
 ### Useful flags
 
@@ -1368,8 +1420,31 @@ graphify navigate --session 7a3f1c in
 # Show the column-key legend on first invocation
 graphify navigate "@GeometryAnalyzer" --legend
 
-# Suppress the ops cheat-sheet line (saves a few tokens per call when you know the ops)
-graphify navigate "@GeometryAnalyzer" --no-ops-hint
+# Add the ops cheat-sheet line (default off — the cheat-sheet is repetitive
+# noise once you know the verb list. The empty-cursor first-contact message
+# always carries the cheat-sheet so a brand-new agent doesn't get stuck.)
+graphify navigate "@GeometryAnalyzer" --ops-hint
+# `--no-ops-hint` is now a no-op alias kept for back-compat.
+
+# Markdown link mode: wrap labels and src:line citations as `[label](file:line)`
+# so IDE / Claude Code can render them as clickable jump targets. Cheap text-only
+# transformation; doesn't affect JSON output.
+graphify navigate "@GeometryAnalyzer" --md
+graphify peek GeometryAnalyzer --md
+
+# Cost preview: short-circuit a pivot to `would return N nodes ≈ K bytes` rather
+# than rendering. Lets you gate `coc` against a 1000-node community before paying
+# the token cost; cursor state is unchanged so a follow-up call without the flag
+# commits with the same query.
+graphify navigate "@GeometryAnalyzer" coc --explain-cost
+# Pair with `coc summary` for the shape-only alternative when --explain-cost
+# tells you the listing is too big to commit.
+
+# Script-leaf transitive: when `out` from a file node is empty but `contains`
+# has children, `--transitive` walks via contains then aggregates the children's
+# out edges in one call. The script-leaf hint already advises this manually;
+# `--transitive` collapses the chain.
+graphify navigate "@multi_axis_fingerprint.py" out --transitive
 
 # Disable session entirely (no disk write, no id printed)
 graphify navigate "@GeometryAnalyzer" --no-session
@@ -1394,7 +1469,22 @@ graphify navigate "@scripts/atlas.py" contains --bodies=2
 # call — single-call blast-radius queries. Combine with --kind=calls to
 # get pure call-chain reachability.
 graphify navigate "@MyClass" out --depth=3 --kind=calls
+
+# Hide nodes living under archive paths (frozen/, legacy/, deprecated/,
+# archive/, archived/) — the disambig listing is far more useful when
+# stale variants of `compile()` aren't competing with the active one.
+graphify navigate "@compile" --no-archived
+
+# Show only the archived variants (inverse — useful when you need the
+# legacy version specifically).
+graphify navigate "@compile" --archived-only
 ```
+
+The archive heuristic is intentionally narrow (lap-7): only directory
+segments that are nearly always archived qualify. `experiments/` and
+`old/` were dropped because they false-flagged active R&D code. If you
+need a custom archive convention, propose one — don't widen the
+heuristic without strong evidence.
 
 ### Trust signals to watch for
 
@@ -1432,6 +1522,22 @@ The cursor file is small (a few hundred bytes) and self-cleaning via TTL — no 
 ```bash
 graphify navigate --session 7a3f1c reset
 ```
+
+---
+
+## For /graphify peek
+
+One-shot body read. Resolves a target (label / path-qualified / fuzzy — full navigate resolution ladder), dumps the body, touches no cursor / no session / no recent-paths log. Pairs with `read` (the in-session flow): use `peek` when you don't want to commit to a navigation chain. "What does this 20-line function do?" should not require a session.
+
+```bash
+$(cat graphify-out/.graphify_python) -m graphify peek <symbol> [--lines N] [--md] [--graph PATH]
+```
+
+- `--lines N` — max lines of body to dump (default 200; the indent walker bails at the natural dedent first, so this is a cap not a forced length).
+- `--md` — wrap the focus label as `[label](file:line)` for IDE click-through.
+- Path qualifiers work: `peek tools/foo.py/_classify_file` resolves the same way navigate does.
+
+If the target is ambiguous, peek prints a short candidate list to stderr (with file:line for each) and exits non-zero — re-run with a more specific qualifier.
 
 ---
 

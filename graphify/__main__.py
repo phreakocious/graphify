@@ -45,6 +45,7 @@ _HELP_BLOCKS: dict[str, list[str]] = {
         "  path \"A\" \"B\"            shortest path between two nodes in graph.json",
         "    --graph <path>          path to graph.json (default graphify-out/graph.json)",
         "    --include-inferred      include LLM-inferred edges (default: AST-extracted only)",
+        "    --edges <mode>          reach (default): exclude type_ref/rationale_for and (symbol-to-symbol) contains/imports — semantic reachability.  calls: strict call-graph (calls/method/impl_of/inherits only) — \"how does X reach Y at runtime?\".  all: every edge type (literal connectedness, may route through type signatures).",
     ],
     "explain": [
         "  explain \"X\"             plain-language explanation of a node and its neighbors",
@@ -56,20 +57,30 @@ _HELP_BLOCKS: dict[str, list[str]] = {
         "  changed [ref]           list code files added/modified/removed since graph extract (or vs git ref)",
         "    --graph <path>          path to graph.json (default graphify-out/graph.json)",
     ],
+    "peek": [
+        "  peek <symbol>           one-shot body read — resolve, dump body, touch no cursor/session/history",
+        "    --lines N               max lines of body to dump (default 200; walker bails at natural dedent first)",
+        "    --md                    render the focus label as a clickable `[label](file:line)` link",
+        "    --graph <path>          path to graph.json (default graphify-out/graph.json)",
+        "    Pairs with `navigate ... read` — use peek when you don't want to commit to a session.",
+    ],
     "navigate": [
         "  navigate [ops...]       cursor-based graph navigation (LLM-friendly)",
         "    @<label>                focus on a node by label/id (fuzzy fallback for typos)",
-        "    @<dir/file>             path-qualified file resolution (`@tools/foo.py`)",
-        "    @<dir/file/Symbol>      path-qualified symbol resolution (disambiguates collisions)",
+        "    @<dir/file>             path-qualified file resolution (`@tools/foo.py` or `@tools/foo` — extension optional)",
+        "    @<dir/file/Symbol>      path-qualified symbol (`@tools/foo.py/_classify_file` — leading `_` works either way)",
         "    in | out | methods | contains    list typed pivots",
         "    callers | callees       sugar for `in --kind=calls` / `out --kind=calls`",
+        "    dependents              transitive callers (default depth=3 via call edges; --depth N overrides)",
+        "    dependencies            transitive callees (default depth=3 via call edges; --depth N overrides)",
         "    coc                     co-community siblings (same Leiden cluster)",
+        "    coc summary             structural shape (top hubs / composition / edge mix) instead of enumeration — cheap on big communities",
         "    rat | inh | parent      rationale anchors / inherits / structural parent",
         "    siblings                structural peers (same parent file/class)",
         "    read | body [N]         dump full body of focused node (N caps lines, default 200; walker bails at natural dedent first)",
         "    [N] | N                 focus on Nth item from previous listing in the chain",
         "    back | reset            pop history / clear cursor",
-        "    --session <id>          resume a prior session (id is printed at the bottom of every output)",
+        "    --session <id>          resume a prior session (id printed when chaining is in flight: --session was passed, a chain paused at disambig, or the cursor walked >1 step)",
         "    --no-session            disable session entirely (no disk, no id printed)",
         "    --json                  structured JSON output",
         "    --include-inferred      include LLM-inferred edges (default: AST-extracted only)",
@@ -79,7 +90,15 @@ _HELP_BLOCKS: dict[str, list[str]] = {
         "    --depth N               for in/out, walk N hops via non-structural edges (default 1)",
         "    --limit N               max items per listing (default 25)",
         "    --legend                prepend column-key legend",
-        "    --no-ops-hint           omit the ops cheat-sheet line",
+        "    --ops-hint              append the ops cheat-sheet line (default: omitted; cheat-sheet still surfaces on first-contact empty-cursor calls)",
+        "    --no-ops-hint           back-compat no-op (cheat-sheet is now off by default)",
+        "    --no-archived           hide nodes under frozen/legacy/deprecated/archive(d)/ paths",
+        "    --archived-only         show only archived nodes (inverse of --no-archived)",
+        "    --include-files         widen `coc` to include file-level hubs (default: symbols only)",
+        "    --no-collapse           expand dupe-label groups in listings (default: collapse ≥5 same-label rows into one)",
+        "    --explain-cost          on a pivot, return `would-show N nodes ≈ K bytes` preview without rendering the listing (lets you gate `coc` against a 1000-node community before committing)",
+        "    --md                    render labels and src:line as `[label](src:line)` markdown links (clickable in IDE / Claude Code)",
+        "    --transitive            on `out` from a file node with 0 direct out edges, route through `contains` children and aggregate their outbound semantic edges (collapses the script-leaf drill into one call)",
         "    --graph <path>          path to graph.json (default graphify-out/graph.json)",
         "    Chain ops in one call: graphify navigate @Foo methods 1 in",
     ],
@@ -269,7 +288,7 @@ Before any of these moves, scout the graph first — it's 50–500x cheaper than
 
 ### Default workflow
 
-Chain ops in a single call — left-to-right, output is the last op's result. Each call prints a session id at the bottom; pass it back via `--session <id>` to resume the cursor on a later call. Default chains stay one-shot — the next call without `--session` starts fresh under a new id.
+Chain ops in a single call — left-to-right, output is the last op's result. When chaining is in flight (a chain paused at disambig, you passed `--session`, or the cursor has walked more than one step) the bottom of the output prints `session: <id>`; pass that id back via `--session <id>` to resume the cursor on a later call. One-shot focus calls stay quiet.
 
 ```
 graphify navigate "@<symbol>"                    # focus a node, return frontier (~200 tok)
@@ -320,7 +339,7 @@ Before any of these moves, scout the graph first — it's 50–500x cheaper than
 
 ### Default workflow
 
-Chain ops left-to-right; output is the last op's result. Each call prints a session id; pass it via `--session <id>` to resume.
+Chain ops left-to-right; output is the last op's result. When chaining is in flight (chain paused, `--session` passed, or cursor walked >1 step) the output prints `session: <id>`; pass it via `--session <id>` to resume.
 
 ```
 graphify navigate "@<symbol>" methods 6 in   # focus, list methods, pick 6th, show its callers
@@ -365,7 +384,7 @@ Before any of these moves, scout the graph first — it's 50–500x cheaper than
 
 ### Default workflow
 
-Chain ops left-to-right; output is the last op's result. Each call prints a session id; pass it via `--session <id>` to resume.
+Chain ops left-to-right; output is the last op's result. When chaining is in flight (chain paused, `--session` passed, or cursor walked >1 step) the output prints `session: <id>`; pass it via `--session <id>` to resume.
 
 ```
 graphify navigate "@<symbol>" methods 6 in   # focus, list methods, pick 6th, show its callers
@@ -1105,6 +1124,8 @@ def main() -> None:
             print(line)
         for line in _HELP_BLOCKS["changed"]:
             print(line)
+        for line in _HELP_BLOCKS["peek"]:
+            print(line)
         print("  add <url>               fetch a URL and save it to ./raw, then update the graph")
         print("    --author \"Name\"         tag the author of the content")
         print("    --contributor \"Name\"    tag who added it to the corpus")
@@ -1457,7 +1478,8 @@ def main() -> None:
                 elif candidates:
                     print(f"warning: anchor `{raw}` is ambiguous "
                           f"({len(candidates)} matches); ignoring. "
-                          f"qualify with `@<dir>/<file>/<label>` to disambiguate.",
+                          f"qualify with the source path: e.g. `@tools/foo.py/{raw[1:]}` "
+                          f"(extension optional, leading `_` works either way).",
                           file=sys.stderr)
 
         # Stopword filter for the term-scoring fallback. The default
@@ -1492,11 +1514,39 @@ def main() -> None:
                 print(msg)
                 sys.exit(0)
             start = [nid for _, nid in scored[:5]]
-            print(f"_(no `@<label>` anchor — falling back to term scan; "
-                  f"prefer `navigate \"@<label>\"` for focused traversal)_",
-                  file=sys.stderr)
+            # Lap-8 bridge: surface the top label hits so the agent can
+            # rerun as `navigate "@<label>"` rather than reading a flat
+            # term-scan dump. The reporter said the fallback warning was
+            # correct but didn't redirect — naming the candidates closes
+            # that gap. We sample from `scored[:5]` (the BFS start set)
+            # because those are the highest-relevance term matches; their
+            # labels are what the agent likely meant to focus.
+            top_labels = []
+            for _, nid in scored[:5]:
+                lbl = G.nodes[nid].get("label", nid)
+                if lbl and lbl not in top_labels:
+                    top_labels.append(lbl)
+            if top_labels:
+                hint = ", ".join(f"@{l}" for l in top_labels[:3])
+                print(f"_(no `@<label>` anchor — falling back to term scan; "
+                      f"did you mean to focus one of: {hint}? "
+                      f"`navigate \"@<label>\"` is more deterministic.)_",
+                      file=sys.stderr)
+            else:
+                print(f"_(no `@<label>` anchor — falling back to term scan; "
+                      f"prefer `navigate \"@<label>\"` for focused traversal)_",
+                      file=sys.stderr)
         nodes, edges = (_dfs if use_dfs else _bfs)(G, start, depth=2)
-        print(_subgraph_to_text(G, nodes, edges, token_budget=budget))
+        # Lap-12: in the no-anchor fallback, the term-scorer's top-N (which
+        # also produces the "did you mean" hint) must appear first in the
+        # rendered subgraph. Without `priority_nodes`, BFS-expansion's
+        # degree-sort surfaces hub neighbours (`types.ts`, generic helpers)
+        # above the actual term-scored hit — the agent reads the suggestion
+        # engine and the result list as contradicting each other. Threading
+        # `start` through aligns them.
+        priority = start if not anchor_starts else None
+        print(_subgraph_to_text(G, nodes, edges, token_budget=budget,
+                                priority_nodes=priority))
     elif cmd == "save-result":
         # graphify save-result --question Q --answer A --type T [--nodes N1 N2 ...]
         import argparse as _ap
@@ -1521,21 +1571,39 @@ def main() -> None:
             _print_subcmd_help("path")
             return
         if len(sys.argv) < 4:
-            print("Usage: graphify path \"<source>\" \"<target>\" [--graph path] [--include-inferred]", file=sys.stderr)
+            print("Usage: graphify path \"<source>\" \"<target>\" [--graph path] [--include-inferred] [--edges all|reach|calls]", file=sys.stderr)
             sys.exit(1)
         from graphify.navigate import resolve_focus, label_index
+        from graphify.analyze import _is_file_node
         from networkx.readwrite import json_graph
         import networkx as _nx
         source_label = sys.argv[2]
         target_label = sys.argv[3]
         graph_path = "graphify-out/graph.json"
         include_inferred = False  # default: AST ground truth only
+        # `reach` (default) excludes type_ref / rationale_for from
+        # symbol-to-symbol paths so reachability means call/use chains,
+        # not "mentioned in a parameter type signature". `all` opts back in
+        # for users who want to see the literal connectedness.
+        edge_mode = "reach"
         args = sys.argv[4:]
         for i, a in enumerate(args):
             if a == "--graph" and i + 1 < len(args):
                 graph_path = args[i + 1]
             elif a == "--include-inferred":
                 include_inferred = True
+            elif a == "--edges" and i + 1 < len(args):
+                em = args[i + 1].lower()
+                if em not in ("all", "reach", "calls"):
+                    print(f"error: --edges must be one of: all, reach, calls (got {em!r})", file=sys.stderr)
+                    sys.exit(1)
+                edge_mode = em
+            elif a.startswith("--edges="):
+                em = a.split("=", 1)[1].lower()
+                if em not in ("all", "reach", "calls"):
+                    print(f"error: --edges must be one of: all, reach, calls (got {em!r})", file=sys.stderr)
+                    sys.exit(1)
+                edge_mode = em
         gp = Path(graph_path).resolve()
         if not gp.exists():
             print(f"error: graph file not found: {gp}", file=sys.stderr)
@@ -1563,34 +1631,122 @@ def main() -> None:
             return chosen, candidates, match_type
         src_nid, src_cands, src_match = _resolve(source_label)
         tgt_nid, tgt_cands, tgt_match = _resolve(target_label)
+        from graphify.navigate import _is_archived_path
         for who, label, nid, cands in (("source", source_label, src_nid, src_cands),
                                         ("target", target_label, tgt_nid, tgt_cands)):
             if nid is None:
                 if cands:
-                    print(f"{who} '{label}' is ambiguous ({len(cands)} matches). pick a more specific label (try `path/symbol` to qualify).", file=sys.stderr)
+                    print(f"{who} '{label}' is ambiguous ({len(cands)} matches). qualify with the source path: e.g. `tools/foo.py/{label}` or `tools/foo/{label}` (extension optional). leading `_` on private symbols works either way. or re-call with one of the node IDs below — IDs bypass label resolution. pick from below:", file=sys.stderr)
                     for c in cands[:5]:
                         attrs = G.nodes[c]
                         src = attrs.get("source_file") or ""
                         loc = attrs.get("source_location") or ""
-                        suffix = f"  — {src}{':' + loc if loc else ''}" if src else ""
-                        print(f"  - {attrs.get('label', c)}{suffix}", file=sys.stderr)
+                        archived = " [archived]" if _is_archived_path(src) else ""
+                        suffix = f"  — {src}{':' + loc if loc else ''}{archived}" if src else ""
+                        # Lap-10: surface node ID so the agent can re-call
+                        # `path <id> <id>` and bypass label resolution. Path
+                        # is one-shot (no [N] interactive pick like navigate),
+                        # so IDs are the only way to pin a specific candidate
+                        # when path-qualification can't disambiguate further.
+                        print(f"  - {attrs.get('label', c)}  [id: {c}]{suffix}", file=sys.stderr)
                 else:
                     print(f"No node matching '{label}' found.", file=sys.stderr)
                 sys.exit(1)
-        # Weight `contains` (structural co-location) higher than semantic
-        # edges so a class→method→callee path beats a class→file→class
-        # shortcut of the same hop count. Without this, A and B that share
-        # a parent file always look "2 hops apart" via `contains`, which is
-        # technically true but uninformative — the real relationship is
-        # the call/method chain, even when it's the same length.
-        # (Both routes are 2 hops; the weighted path makes the semantic
-        # one cheaper so shortest_path prefers it.)
-        STRUCTURAL_RELS = {"contains"}
+        # Auto-detect: when both endpoints are symbol nodes, drop the
+        # file-graph edges (contains/imports) before pathing. Without
+        # this, `path "kg/compile-v2.ts/compile" "embeddingGenerate"`
+        # returned `compile() → compile-v2.ts → engine-core.ts → ...`
+        # — a contains/imports chain dressed as a call path. compile()
+        # does not transitively call the target via that route. When
+        # either endpoint IS a file node, the user is asking about
+        # the file graph, so we keep those edges.
+        src_is_file = _is_file_node(G, src_nid)
+        tgt_is_file = _is_file_node(G, tgt_nid)
+        symbol_to_symbol = not (src_is_file or tgt_is_file)
+        FILE_RELS = {"contains", "imports"}
+        # Lap-7: `type_ref` and `rationale_for` aren't call-graph reachability.
+        # A path through `compile() --type_ref→ DecodeEngine --type_ref→ ...`
+        # walks parameter type signatures, which is "literally connected" but
+        # not "compile() reaches X by calling/using it". Block by default;
+        # `--edges all` opts back in.
+        NON_REACH_RELS = {"type_ref", "rationale_for"}
+        # Lap-8: `calls` mode for "execution-relevant" reachability — only
+        # walks call/method/inheritance edges. The complement of this set is
+        # blocked. Reporter case: `path "compile-v2" "embeddingGenerate"`
+        # under `reach` routed compile-v2 --imports→ engine-core --contains→
+        # f32ToF16Array --calls→ embeddingGenerate, which is graph distance
+        # but reads as a call chain. `calls` keeps only call-graph proper.
+        CALL_RELS = {"calls", "method", "impl_of", "inherits"}
+        if edge_mode == "all":
+            blocked: set[str] = set()
+        elif edge_mode == "calls":
+            # Block everything outside the call-graph proper. Compute lazily
+            # from the actual graph so we don't have to enumerate every
+            # relation type that might exist.
+            all_rels = {d.get("relation") for _, _, d in G.edges(data=True)
+                        if d.get("relation")}
+            blocked = all_rels - CALL_RELS
+        elif symbol_to_symbol:
+            blocked = FILE_RELS | NON_REACH_RELS
+        else:
+            # File involved: contains/imports stay (the user is asking about
+            # the file graph), but type-ref/rationale paths are still noise.
+            blocked = NON_REACH_RELS
+        # Mutate weights to make blocked edges effectively unreachable
+        # rather than removing them — keeps the graph object intact for any
+        # downstream reuse and lets a fallback try via-file routing if
+        # shortest_path fails.
         for u, v, d in G.edges(data=True):
-            d["_path_weight"] = 10.0 if d.get("relation") in STRUCTURAL_RELS else 1.0
+            rel = d.get("relation")
+            if rel in blocked:
+                d["_path_weight"] = 1000.0
+            elif (not symbol_to_symbol) and rel == "contains":
+                # Weight `contains` higher than semantic edges so the
+                # call/method chain still beats class→file→class ties
+                # (the original Lap-2 weighting).
+                d["_path_weight"] = 10.0
+            else:
+                d["_path_weight"] = 1.0
         try:
             path_nodes = _nx.shortest_path(G, src_nid, tgt_nid, weight="_path_weight")
+            # If the path traversed any blocked edge (file-graph or
+            # non-reachability), shortest_path still found it but at
+            # ≥1000 cost per blocked hop. Treat that as "no semantic
+            # path" and fall through to the descriptive fallback. Without
+            # this, a type_ref-only chain reports as a real path.
+            via_blocked = blocked and any(
+                G.edges[path_nodes[i], path_nodes[i + 1]].get("relation") in blocked
+                for i in range(len(path_nodes) - 1)
+            )
+            if via_blocked:
+                raise _nx.NetworkXNoPath  # treat as no semantic path
         except (_nx.NetworkXNoPath, _nx.NodeNotFound):
+            if blocked:
+                # Retry with all edges allowed so we can tell the user
+                # what (if anything) connects them at all.
+                for u, v, d in G.edges(data=True):
+                    d["_path_weight"] = (
+                        10.0 if d.get("relation") == "contains" else 1.0
+                    )
+                try:
+                    via = _nx.shortest_path(G, src_nid, tgt_nid, weight="_path_weight")
+                    rels = [G.edges[via[i], via[i + 1]].get("relation", "")
+                            for i in range(len(via) - 1)]
+                    blocked_rels = {r for r in rels if r in blocked}
+                    if blocked_rels & FILE_RELS:
+                        note_kind = "co-location/imports"
+                    elif blocked_rels & NON_REACH_RELS:
+                        note_kind = "type-ref/rationale (no call/use chain)"
+                    else:
+                        note_kind = "structural"
+                    note = f" (only {note_kind} connects them — pass `--edges all` to see it)"
+                    print(f"No semantic path between '{source_label}' and "
+                          f"'{target_label}'.{note}")
+                    print(f"  via {','.join(sorted(blocked_rels)) or 'mixed'} ({len(via) - 1} hops): "
+                          f"{' → '.join(G.nodes[n].get('label', n) for n in via)}")
+                    sys.exit(0)
+                except (_nx.NetworkXNoPath, _nx.NodeNotFound):
+                    pass
             hint = "" if include_inferred else " (try --include-inferred to widen)"
             print(f"No path found between '{source_label}' and '{target_label}'.{hint}")
             sys.exit(0)
@@ -1658,13 +1814,15 @@ def main() -> None:
         nid, candidates, match_type, _alts = resolve_focus(G, idx, label)
         if nid is None:
             if candidates:
-                print(f"'{label}' is ambiguous ({len(candidates)} matches). pick one (try `path/symbol` to qualify):", file=sys.stderr)
+                from graphify.navigate import _is_archived_path
+                print(f"'{label}' is ambiguous ({len(candidates)} matches). qualify with the source path: e.g. `tools/foo.py/{label}` or `tools/foo/{label}` (extension optional). leading `_` on private symbols works either way. or re-call with a node ID below to bypass label resolution. pick from below:", file=sys.stderr)
                 for c in candidates[:5]:
                     attrs = G.nodes[c]
                     src = attrs.get("source_file") or ""
                     loc = attrs.get("source_location") or ""
-                    suffix = f"  — {src}{':' + loc if loc else ''}" if src else ""
-                    print(f"  - {attrs.get('label', c)}{suffix}", file=sys.stderr)
+                    archived = " [archived]" if _is_archived_path(src) else ""
+                    suffix = f"  — {src}{':' + loc if loc else ''}{archived}" if src else ""
+                    print(f"  - {attrs.get('label', c)}  [id: {c}]{suffix}", file=sys.stderr)
             else:
                 print(f"No node matching '{label}' found.")
             sys.exit(0 if not candidates else 1)
@@ -1768,25 +1926,43 @@ def main() -> None:
             since_label = f"vs {ref}"
         else:
             from graphify.detect import CODE_EXTENSIONS
+            import os as _os
             graph_mtime = gp.stat().st_mtime
+            # Heavy directories that almost never contain user code we want
+            # to track. Pruning at the directory level (vs per-file filter)
+            # is the difference between ~60s and <2s on repos with large
+            # vendored trees (lap-11 friction report). os.walk lets us
+            # mutate `dirnames` in place to skip whole subtrees.
+            _SKIP_DIRS = {
+                "node_modules", "target", "build", "dist", "out", "vendor",
+                "venv", ".venv", "env", ".env",
+                "__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache",
+                ".git", "graphify-out",
+                "coverage", ".coverage", ".tox", ".nox",
+                "bower_components", "jspm_packages",
+                ".next", ".nuxt", ".turbo", ".cache",
+            }
             changed_files = []
-            for f in root.rglob("*"):
-                if not f.is_file():
-                    continue
-                # Skip hidden and graphify output dirs to keep this fast on
-                # repos with large vendored trees.
-                rel_parts = f.relative_to(root).parts
-                if any(p.startswith(".") and p != "." for p in rel_parts):
-                    continue
-                if "graphify-out" in rel_parts:
-                    continue
-                if f.suffix.lower() not in CODE_EXTENSIONS:
-                    continue
-                try:
-                    if f.stat().st_mtime > graph_mtime:
-                        changed_files.append(str(f.relative_to(root)))
-                except OSError:
-                    continue
+            for dirpath, dirnames, filenames in _os.walk(str(root), topdown=True):
+                # Mutate dirnames in place so os.walk skips these subtrees.
+                # Also skip dot-prefixed dirs (preserves the previous
+                # behavior of pruning hidden dirs at any depth).
+                dirnames[:] = [d for d in dirnames
+                               if d not in _SKIP_DIRS and not d.startswith(".")]
+                for fn in filenames:
+                    # Cheap suffix gate first — vast majority of files
+                    # in even a pruned tree aren't code.
+                    if "." not in fn:
+                        continue
+                    suf = fn[fn.rfind("."):].lower()
+                    if suf not in CODE_EXTENSIONS:
+                        continue
+                    f = Path(dirpath) / fn
+                    try:
+                        if f.stat().st_mtime > graph_mtime:
+                            changed_files.append(str(f.relative_to(root)))
+                    except OSError:
+                        continue
             since_label = "since graph extract"
         # Bucket files relative to the graph's known set.
         modified: list[tuple[str, list[str]]] = []
@@ -1826,6 +2002,99 @@ def main() -> None:
                 print("  re-run `graphify update .` to refresh added/removed nodes.")
             if modified:
                 print("  jump: `graphify navigate \"@<label>\"` for any modified node.")
+
+    elif cmd == "peek":
+        # One-shot body read. Resolves a target like navigate's `@<label>`
+        # (full prefix/substring/fuzzy + path-qualifier ladder), dumps the
+        # body, touches no cursor / no session / no recent-paths log.
+        # Pairs with `read` (the in-session flow) — `peek` is for
+        # "what does this 20-line function do?" without committing to
+        # a navigation chain.
+        if any(a in ("-h", "--help") for a in sys.argv[2:]):
+            _print_subcmd_help("peek")
+            return
+        from graphify.navigate import (
+            DEFAULT_GRAPH_PATH, load_graph, label_index, resolve_focus,
+            _read_body_full, _render_body_text,
+        )
+        from graphify.analyze import _is_file_node
+        args = sys.argv[2:]
+        graph_path = DEFAULT_GRAPH_PATH
+        max_lines = 200
+        md = False
+        target: str | None = None
+        i = 0
+        while i < len(args):
+            a = args[i]
+            if a == "--graph" and i + 1 < len(args):
+                graph_path = args[i + 1]; i += 2
+            elif a.startswith("--graph="):
+                graph_path = a.split("=", 1)[1]; i += 1
+            elif a == "--lines" and i + 1 < len(args):
+                max_lines = max(1, int(args[i + 1])); i += 2
+            elif a.startswith("--lines="):
+                max_lines = max(1, int(a.split("=", 1)[1])); i += 1
+            elif a == "--md":
+                md = True; i += 1
+            elif target is None:
+                target = a; i += 1
+            else:
+                # Multiple positional args isn't currently meaningful; treat
+                # the first as the target and ignore the rest with a warning
+                # rather than silently dropping them.
+                print(f"warning: ignoring extra arg `{a}`. peek takes a single target.",
+                      file=sys.stderr)
+                i += 1
+        if not target:
+            print("Usage: graphify peek <symbol> [--lines N] [--md] [--graph PATH]",
+                  file=sys.stderr)
+            sys.exit(1)
+        gp = Path(graph_path)
+        if not gp.exists():
+            print(f"error: graph not found at {gp}. run `graphify update <path>` first.",
+                  file=sys.stderr)
+            sys.exit(1)
+        G, _comm = load_graph(gp)
+        idx = label_index(G)
+        chosen, candidates, match_type, _alts = resolve_focus(G, idx, target)
+        if not chosen:
+            if candidates:
+                # Multiple matches — print a short disambig list so the
+                # caller can re-run with a more specific target. We
+                # don't run a full disambig listing here because peek
+                # is one-shot; resolution is the agent's job.
+                print(f"ambiguous `{target}` ({len(candidates)} matches). "
+                      f"qualify with @<dir>/<file>/<symbol>:", file=sys.stderr)
+                for nid in candidates[:8]:
+                    a = G.nodes[nid]
+                    sf = a.get("source_file", "?")
+                    loc = a.get("source_location", "")
+                    label = a.get("label", nid)
+                    print(f"  {label}  {sf}{':' + loc[1:] if loc.startswith('L') else ''}",
+                          file=sys.stderr)
+                if len(candidates) > 8:
+                    print(f"  +{len(candidates) - 8} more", file=sys.stderr)
+                sys.exit(1)
+            print(f"no node matches `{target}`.", file=sys.stderr)
+            sys.exit(1)
+        if match_type and match_type != "exact":
+            chosen_label = G.nodes[chosen].get("label", chosen)
+            print(f"# matched `{target}` → {chosen_label} ({match_type})")
+        nattrs = G.nodes[chosen]
+        sf = nattrs.get("source_file")
+        loc = nattrs.get("source_location")
+        is_file = _is_file_node(G, chosen)
+        body, ln, trunc = _read_body_full(sf, loc, max_lines=max_lines, flat=is_file)
+        data = {
+            "type": "body",
+            "label": nattrs.get("label", chosen),
+            "source_file": sf,
+            "source_location": loc,
+            "lines": body,
+            "start_line": ln,
+            "truncated": trunc,
+        }
+        print(_render_body_text(data, md=md))
 
     elif cmd == "add":
         if len(sys.argv) < 3:
@@ -1927,11 +2196,20 @@ def main() -> None:
         extracted_only = True   # default: AST ground truth only
         min_confidence: float | None = None
         show_legend = False
-        show_ops_hint = True
-        limit = LIST_LIMIT
+        show_ops_hint = False
+        # `None` means "use navigate()'s defaults" (which differ per pivot:
+        # standard listings get LIST_LIMIT, `coc` gets the smaller
+        # COC_LIST_LIMIT_DEFAULT). Setting an int here bypasses both.
+        limit: int | None = None
         kinds: set[str] | None = None
         bodies: int | None = None
         depth: int = 1
+        archived_mode: str = "all"  # --no-archived → "no" / --archived-only → "only"
+        include_files: bool = False  # --include-files turns coc back on for file hubs
+        collapse_dupes: bool = True   # --no-collapse expands dupe-label groups
+        explain_cost: bool = False    # --explain-cost short-circuits pivots to size preview
+        md: bool = False              # --md wraps labels and src:line in markdown links
+        transitive: bool = False      # --transitive routes script-leaf out through contains
         i = 0
         ops: list[str] = []
         # `--help` / `-h` mid-args takes precedence over op parsing — without
@@ -1986,8 +2264,25 @@ def main() -> None:
                 depth = max(1, int(a.split("=", 1)[1])); i += 1
             elif a == "--legend":
                 show_legend = True; i += 1
+            elif a == "--ops-hint":
+                show_ops_hint = True; i += 1
             elif a == "--no-ops-hint":
+                # back-compat no-op: was the opt-out flag, is now the default.
                 show_ops_hint = False; i += 1
+            elif a == "--no-archived":
+                archived_mode = "no"; i += 1
+            elif a == "--archived-only":
+                archived_mode = "only"; i += 1
+            elif a == "--include-files":
+                include_files = True; i += 1
+            elif a == "--no-collapse":
+                collapse_dupes = False; i += 1
+            elif a == "--explain-cost":
+                explain_cost = True; i += 1
+            elif a == "--md":
+                md = True; i += 1
+            elif a == "--transitive":
+                transitive = True; i += 1
             else:
                 ops.append(a); i += 1
         out = navigate(
@@ -2003,6 +2298,12 @@ def main() -> None:
             kinds=kinds,
             bodies=bodies,
             depth=depth,
+            archived_mode=archived_mode,
+            include_files=include_files,
+            collapse_dupes=collapse_dupes,
+            explain_cost=explain_cost,
+            md=md,
+            transitive=transitive,
         )
         print(out)
 

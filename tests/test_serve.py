@@ -135,6 +135,33 @@ def test_subgraph_to_text_edge_included():
     assert "calls" in text
 
 
+def test_subgraph_to_text_priority_nodes_render_first():
+    """Lap-12: when priority_nodes is set (no-anchor query path), the
+    suggestion-engine's top-N must render first regardless of degree.
+    Without this, BFS-expansion's degree-sort buries the term-scored hit
+    below hub neighbours."""
+    G = nx.Graph()
+    # `hub` has degree 3, `target` has degree 1. Default sort would put
+    # hub first; priority should flip target to the top.
+    G.add_node("hub", label="types_hub", source_file="types.ts",
+               source_location="L1", community=0)
+    G.add_node("target", label="polar_decomp", source_file="polar.ts",
+               source_location="L1", community=0)
+    G.add_node("a", label="a")
+    G.add_node("b", label="b")
+    G.add_node("c", label="c")
+    G.add_edge("hub", "a"); G.add_edge("hub", "b"); G.add_edge("hub", "c")
+    G.add_edge("target", "hub")
+    nodes = {"hub", "target", "a", "b", "c"}
+    text_default = _subgraph_to_text(G, nodes, [], token_budget=2000)
+    text_priority = _subgraph_to_text(G, nodes, [], token_budget=2000,
+                                       priority_nodes=["target"])
+    # Default: hub appears first (highest degree)
+    assert text_default.index("types_hub") < text_default.index("polar_decomp")
+    # Priority: target appears first
+    assert text_priority.index("polar_decomp") < text_priority.index("types_hub")
+
+
 # --- _load_graph ---
 
 def test_load_graph_roundtrip(tmp_path):
