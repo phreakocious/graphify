@@ -676,6 +676,33 @@ def _filter_archived_ids(G: nx.DiGraph, ids: list[str],
     return keep, hidden
 
 
+def _is_function_kind(G: nx.DiGraph, nid: str) -> bool:
+    """Is this node a function/method (vs class/file/rationale)?
+
+    Used by empty-pivot diagnostics to redirect `methods`/`contains` calls
+    on a function to the right pivots (`out`/`in`/`read`).
+
+    TS extractor tags impl_method/iface_method explicitly. Python's pass
+    leaves node_kind None on functions, so fall back to a label heuristic:
+    `name()` on a node that has its own source_location (not a file hub
+    where label happens to look function-shaped). File hubs are excluded
+    by checking the label doesn't match the basename of source_file.
+    """
+    a = G.nodes[nid]
+    kind = a.get("node_kind")
+    if kind in ("impl_method", "iface_method", "function"):
+        return True
+    if kind:  # any other tagged kind (class/interface/type_alias/etc) → not a function
+        return False
+    label = a.get("label") or ""
+    if not label.endswith("()"):
+        return False
+    src = a.get("source_file") or ""
+    if src and Path(src).name == label:
+        return False
+    return True
+
+
 def _is_test_path(src: str | None) -> bool:
     """Heuristic: is this source path a test file? Cheap path check, no file read."""
     if not src:
@@ -2343,6 +2370,13 @@ def _pivot_data(G: nx.DiGraph, communities: dict[int, list[str]],
         # so a chained pick (`methods 1`) doesn't blindly error on the empty
         # listing. Renderer surfaces sort_label starting with "n/a" as the
         # message, replacing the empty body.
+        # Function check first: `_is_file_node` mis-claims module-level
+        # `name()` nodes with degree<=1 as file nodes (its `is structurally
+        # isolated by definition` heuristic) — would route function queries
+        # to the wrong directive. Function-kind is more specific.
+        if not succs and _is_function_kind(G, nid):
+            return ("◉methods", [], {},
+                    "n/a on function nodes — try `out` for callees, `in` for callers, or `read` for the body", {})
         from graphify.analyze import _is_file_node as _isf
         if not succs and _isf(G, nid):
             return ("◉methods", [], {},
@@ -2361,6 +2395,12 @@ def _pivot_data(G: nx.DiGraph, communities: dict[int, list[str]],
         succs = [v for v in G.successors(nid)
                  if G.edges[nid, v].get("relation") == "contains"
                  and _passes_confidence(G.edges[nid, v], extracted_only, min_confidence)]
+        # Function/method nodes don't `contain` anything — they have
+        # callees and callers. Same redirect as `methods` so the agent
+        # learns the right pivot for the kind.
+        if not succs and _is_function_kind(G, nid):
+            return ("◇contains", [], {},
+                    "n/a on function nodes — try `out` for callees, `in` for callers, or `read` for the body", {})
         succs.sort(key=lambda x: -(G.in_degree(x) + G.out_degree(x)))
         drops = _drop_breakdown(all_c, extracted_only, min_confidence)
         # Lap-8: procedural-file footer. `@cartography-build.ts contains`
@@ -2568,15 +2608,21 @@ def _recency_bucket(src: str | None) -> int:
     return 3
 
 
-def _rank_match(G: nx.Graph, key: str, nid: str) -> tuple[int, int, int, int, int, int]:
+def _rank_match(G: nx.Graph, key: str, nid: str) -> tuple[int, int, int, int, int, int, int]:
     """Sort key for fuzzy/substring matches. Prefer
     (1) active code over archived (frozen/, legacy/, deprecated/, archive/, archived/),
     (2) symbol nodes over rationale (docstring) nodes — lap-7: `@FOO_BAR` was
         landing on the docstring above the dict because it tied on substring,
     (3) public names,
-    (4) shorter labels (less padding around the key),
-    (5) recently-touched files (mtime/git_mtime bucketed),
-    (6) higher degree (load-bearing).
+    (4) connected nodes over orphans — lap-16: `@MöbiusS3` landed on
+        `TestMobiusS3` (orphan, length_pad=4) ahead of `MobiusS3Geometry`
+        (deg=13+, length_pad=8) because shorter-label-pad won the tie. An
+        orphan with an exactly-matching name is almost always less useful
+        than a connected near-match; demote orphans before label length
+        decides.
+    (5) shorter labels (less padding around the key),
+    (6) recently-touched files (mtime/git_mtime bucketed),
+    (7) higher degree (load-bearing).
 
     Use `G.degree(nid)` — it works on both DiGraph and undirected Graph
     (and on DiGraph equals `in_degree + out_degree`). The `path` and
@@ -2588,10 +2634,11 @@ def _rank_match(G: nx.Graph, key: str, nid: str) -> tuple[int, int, int, int, in
     is_archived = 1 if _is_archived_path(src) else 0
     is_rat = 1 if G.nodes[nid].get("file_type") == "rationale" else 0
     is_priv = 1 if _is_private_label(label) else 0
+    deg = G.degree(nid)
+    is_orphan = 1 if deg == 0 else 0
     length_pad = max(0, len(label) - len(key))
     bucket = _recency_bucket(src)
-    deg = G.degree(nid)
-    return (is_archived, is_rat, is_priv, length_pad, bucket, -deg)
+    return (is_archived, is_rat, is_priv, is_orphan, length_pad, bucket, -deg)
 
 
 def resolve_focus(G: nx.DiGraph, idx: dict[str, list[str]],

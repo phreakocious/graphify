@@ -162,6 +162,38 @@ def test_subgraph_to_text_priority_nodes_render_first():
     assert text_priority.index("polar_decomp") < text_priority.index("types_hub")
 
 
+def test_subgraph_to_text_node_limit_caps_rows():
+    """Lap-16 TS field-report friction 3: `query --limit 10` was ignored.
+    `node_limit` caps rendered NODE rows and drops edges between dropped
+    nodes — the byte-budget truncator alone can't satisfy a structural cap."""
+    G = nx.Graph()
+    for i in range(20):
+        G.add_node(f"n{i}", label=f"sym{i}", source_file=f"f{i}.py",
+                   source_location="L1", community=0)
+    # No edges — keeps the test focused on the node-cap path.
+    nodes = {f"n{i}" for i in range(20)}
+    text = _subgraph_to_text(G, nodes, [], token_budget=10000, node_limit=5)
+    # Exactly 5 NODE rows
+    assert text.count("NODE ") == 5, f"expected 5, got {text.count('NODE ')}\n{text}"
+    # Truncation footer present
+    assert "+15 more nodes" in text, text
+
+
+def test_subgraph_to_text_node_limit_drops_edges_to_dropped_nodes():
+    """When `node_limit` cuts a node, edges incident on that node must
+    not appear in the output — otherwise the listing has dangling
+    endpoints with no NODE row to match."""
+    G = nx.Graph()
+    G.add_node("keep", label="keep", source_file="a.py", source_location="L1", community=0)
+    G.add_node("drop", label="drop", source_file="b.py", source_location="L1", community=0)
+    G.add_edge("keep", "drop", relation="calls", confidence="EXTRACTED")
+    nodes = {"keep", "drop"}
+    text = _subgraph_to_text(G, nodes, [("keep", "drop")], token_budget=10000, node_limit=1)
+    assert "NODE keep" in text
+    assert "NODE drop" not in text
+    assert "EDGE" not in text, f"edge to dropped node should be omitted:\n{text}"
+
+
 # --- _load_graph ---
 
 def test_load_graph_roundtrip(tmp_path):

@@ -117,7 +117,8 @@ def _dfs(G: nx.Graph, start_nodes: list[str], depth: int) -> tuple[set[str], lis
 
 def _subgraph_to_text(G: nx.Graph, nodes: set[str], edges: list[tuple],
                       token_budget: int = 2000,
-                      priority_nodes: list[str] | None = None) -> str:
+                      priority_nodes: list[str] | None = None,
+                      node_limit: int | None = None) -> str:
     """Render subgraph as text, cutting at token_budget (approx 3 chars/token).
 
     `priority_nodes` is an ordered list of node ids that should appear first
@@ -126,6 +127,11 @@ def _subgraph_to_text(G: nx.Graph, nodes: set[str], edges: list[tuple],
     this, BFS expansion plus degree-sort would surface hub neighbors
     (`types.ts`, generic helpers) above the actual term-scored hit, even
     when the start set was correctly chosen.
+
+    `node_limit` caps the rendered node count after priority+degree
+    ordering. Edges between dropped nodes are also omitted so the output
+    isn't a graph with dangling endpoints. The default `token_budget` cuts
+    at output length; `node_limit` cuts at structural granularity.
     """
     char_budget = token_budget * 3
     lines = []
@@ -133,16 +139,23 @@ def _subgraph_to_text(G: nx.Graph, nodes: set[str], edges: list[tuple],
     rest = [n for n in nodes if n not in priority_set]
     rest.sort(key=lambda n: G.degree(n), reverse=True)
     ordered_nodes = [n for n in (priority_nodes or []) if n in nodes] + rest
+    truncated_count = 0
+    if node_limit is not None and node_limit >= 0 and len(ordered_nodes) > node_limit:
+        truncated_count = len(ordered_nodes) - node_limit
+        ordered_nodes = ordered_nodes[:node_limit]
+    kept = set(ordered_nodes)
     for nid in ordered_nodes:
         d = G.nodes[nid]
         line = f"NODE {sanitize_label(d.get('label', nid))} [src={d.get('source_file', '')} loc={d.get('source_location', '')} community={d.get('community', '')}]"
         lines.append(line)
     for u, v in edges:
-        if u in nodes and v in nodes:
+        if u in kept and v in kept:
             raw = G[u][v]
             d = next(iter(raw.values()), {}) if isinstance(G, (nx.MultiGraph, nx.MultiDiGraph)) else raw
             line = f"EDGE {sanitize_label(G.nodes[u].get('label', u))} --{d.get('relation', '')} [{d.get('confidence', '')}]--> {sanitize_label(G.nodes[v].get('label', v))}"
             lines.append(line)
+    if truncated_count:
+        lines.append(f"... (+{truncated_count} more nodes, raise --limit to see)")
     output = "\n".join(lines)
     if len(output) > char_budget:
         output = output[:char_budget] + f"\n... (truncated to ~{token_budget} token budget)"

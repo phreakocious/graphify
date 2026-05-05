@@ -674,6 +674,91 @@ def test_methods_on_file_returns_directive(tmp_path):
     )
 
 
+def test_methods_on_function_returns_redirect(tmp_path):
+    """Lap-16 TS field-report friction 6: `methods` on a function returned
+    a silent empty listing. The agent had no signal that the pivot didn't
+    apply to the kind. The redirect should surface `out`/`in`/`read`."""
+    import json as _json
+    from graphify.navigate import navigate
+    nodes = [
+        # Python-style function: no node_kind, label foo()
+        {"id": "py_helper", "label": "helper()", "file_type": "code",
+         "source_file": "lib.py", "source_location": "L10"},
+        # TS-style impl_method: explicit node_kind
+        {"id": "ts_impl", "label": ".forward()", "file_type": "code",
+         "source_file": "engine.ts", "source_location": "L271",
+         "node_kind": "impl_method"},
+    ]
+    graph_dir = tmp_path / "graphify-out"
+    graph_dir.mkdir()
+    (graph_dir / "graph.json").write_text(_json.dumps(
+        {"directed": True, "multigraph": False,
+         "graph": {}, "nodes": nodes, "links": []}), encoding="utf-8")
+    for q in ("@helper()", "@.forward()"):
+        out = navigate([q, "methods"],
+                       graph_path=str(graph_dir / "graph.json"),
+                       session=False, fmt="text")
+        assert "n/a on function nodes" in out, f"{q}: {out}"
+        assert "out" in out and "in" in out, f"{q}: redirect missing pivots: {out}"
+
+
+def test_contains_on_function_returns_redirect(tmp_path):
+    """Same redirect for `contains` — function nodes don't contain
+    anything; agent should be steered to `out`/`in`/`read`."""
+    import json as _json
+    from graphify.navigate import navigate
+    nodes = [
+        {"id": "ts_impl", "label": ".dispatch()", "file_type": "code",
+         "source_file": "engine.ts", "source_location": "L80",
+         "node_kind": "impl_method"},
+    ]
+    graph_dir = tmp_path / "graphify-out"
+    graph_dir.mkdir()
+    (graph_dir / "graph.json").write_text(_json.dumps(
+        {"directed": True, "multigraph": False,
+         "graph": {}, "nodes": nodes, "links": []}), encoding="utf-8")
+    out = navigate(["@.dispatch()", "contains"],
+                   graph_path=str(graph_dir / "graph.json"),
+                   session=False, fmt="text")
+    assert "n/a on function nodes" in out, out
+
+
+def test_resolve_focus_demotes_orphan_in_fuzzy_match(tmp_path):
+    """Lap-16 Python field-report: `@MöbiusS3` landed on `TestMobiusS3`
+    (orphan, length_pad=4) ahead of `MobiusS3Geometry` (deg=high,
+    length_pad=8). Connected near-matches should beat orphan exact-shape
+    matches."""
+    import networkx as nx
+    from graphify.navigate import resolve_focus, label_index
+    G = nx.DiGraph()
+    # Source class — connected via methods + inh
+    G.add_node("real_geo", label="MobiusS3Geometry", file_type="code",
+               source_file="src/geom.py", source_location="L1",
+               norm_label="mobiuss3geometry")
+    G.add_node("real_method", label="forward()", file_type="code",
+               source_file="src/geom.py", source_location="L10",
+               norm_label="forward()")
+    G.add_node("real_base", label="Base", file_type="code",
+               source_file="src/base.py", source_location="L1",
+               norm_label="base")
+    G.add_edge("real_geo", "real_method", relation="method")
+    G.add_edge("real_geo", "real_base", relation="inherits")
+    # Test class — orphan, label looks closer to query
+    G.add_node("test_cls", label="TestMobiusS3", file_type="code",
+               source_file="tests/test_geom.py", source_location="L1",
+               norm_label="testmobiuss3")
+    idx = label_index(G)
+    chosen, candidates, mt, _ = resolve_focus(G, idx, "@MobiusS3")
+    # Substring lookup returns multiple candidates; ranker decides ordering.
+    if chosen:
+        assert chosen == "real_geo", (
+            f"expected MobiusS3Geometry (connected) over TestMobiusS3 "
+            f"(orphan), got {chosen}")
+    else:
+        assert candidates[0] == "real_geo", (
+            f"expected real_geo first, got {candidates}")
+
+
 def test_path_edges_calls_blocks_imports(tmp_path):
     """Lap-8 friction 3: even file-involved paths under `--edges reach`
     routed through `imports → contains` and presented as a "path". The
