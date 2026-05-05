@@ -206,6 +206,37 @@ def _passes_confidence(edge: dict, extracted_only: bool, min_confidence: float |
     return True
 
 
+def _drop_breakdown(edges: list[dict], extracted_only: bool,
+                    min_confidence: float | None) -> dict[str, int]:
+    """Count how many edges the current filter would drop, by reason.
+
+    Used to surface omissions to the agent — `↗in(0 / +462inf hidden)` is
+    far more informative than `↗in(0)` when the filter is active.
+    """
+    inferred_hidden = 0
+    low_conf_hidden = 0
+    for e in edges:
+        if _passes_confidence(e, extracted_only, min_confidence):
+            continue
+        if extracted_only and e.get("confidence") != "EXTRACTED":
+            inferred_hidden += 1
+        elif min_confidence is not None and e.get("confidence") != "EXTRACTED":
+            score = e.get("confidence_score")
+            if not isinstance(score, (int, float)) or score < min_confidence:
+                low_conf_hidden += 1
+    return {"inferred": inferred_hidden, "low_confidence": low_conf_hidden}
+
+
+def _format_hidden(drops: dict[str, int]) -> str:
+    """Render a drop breakdown as ' / +Ninf hidden, +Mlc hidden' or '' if none."""
+    bits = []
+    if drops.get("inferred"):
+        bits.append(f"+{drops['inferred']}inf hidden")
+    if drops.get("low_confidence"):
+        bits.append(f"+{drops['low_confidence']}lc hidden")
+    return f" / {', '.join(bits)}" if bits else ""
+
+
 # --- structured data builders ----------------------------------------------
 
 def _node_summary(G: nx.DiGraph, nid: str) -> dict:
@@ -237,49 +268,70 @@ def _frontier_data(G: nx.DiGraph, communities: dict[int, list[str]],
 
     def f(es): return [e for e in es if _passes_confidence(e, extracted_only, min_confidence)]
 
-    methods = f([e for e in out_edges if e.get("relation") == "method"])
-    inh = f([e for e in out_edges if e.get("relation") == "inherits"])
-    contains = f([e for e in out_edges if e.get("relation") == "contains"])
-    out_semantic = f([e for e in out_edges if e.get("relation") not in _STRUCTURAL])
-    in_semantic = f([e for e in in_edges if e.get("relation") not in _STRUCTURAL])
-    parent_edges = f([e for e in in_edges if e.get("relation") in ("contains", "method")])
+    # Unfiltered slices (for drop-count computation)
+    methods_all = [e for e in out_edges if e.get("relation") == "method"]
+    inh_all = [e for e in out_edges if e.get("relation") == "inherits"]
+    contains_all = [e for e in out_edges if e.get("relation") == "contains"]
+    out_semantic_all = [e for e in out_edges if e.get("relation") not in _STRUCTURAL]
+    in_semantic_all = [e for e in in_edges if e.get("relation") not in _STRUCTURAL]
+    parent_all = [e for e in in_edges if e.get("relation") in ("contains", "method")]
 
-    # rationale anchors
+    methods = f(methods_all)
+    inh = f(inh_all)
+    contains = f(contains_all)
+    out_semantic = f(out_semantic_all)
+    in_semantic = f(in_semantic_all)
+    parent_edges = f(parent_all)
+
+    # rationale anchors (kept as set, no drop-count tracking — rat is rarely
+    # filter-affected since rationale_for edges are EXTRACTED in practice)
     rat = set()
+    rat_all_count = 0
     for u in G.predecessors(nid):
         if (G.nodes[u].get("file_type") == "rationale"
                 or G.edges[u, nid].get("relation") == "rationale_for"):
+            rat_all_count += 1
             if _passes_confidence(G.edges[u, nid], extracted_only, min_confidence):
                 rat.add(u)
     for v in G.successors(nid):
         if G.edges[nid, v].get("relation") == "rationale_for":
+            rat_all_count += 1
             if _passes_confidence(G.edges[nid, v], extracted_only, min_confidence):
                 rat.add(v)
 
     cid = node["community"] if node["community"] is not None else -1
     coc_size = max(0, len(communities.get(cid, [])) - 1) if cid != -1 else 0
 
-    def pivot_summary(name: str, edges: list[dict]) -> dict:
+    def pivot_summary(name: str, edges: list[dict], edges_all: list[dict]) -> dict:
         return {
             "name": name,
             "count": len(edges),
             "extracted": sum(1 for e in edges if e.get("confidence") == "EXTRACTED"),
             "inferred": sum(1 for e in edges if e.get("confidence") == "INFERRED"),
             "confidence_text": _bin_confidence(edges),
+            "drops": _drop_breakdown(edges_all, extracted_only, min_confidence),
+        }
+
+    def cnt(name: str, edges: list[dict], edges_all: list[dict]) -> dict:
+        return {
+            "name": name,
+            "count": len(edges),
+            "drops": _drop_breakdown(edges_all, extracted_only, min_confidence),
         }
 
     return {
         "type": "frontier",
         "current": node,
         "pivots": {
-            "in": pivot_summary("in", in_semantic),
-            "out": pivot_summary("out", out_semantic),
-            "methods": {"name": "methods", "count": len(methods)},
-            "contains": {"name": "contains", "count": len(contains)},
-            "coc": {"name": "coc", "count": coc_size, "community_id": cid},
-            "rat": {"name": "rat", "count": len(rat)},
-            "inh": {"name": "inh", "count": len(inh)},
-            "parent": {"name": "parent", "count": len(parent_edges)},
+            "in": pivot_summary("in", in_semantic, in_semantic_all),
+            "out": pivot_summary("out", out_semantic, out_semantic_all),
+            "methods": cnt("methods", methods, methods_all),
+            "contains": cnt("contains", contains, contains_all),
+            "coc": {"name": "coc", "count": coc_size, "community_id": cid, "drops": {}},
+            "rat": {"name": "rat", "count": len(rat),
+                    "drops": {"inferred": max(0, rat_all_count - len(rat))} if extracted_only else {}},
+            "inh": cnt("inh", inh, inh_all),
+            "parent": cnt("parent", parent_edges, parent_all),
         },
         "history_depth": len(cursor.history),
         "last_pivot": cursor.last_pivot,
@@ -290,7 +342,8 @@ def _frontier_data(G: nx.DiGraph, communities: dict[int, list[str]],
 
 def _listing_data(G: nx.DiGraph, ids: list[str], pivot_name: str,
                   edge_for: dict[str, dict] | None, total: int,
-                  sort_label: str, limit: int) -> dict:
+                  sort_label: str, limit: int,
+                  drops: dict[str, int] | None = None) -> dict:
     items = []
     for nid in ids[:limit]:
         item = _node_summary(G, nid)
@@ -309,6 +362,7 @@ def _listing_data(G: nx.DiGraph, ids: list[str], pivot_name: str,
         "showing": min(total, limit),
         "sort": sort_label,
         "items": items,
+        "drops": drops or {},
     }
 
 
@@ -337,17 +391,32 @@ def _render_frontier_text(data: dict, cursor: Cursor, *, show_ops: bool) -> str:
     p = data["pivots"]
     header = f"@ {n['label']}  · c{cid} · deg={n['degree']} · {src}{ftype_tag}"
 
+    def _glyph(prefix: str, pv: dict, with_conf: bool = False) -> str:
+        # Format: glyph(count[: conf-mix][; +Ninf hidden])
+        # Always show the drop-count when filtering hides edges, so the agent
+        # never thinks a 0-count means "nothing exists" when it really means
+        # "nothing matches the current filter".
+        c = pv["count"]
+        hidden = _format_hidden(pv.get("drops", {})).lstrip(" /").strip(", ").strip()
+        # _format_hidden returns " / +Xinf hidden" — normalise to "; +Xinf hidden"
+        hidden_suffix = f"; {hidden}" if hidden else ""
+        if with_conf and c:
+            return f"{prefix}({c}: {pv['confidence_text']}{hidden_suffix})"
+        if hidden_suffix:
+            return f"{prefix}({c}{hidden_suffix})"
+        return f"{prefix}({c})"
+
     line_a = "  ".join([
-        f"↗in({p['in']['count']}: {p['in']['confidence_text']})" if p['in']['count'] else "↗in(0)",
-        f"↘out({p['out']['count']}: {p['out']['confidence_text']})" if p['out']['count'] else "↘out(0)",
-        f"◉methods({p['methods']['count']})",
-        f"◇contains({p['contains']['count']})",
+        _glyph("↗in", p['in'], with_conf=True),
+        _glyph("↘out", p['out'], with_conf=True),
+        _glyph("◉methods", p['methods']),
+        _glyph("◇contains", p['contains']),
     ])
     line_b_parts = [
         f"⊕coc({p['coc']['count']})",
-        f"←rat({p['rat']['count']})",
-        f"→inh({p['inh']['count']})",
-        f"⇡parent({p['parent']['count']})",
+        _glyph("←rat", p['rat']),
+        _glyph("→inh", p['inh']),
+        _glyph("⇡parent", p['parent']),
     ]
     if data.get("show_history"):
         line_b_parts.append(f"↺({data['history_depth']})")
@@ -389,7 +458,17 @@ def _render_frontier_text(data: dict, cursor: Cursor, *, show_ops: bool) -> str:
 
 def _render_listing_text(data: dict, *, show_ops: bool) -> str:
     if data["total"] == 0:
-        return f"  {data['pivot']}: empty"
+        # Even on an empty result, surface the drop count — `in: empty` after
+        # extracted-only filtering would otherwise hide that 462 inferred edges
+        # were dropped, which is exactly the orientation the agent needs.
+        drops = data.get("drops") or {}
+        bits = []
+        if drops.get("inferred"):
+            bits.append(f"+{drops['inferred']} INFERRED hidden")
+        if drops.get("low_confidence"):
+            bits.append(f"+{drops['low_confidence']} below --min-confidence")
+        suffix = f"  ({', '.join(bits)}, --include-inferred to show)" if bits else ""
+        return f"  {data['pivot']}: empty{suffix}"
 
     items = data["items"]
 
@@ -414,6 +493,14 @@ def _render_listing_text(data: dict, *, show_ops: bool) -> str:
             header += f" — top {data['showing']} by {sort}"
         else:
             header += f" — showing first {data['showing']}"
+    drops = data.get("drops") or {}
+    drop_bits = []
+    if drops.get("inferred"):
+        drop_bits.append(f"+{drops['inferred']} INFERRED hidden")
+    if drops.get("low_confidence"):
+        drop_bits.append(f"+{drops['low_confidence']} below --min-confidence")
+    if drop_bits:
+        header += f"  ({', '.join(drop_bits)}, --include-inferred to show)"
     out.append(header)
 
     if use_table:
@@ -491,78 +578,109 @@ def _rank_key(G: nx.DiGraph, nid: str, edge: dict) -> tuple[int, int, int]:
 def _pivot_data(G: nx.DiGraph, communities: dict[int, list[str]],
                 cursor: Cursor, key: str, *,
                 extracted_only: bool,
-                min_confidence: float | None) -> tuple[str, list[str], dict[str, dict], str]:
-    """Return (pivot_label, ordered_ids, edge_for_dict, sort_label) for a pivot key."""
+                min_confidence: float | None) -> tuple[str, list[str], dict[str, dict], str, dict[str, int]]:
+    """Return (pivot_label, ordered_ids, edge_for_dict, sort_label, drops) for a pivot key.
+
+    `drops` records what the current confidence filter excluded (inferred,
+    low-confidence) so the renderer can surface it. Filters that are part
+    of the pivot's semantics (e.g. `in` excluding _STRUCTURAL) aren't drops
+    — those edges live under their own pivot (methods/contains/parent) and
+    are reported there.
+    """
     nid = cursor.current
     if not nid:
-        return ("", [], {}, "")
+        return ("", [], {}, "", {})
 
     if key == "in":
+        all_in = [G.edges[u, nid] for u in G.predecessors(nid)
+                  if G.edges[u, nid].get("relation") not in _STRUCTURAL]
         preds = [u for u in G.predecessors(nid)
                  if G.edges[u, nid].get("relation") not in _STRUCTURAL
                  and _passes_confidence(G.edges[u, nid], extracted_only, min_confidence)]
         edge_for = {u: G.edges[u, nid] for u in preds}
         preds.sort(key=lambda x: _rank_key(G, x, edge_for[x]))
-        return ("↗in", preds, edge_for, "extracted-first, then degree desc")
+        return ("↗in", preds, edge_for, "extracted-first, then degree desc",
+                _drop_breakdown(all_in, extracted_only, min_confidence))
 
     if key == "out":
+        all_out = [G.edges[nid, v] for v in G.successors(nid)
+                   if G.edges[nid, v].get("relation") not in _STRUCTURAL]
         succs = [v for v in G.successors(nid)
                  if G.edges[nid, v].get("relation") not in _STRUCTURAL
                  and _passes_confidence(G.edges[nid, v], extracted_only, min_confidence)]
         edge_for = {v: G.edges[nid, v] for v in succs}
         succs.sort(key=lambda x: _rank_key(G, x, edge_for[x]))
-        return ("↘out", succs, edge_for, "extracted-first, then degree desc")
+        return ("↘out", succs, edge_for, "extracted-first, then degree desc",
+                _drop_breakdown(all_out, extracted_only, min_confidence))
 
     if key == "methods":
+        all_m = [G.edges[nid, v] for v in G.successors(nid)
+                 if G.edges[nid, v].get("relation") == "method"]
         succs = [v for v in G.successors(nid)
                  if G.edges[nid, v].get("relation") == "method"
                  and _passes_confidence(G.edges[nid, v], extracted_only, min_confidence)]
-        return ("◉methods", succs, {v: G.edges[nid, v] for v in succs}, "source order")
+        return ("◉methods", succs, {v: G.edges[nid, v] for v in succs}, "source order",
+                _drop_breakdown(all_m, extracted_only, min_confidence))
 
     if key == "contains":
+        all_c = [G.edges[nid, v] for v in G.successors(nid)
+                 if G.edges[nid, v].get("relation") == "contains"]
         succs = [v for v in G.successors(nid)
                  if G.edges[nid, v].get("relation") == "contains"
                  and _passes_confidence(G.edges[nid, v], extracted_only, min_confidence)]
         succs.sort(key=lambda x: -(G.in_degree(x) + G.out_degree(x)))
-        return ("◇contains", succs, {v: G.edges[nid, v] for v in succs}, "degree desc")
+        return ("◇contains", succs, {v: G.edges[nid, v] for v in succs}, "degree desc",
+                _drop_breakdown(all_c, extracted_only, min_confidence))
 
     if key == "inh":
         succs = [v for v in G.successors(nid)
                  if G.edges[nid, v].get("relation") == "inherits"
                  and _passes_confidence(G.edges[nid, v], extracted_only, min_confidence)]
-        return ("→inh", succs, {v: G.edges[nid, v] for v in succs}, "source order")
+        all_inh = [G.edges[nid, v] for v in G.successors(nid)
+                   if G.edges[nid, v].get("relation") == "inherits"]
+        return ("→inh", succs, {v: G.edges[nid, v] for v in succs}, "source order",
+                _drop_breakdown(all_inh, extracted_only, min_confidence))
 
     if key == "parent":
+        all_p = [G.edges[u, nid] for u in G.predecessors(nid)
+                 if G.edges[u, nid].get("relation") in ("contains", "method")]
         preds = [u for u in G.predecessors(nid)
                  if G.edges[u, nid].get("relation") in ("contains", "method")
                  and _passes_confidence(G.edges[u, nid], extracted_only, min_confidence)]
-        return ("⇡parent", preds, {u: G.edges[u, nid] for u in preds}, "source order")
+        return ("⇡parent", preds, {u: G.edges[u, nid] for u in preds}, "source order",
+                _drop_breakdown(all_p, extracted_only, min_confidence))
 
     if key == "rat":
         rat = set()
+        all_rat_edges: list[dict] = []
         for u in G.predecessors(nid):
             e = G.edges[u, nid]
             if (G.nodes[u].get("file_type") == "rationale"
                     or e.get("relation") == "rationale_for"):
+                all_rat_edges.append(e)
                 if _passes_confidence(e, extracted_only, min_confidence):
                     rat.add(u)
         for v in G.successors(nid):
             e = G.edges[nid, v]
-            if e.get("relation") == "rationale_for" and _passes_confidence(e, extracted_only, min_confidence):
-                rat.add(v)
+            if e.get("relation") == "rationale_for":
+                all_rat_edges.append(e)
+                if _passes_confidence(e, extracted_only, min_confidence):
+                    rat.add(v)
         ids = sorted(rat, key=lambda x: -(G.in_degree(x) + G.out_degree(x)))
-        return ("←rat", ids, {}, "degree desc")
+        return ("←rat", ids, {}, "degree desc",
+                _drop_breakdown(all_rat_edges, extracted_only, min_confidence))
 
     if key == "coc":
         # Co-community: same Leiden cluster. Not co-occurrence in commits or imports.
+        # No filter applies (members are nodes, not edges) so drops is empty.
         cid = G.nodes[nid].get("community", -1)
         if cid == -1:
-            return ("⊕coc", [], {}, "")
+            return ("⊕coc", [], {}, "", {})
         members = [n for n in communities.get(cid, []) if n != nid]
         members.sort(key=lambda x: -(G.in_degree(x) + G.out_degree(x)))
-        return (f"⊕coc(c{cid})", members, {}, "degree desc")
+        return (f"⊕coc(c{cid})", members, {}, "degree desc", {})
 
-    return ("", [], {}, "")
+    return ("", [], {}, "", {})
 
 
 # --- focus resolution ------------------------------------------------------
@@ -645,9 +763,11 @@ def resolve_focus(G: nx.DiGraph, idx: dict[str, list[str]],
         return substring_hits[0], [], "substring", alt_ids
     if substring_hits:
         # Multi-hit: tag the listing as "prefix" if every hit is a prefix-hit
-        # (cleaner signal to the agent), else "substring".
+        # (cleaner signal to the agent), else "substring". Return the full
+        # list — the renderer truncates to `limit`; the caller sees the
+        # untruncated total for accurate "X matches" announcement.
         match_type = "prefix" if prefix_hits and len(prefix_hits) == len(substring_hits) else "substring"
-        return None, substring_hits[:LIST_LIMIT], match_type, []
+        return None, substring_hits, match_type, []
 
     # 3. fuzzy (typo) fallback — labels only. difflib returns close matches in
     # similarity-desc order; preserve that ordering rather than re-ranking,
@@ -880,7 +1000,7 @@ def navigate(ops: list[str] | str, *,
                     last_data = {"type": "error",
                                  "message": "no cursor. focus with @<label> first."}
                 else:
-                    pname, ids, edge_for, sort_label = _pivot_data(
+                    pname, ids, edge_for, sort_label, drops = _pivot_data(
                         G, communities, cursor, pkey,
                         extracted_only=extracted_only,
                         min_confidence=min_confidence,
@@ -892,7 +1012,8 @@ def navigate(ops: list[str] | str, *,
                     last_data = _listing_data(G, ids, pname, edge_for,
                                               total=len(ids),
                                               sort_label=sort_label,
-                                              limit=limit)
+                                              limit=limit,
+                                              drops=drops)
             else:
                 handled = False
                 last_data = {"type": "error",
