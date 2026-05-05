@@ -1287,6 +1287,7 @@ Op forms:
 - `inh` — inherits edges
 - `siblings` (or `sib`, `s`) — structural peers under the same parent file/class (disjoint from `coc`, which is the Leiden cluster). Use this for "what else is in this file?" without pivoting through `parent` then `contains`.
 - `callers` / `callees` — sugar for `in --kind=calls` / `out --kind=calls`. Most pivots want call edges; this drops `uses`/`imports`/`references` noise without typing the flag.
+- `read` (or `body`) — dump the focused node's full body inline (capped at 200 lines). Folds *find this node* + *Read its source* into one call, so `navigate "@foo" read` returns the function bytes without a separate Read.
 - Single-letter aliases for chained calls: `i`=in, `o`=out, `m`=methods, `p`=parent, `s`=siblings, `r`=rat (no alias for `c` to keep `coc` and `contains` unambiguous).
 - `[N]` — focus on the Nth item from the most recent listing (e.g. `[3]`)
 - `back` — pop history (returns to the previous focus)
@@ -1318,6 +1319,10 @@ Pivot listing (after `in`/`out`/`methods`/`coc`/...):
     [ 2] <label>                                c<cid>  d=<deg>  a:<line> [edge-type/conf]
 ```
 The `files:` table dedups repeated paths — refer to file `a:368` rather than the full path. Listings rank EXTRACTED above INFERRED, code above rationale, then by degree.
+
+**Cluster tag elision.** When all items in a listing share one community, an `all in c<cid>=<auto-name>` line is hoisted under the header and the per-item `c<cid>` tag is dropped — opaque integers are noise when they're all the same. When items span multiple communities, the per-item tag is preserved as an "out of cluster" marker.
+
+**Recency-aware substring ranking.** Substring/fuzzy hits are tie-broken by file recency: matches in files modified within the last week float above same-shape matches in stale files. Combined with the public-name and degree heuristics, the most likely target lands first.
 
 ### Worked example — recon before commitment (one-shot chain)
 

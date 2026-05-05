@@ -1050,6 +1050,7 @@ def main() -> None:
         print("    coc                     co-community siblings (same Leiden cluster)")
         print("    rat | inh | parent      rationale anchors / inherits / structural parent")
         print("    siblings                structural peers (same parent file/class)")
+        print("    read | body             dump full body of focused node inline (no separate Read needed)")
         print("    [N] | N                 focus on Nth item from previous listing in the chain")
         print("    back | reset            pop history / clear cursor")
         print("    --session <id>          resume a prior session (id is printed at the bottom of every output)")
@@ -1133,6 +1134,28 @@ def main() -> None:
             # Reading our own report → no nudge needed
             if "graphify-out/" in fp:
                 return
+            # Lap-3: suppress the nudge if the file was just surfaced by a
+            # graphify navigate call. The session log is written by
+            # navigate._record_session_paths and lives alongside graph.json.
+            # Both sides are realpath'd because macOS aliases /tmp →
+            # /private/tmp; raw abspath wouldn't match.
+            try:
+                import time as _t
+                recent_log = Path("graphify-out/.session/recent-paths")
+                if recent_log.exists():
+                    now = _t.time()
+                    target = _osp.realpath(fp) if fp else ""
+                    for line in recent_log.read_text(encoding="utf-8").splitlines():
+                        ts_str, _, path = line.partition("\t")
+                        try:
+                            if now - float(ts_str) > 600:
+                                continue
+                        except ValueError:
+                            continue
+                        if path and target and path == target:
+                            return
+            except Exception:
+                pass
         msg = (
             "graphify-out/graph.json exists. Before reading/grepping "
             "unfamiliar code, scout it cheaper: `graphify navigate "
@@ -1141,6 +1164,37 @@ def main() -> None:
             "file:line once a node is load-bearing. See "
             "~/.claude/skills/graphify/SKILL.md."
         )
+        # Lap-3: one-shot staleness banner when the graph is conspicuously
+        # behind the working tree. Stamp file rate-limits to one banner per
+        # 30min so it doesn't piggyback on every code read.
+        try:
+            import time as _t
+            graph_p = Path("graphify-out/graph.json")
+            if graph_p.exists():
+                now = _t.time()
+                graph_age = now - graph_p.stat().st_mtime
+                if graph_age > 86400:  # > 1 day
+                    stamp = Path("graphify-out/.session/banner-stamp")
+                    last_banner = 0.0
+                    if stamp.exists():
+                        try:
+                            last_banner = float(stamp.read_text().strip())
+                        except (OSError, ValueError):
+                            last_banner = 0.0
+                    if now - last_banner > 1800:  # 30min
+                        days = int(graph_age // 86400)
+                        days_str = f"{days}d" if days >= 1 else f"{int(graph_age // 3600)}h"
+                        banner = (f"⚠ graph was extracted {days_str} ago — "
+                                  f"results may be stale. `graphify update .` "
+                                  f"refreshes incrementally. ")
+                        msg = banner + msg
+                        try:
+                            stamp.parent.mkdir(parents=True, exist_ok=True)
+                            stamp.write_text(f"{now:.0f}", encoding="utf-8")
+                        except OSError:
+                            pass
+        except Exception:
+            pass
         out_payload = {"hookSpecificOutput": {
             "hookEventName": "PreToolUse",
             "additionalContext": msg,

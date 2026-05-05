@@ -159,6 +159,73 @@ def _new_session_id() -> str:
     return secrets.token_hex(3)
 
 
+# --- session-recent path log ----------------------------------------------
+#
+# Lap-3: the PreToolUse hook nudges "scout cheaper with graphify" on every
+# Read, even on files the agent just navigated to via graphify itself. We
+# log the source paths surfaced by each navigate() call here, with timestamps,
+# and the hook reads this file to suppress the nudge for recently-visited
+# targets. Best-effort; failures here must never abort navigate.
+
+RECENT_PATHS_DIR = ".session"
+RECENT_PATHS_FILE = "recent-paths"
+RECENT_PATHS_TTL = 600          # 10 minutes
+RECENT_PATHS_MAX = 200
+
+
+def _record_session_paths(gpath: Path, source_files: set[str]) -> None:
+    if not source_files:
+        return
+    target = gpath.parent / RECENT_PATHS_DIR / RECENT_PATHS_FILE
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        now = time.time()
+        existing: list[str] = []
+        if target.exists():
+            try:
+                existing = target.read_text(encoding="utf-8").splitlines()
+            except OSError:
+                existing = []
+        kept: list[str] = []
+        for line in existing:
+            ts_str, _, _ = line.partition("\t")
+            try:
+                if now - float(ts_str) <= RECENT_PATHS_TTL:
+                    kept.append(line)
+            except ValueError:
+                continue
+        new_lines = [f"{now:.0f}\t{p}" for p in sorted(source_files) if p]
+        all_lines = kept + new_lines
+        if len(all_lines) > RECENT_PATHS_MAX:
+            all_lines = all_lines[-RECENT_PATHS_MAX:]
+        target.write_text("\n".join(all_lines) + "\n", encoding="utf-8")
+    except OSError:
+        return
+
+
+def _collect_session_paths(last_data: dict | None, cursor: Cursor,
+                           G: nx.DiGraph) -> set[str]:
+    paths: set[str] = set()
+    def _add(sf: str | None) -> None:
+        if not sf:
+            return
+        try:
+            paths.add(str(Path(sf).resolve()))
+        except OSError:
+            paths.add(str(sf))
+
+    if cursor.current and cursor.current in G:
+        _add(G.nodes[cursor.current].get("source_file"))
+    if last_data:
+        if last_data.get("type") == "frontier":
+            cur = last_data.get("current") or {}
+            _add(cur.get("source_file"))
+        elif last_data.get("type") == "listing":
+            for item in last_data.get("items", []):
+                _add(item.get("source_file"))
+    return paths
+
+
 def _sweep_stale(navigate_dir: Path) -> None:
     """Delete cursor files older than STALE_AGE_SECONDS. Best-effort."""
     if not navigate_dir.exists():
@@ -715,6 +782,80 @@ def _read_body_preview(source_file: str | None, source_location: str | None,
     return out
 
 
+def _read_body_full(source_file: str | None, source_location: str | None,
+                    max_lines: int = 200) -> tuple[list[str], int, bool]:
+    """Read the full body at source_location, preserving indentation.
+
+    Returns (lines, start_line_no, truncated). Lines include the header.
+    Walks until the next dedent past the body's indent baseline, or until
+    `max_lines` is reached. Used by the `read` op to fold node-find +
+    body-read into a single navigate call (Lap-3 wishlist #2).
+    """
+    if not source_file or not source_location:
+        return [], 0, False
+    loc = source_location
+    line_no: int | None = None
+    if loc.startswith("L"):
+        try:
+            line_no = int(loc[1:].split("-", 1)[0].split(":", 1)[0])
+        except ValueError:
+            return [], 0, False
+    if line_no is None:
+        return [], 0, False
+    try:
+        with open(source_file, "r", encoding="utf-8", errors="replace") as f:
+            lines = f.readlines()
+    except OSError:
+        return [], 0, False
+    start = max(0, line_no - 1)
+    if start >= len(lines):
+        return [], 0, False
+    header = lines[start].rstrip("\n")
+    header_indent = len(header) - len(header.lstrip(" \t"))
+    out: list[str] = [header]
+    body_indent: int | None = None
+    truncated = False
+    for raw in lines[start + 1:start + 1 + max_lines]:
+        stripped_full = raw.rstrip("\n")
+        if not stripped_full.strip():
+            out.append(stripped_full)
+            continue
+        cur_indent = len(stripped_full) - len(stripped_full.lstrip(" \t"))
+        if body_indent is None:
+            if cur_indent > header_indent:
+                body_indent = cur_indent
+            else:
+                # Body never started (decorator-only / single-line def). Bail.
+                break
+        if cur_indent < body_indent:
+            break
+        out.append(stripped_full)
+    if len(lines) - start - 1 > max_lines and len(out) >= max_lines:
+        truncated = True
+    return out, line_no, truncated
+
+
+def _render_body_text(data: dict) -> str:
+    """Render a `read`/`body` op result. Output is the file path/line header
+    plus the body lines numbered, so the agent can jump straight to a
+    specific line without a separate Read call."""
+    label = data.get("label") or "?"
+    sf = data.get("source_file") or "?"
+    ln = data.get("start_line") or 0
+    body_lines = data.get("lines") or []
+    truncated = data.get("truncated")
+    if not body_lines:
+        return f"  read @{label}: no body at {sf}:{ln} (missing source or unparseable location)"
+    header = f"  read @{label}  ({sf}:{ln}, {len(body_lines)} lines"
+    if truncated:
+        header += " — truncated at 200, focus contained items for the rest"
+    header += ")"
+    out = [header]
+    for i, raw in enumerate(body_lines):
+        out.append(f"  {ln + i:>4}  {raw}")
+    return "\n".join(out)
+
+
 # --- text renderers --------------------------------------------------------
 
 LEGEND = (
@@ -912,6 +1053,25 @@ def _render_listing_text(data: dict, *, show_ops: bool) -> str:
         header += f"  ({', '.join(drop_bits)})"
     out.append(header)
 
+    # Cluster hoisting — Lap-3 reported every item line carrying a `cN` tag is
+    # opaque integer noise. If all items share one community, hoist it above
+    # the table and drop per-item cN entirely; if items span clusters, the
+    # per-item tag stays useful as an "out of cluster" marker.
+    cids_seen = [it.get("community") for it in items
+                 if it.get("community") not in (None, -1)]
+    unique_cids = set(cids_seen)
+    multi_community = len(unique_cids) > 1
+    if len(unique_cids) == 1:
+        cid = next(iter(unique_cids))
+        clabel = next((it.get("community_label") for it in items
+                       if it.get("community") == cid), None)
+        cstr = f"c{cid}={clabel}" if clabel else f"c{cid}"
+        # `coc` pivot already names the cluster in its header — don't double-stamp.
+        pivot_str = data.get("pivot") or ""
+        already_in_header = f"c{cid}" in pivot_str
+        if not already_in_header:
+            out.append(f"  all in {cstr}")
+
     if use_table:
         # Only emit letters that are actually referenced (suppression of
         # singletons isn't useful if they appear only once — they'd still
@@ -978,7 +1138,11 @@ def _render_listing_text(data: dict, *, show_ops: bool) -> str:
         deg = item.get("degree", 0)
         # Only show per-item meta when the file-table didn't already absorb it.
         meta = "" if (use_table and src in file_to_letter) else _meta_tag(item)
-        out.append(f"    [{i:>2}] {label:<44} c{cid:<3} d={deg:<4} {src_str}{ft_tag}{edge_tag}{meta}")
+        # Per-item cluster tag only when items span multiple communities — see
+        # the hoist block above. Single-community listings already announced
+        # the cluster in the header, so keep item lines tight.
+        cstr = f"c{cid:<3} " if multi_community else ""
+        out.append(f"    [{i:>2}] {label:<44} {cstr}d={deg:<4} {src_str}{ft_tag}{edge_tag}{meta}")
         # Optional body preview: surfaces stub/redirect/decorator-only patterns
         # without an actual Read. Truncate long lines so the preview doesn't
         # blow out the line budget; one signal per line is enough.
@@ -1264,15 +1428,41 @@ def _is_private_label(label: str) -> bool:
     return s.startswith("_")
 
 
-def _rank_match(G: nx.DiGraph, key: str, nid: str) -> tuple[int, int, int]:
+def _recency_bucket(src: str | None) -> int:
+    """Bucket file age into 0=<7d, 1=<30d, 2=<90d, 3=older, 4=unknown.
+
+    Used as a substring/fuzzy-rank tier so recently-edited matches float
+    above stale code with the same label shape — Lap-3 reported `@residual`
+    returning 14 hits with no recency awareness, leaving the agent to pick
+    by file size rather than relevance.
+    """
+    if not src:
+        return 4
+    meta = _file_meta(src)
+    age_src = meta.get("git_mtime") or meta.get("mtime")
+    if not age_src:
+        return 4
+    days = (time.time() - age_src) / 86400.0
+    if days < 7:
+        return 0
+    if days < 30:
+        return 1
+    if days < 90:
+        return 2
+    return 3
+
+
+def _rank_match(G: nx.DiGraph, key: str, nid: str) -> tuple[int, int, int, int]:
     """Sort key for fuzzy/substring matches. Prefer (1) public names,
-    (2) shorter labels (less padding around the key), (3) higher degree (load-bearing).
+    (2) shorter labels (less padding around the key), (3) recently-touched
+    files (mtime/git_mtime bucketed), (4) higher degree (load-bearing).
     """
     label = G.nodes[nid].get("label", nid)
     is_priv = 1 if _is_private_label(label) else 0
     length_pad = max(0, len(label) - len(key))
+    bucket = _recency_bucket(G.nodes[nid].get("source_file"))
     deg = G.in_degree(nid) + G.out_degree(nid)
-    return (is_priv, length_pad, -deg)
+    return (is_priv, length_pad, bucket, -deg)
 
 
 def resolve_focus(G: nx.DiGraph, idx: dict[str, list[str]],
@@ -1549,8 +1739,26 @@ def navigate(ops: list[str] | str, *,
                                               sort_label="match relevance",
                                               limit=limit)
                 else:
-                    last_data = {"type": "error",
-                                 "message": f"no node matches `{op_str}`. try a substring."}
+                    # Lap-3: previous "try a substring" message ate the actual
+                    # next-step hint. Lower the fuzzy cutoff and surface up to
+                    # 5 near-name candidates so the agent has something to
+                    # pivot to. If even the relaxed pass returns nothing,
+                    # the symbol is likely new (graph stale) — point at update.
+                    key = _norm(op_str.lstrip("@").strip())
+                    all_labels = {_norm(G.nodes[n].get("label", n)): n
+                                  for n in G.nodes()}
+                    near = get_close_matches(key, list(all_labels.keys()),
+                                             n=5, cutoff=0.5)
+                    near_labels = [G.nodes[all_labels[s]].get("label", s)
+                                   for s in near]
+                    if near_labels:
+                        msg = (f"no node matches `{op_str}`. "
+                               f"did you mean: {', '.join(near_labels)}?")
+                    else:
+                        msg = (f"no node matches `{op_str}`. "
+                               "graph may be stale — try `graphify update .` "
+                               "if you've added code since the last extract.")
+                    last_data = {"type": "error", "message": msg}
             elif (n := _is_pick(op_str)) is not None:
                 # pick from last listing
                 if not cursor.last_listing:
@@ -1592,6 +1800,27 @@ def navigate(ops: list[str] | str, *,
                                                extracted_only=extracted_only,
                                                min_confidence=min_confidence,
                                                show_history=show_history)
+            elif op_str in ("read", "body"):
+                # Lap-3 wishlist: fold node-find + body-read into one nav call.
+                # The graph already knows file:line; serving the body inline
+                # closes the loop and avoids a separate Read of the same file.
+                if not cursor.current:
+                    last_data = {"type": "error",
+                                 "message": "no cursor. focus with @<label> first."}
+                else:
+                    nattrs = G.nodes[cursor.current]
+                    sf = nattrs.get("source_file")
+                    loc = nattrs.get("source_location")
+                    body, ln, trunc = _read_body_full(sf, loc, max_lines=200)
+                    last_data = {
+                        "type": "body",
+                        "label": nattrs.get("label", cursor.current),
+                        "source_file": sf,
+                        "source_location": loc,
+                        "lines": body,
+                        "start_line": ln,
+                        "truncated": trunc,
+                    }
             elif (pkey := PIVOT_KEYS.get(op_str)) is not None:
                 # pivot
                 if not cursor.current:
@@ -1621,7 +1850,8 @@ def navigate(ops: list[str] | str, *,
                 last_data = {"type": "error",
                              "message": (f"unknown op `{op_str}`. ops: @<label> · "
                                          "in · out · methods · contains · coc · rat · inh · "
-                                         "parent · back · reset · [N]")}
+                                         "parent · siblings · callers · callees · read · "
+                                         "back · reset · [N]")}
             _summarize_step(op_str, last_data)
 
             # Abort the chain on hard failures so a downstream op doesn't
@@ -1654,6 +1884,12 @@ def navigate(ops: list[str] | str, *,
     if persist and session_id is not None:
         cursor.save(_cursor_path(gpath, session_id))
 
+    # Log surfaced source paths so the PreToolUse hook can suppress its
+    # "scout cheaper" nudge on files this session just navigated to.
+    # Best-effort; failures must not affect the rendered output.
+    if persist:
+        _record_session_paths(gpath, _collect_session_paths(last_data, cursor, G))
+
     # Render
     if fmt == "json":
         payload: dict[str, Any] = {}
@@ -1680,6 +1916,8 @@ def navigate(ops: list[str] | str, *,
         parts.append(_render_frontier_text(last_data, cursor, show_ops=show_ops_hint))
     elif last_data.get("type") == "listing":
         parts.append(_render_listing_text(last_data, show_ops=show_ops_hint))
+    elif last_data.get("type") == "body":
+        parts.append(_render_body_text(last_data))
     elif last_data.get("type") == "status":
         parts.append(last_data["message"])
     elif last_data.get("type") == "error":
