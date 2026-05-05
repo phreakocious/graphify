@@ -51,3 +51,39 @@ def test_path_qualified_no_match_falls_through():
     chosen, candidates, match_type, _ = resolve_focus(G, idx, "nope/nonexistent.py")
     # Either no match or fuzzy — but no exception, no spurious exact hit
     assert chosen is None or match_type == "fuzzy"
+
+
+def test_path_qualified_symbol_disambiguates_collision():
+    """Symbol-shape path qualifier `dir/file.rs/Symbol` — disambiguates a
+    label that collides across many files. Critical for Rust crates / JS
+    monorepos where the same struct name lives in 10+ modules."""
+    G = nx.DiGraph()
+    G.add_node("vi_a", label="VectorIndex", file_type="code",
+               source_file="crates/foo/src/gate.rs", source_location="L11")
+    G.add_node("vi_b", label="VectorIndex", file_type="code",
+               source_file="crates/foo/src/walk.rs", source_location="L15")
+    G.add_node("vi_c", label="VectorIndex", file_type="code",
+               source_file="crates/bar/src/gate.rs", source_location="L19")
+    idx = label_index(G)
+    # `path/file.ext/Symbol` should resolve to the one in crates/foo/src/walk.rs
+    chosen, _, match_type, _ = resolve_focus(G, idx, "crates/foo/src/walk.rs/VectorIndex")
+    assert chosen == "vi_b", f"expected vi_b, got {chosen!r}"
+    assert match_type == "exact"
+
+
+def test_resolve_works_on_undirected_graph():
+    """`path` and `explain` subcommands load via networkx node_link_graph
+    which yields an undirected Graph. _rank_match used to call
+    G.in_degree / G.out_degree → AttributeError. Regression test:
+    resolution must not crash on undirected input."""
+    G = nx.Graph()  # undirected on purpose
+    G.add_node("a", label="alpha", file_type="code",
+               source_file="m.py", source_location="L1")
+    G.add_node("b", label="alpha", file_type="code",
+               source_file="m.py", source_location="L5")
+    G.add_edge("a", "b")  # symmetric
+    idx = label_index(G)
+    # Multiple-match path triggers _rank_match for sort ordering
+    chosen, candidates, match_type, _ = resolve_focus(G, idx, "alpha")
+    assert chosen is None
+    assert len(candidates) == 2  # didn't crash and returned both

@@ -1443,9 +1443,13 @@ def main() -> None:
                                         ("target", target_label, tgt_nid, tgt_cands)):
             if nid is None:
                 if cands:
-                    print(f"{who} '{label}' is ambiguous ({len(cands)} matches). pick a more specific label.", file=sys.stderr)
+                    print(f"{who} '{label}' is ambiguous ({len(cands)} matches). pick a more specific label (try `path/symbol` to qualify).", file=sys.stderr)
                     for c in cands[:5]:
-                        print(f"  - {G.nodes[c].get('label', c)}", file=sys.stderr)
+                        attrs = G.nodes[c]
+                        src = attrs.get("source_file") or ""
+                        loc = attrs.get("source_location") or ""
+                        suffix = f"  — {src}{':' + loc if loc else ''}" if src else ""
+                        print(f"  - {attrs.get('label', c)}{suffix}", file=sys.stderr)
                 else:
                     print(f"No node matching '{label}' found.", file=sys.stderr)
                 sys.exit(1)
@@ -1527,9 +1531,13 @@ def main() -> None:
         nid, candidates, match_type, _alts = resolve_focus(G, idx, label)
         if nid is None:
             if candidates:
-                print(f"'{label}' is ambiguous ({len(candidates)} matches). pick one:", file=sys.stderr)
+                print(f"'{label}' is ambiguous ({len(candidates)} matches). pick one (try `path/symbol` to qualify):", file=sys.stderr)
                 for c in candidates[:5]:
-                    print(f"  - {G.nodes[c].get('label', c)}", file=sys.stderr)
+                    attrs = G.nodes[c]
+                    src = attrs.get("source_file") or ""
+                    loc = attrs.get("source_location") or ""
+                    suffix = f"  — {src}{':' + loc if loc else ''}" if src else ""
+                    print(f"  - {attrs.get('label', c)}{suffix}", file=sys.stderr)
             else:
                 print(f"No node matching '{label}' found.")
             sys.exit(0 if not candidates else 1)

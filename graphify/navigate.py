@@ -1452,16 +1452,21 @@ def _recency_bucket(src: str | None) -> int:
     return 3
 
 
-def _rank_match(G: nx.DiGraph, key: str, nid: str) -> tuple[int, int, int, int]:
+def _rank_match(G: nx.Graph, key: str, nid: str) -> tuple[int, int, int, int]:
     """Sort key for fuzzy/substring matches. Prefer (1) public names,
     (2) shorter labels (less padding around the key), (3) recently-touched
     files (mtime/git_mtime bucketed), (4) higher degree (load-bearing).
+
+    Use `G.degree(nid)` — it works on both DiGraph and undirected Graph
+    (and on DiGraph equals `in_degree + out_degree`). The `path` and
+    `explain` subcommands load via `node_link_graph` which returns an
+    undirected Graph; without this, both crash inside `resolve_focus`.
     """
     label = G.nodes[nid].get("label", nid)
     is_priv = 1 if _is_private_label(label) else 0
     length_pad = max(0, len(label) - len(key))
     bucket = _recency_bucket(G.nodes[nid].get("source_file"))
-    deg = G.in_degree(nid) + G.out_degree(nid)
+    deg = G.degree(nid)
     return (is_priv, length_pad, bucket, -deg)
 
 
@@ -1493,20 +1498,33 @@ def resolve_focus(G: nx.DiGraph, idx: dict[str, list[str]],
         matches_sorted = sorted(matches, key=lambda n: _rank_match(G, key, n))
         return None, matches_sorted, "exact", []
 
-    # 1b. path-qualified query (`tools/metric_diagnostic.py`). The label
-    # index keys off basename, so a `/`-bearing query never hits step 1.
-    # Substring also fails because the key is *longer* than typical labels.
-    # Without this branch we fall through to fuzzy and `tools/foo.py` ends
-    # up "ambiguous" against basename-similar typos (`bar/ab_foo.py`,
-    # `qux/foo_other.py`) — even though the user told us exactly which
-    # file. Match nodes whose label == basename AND whose source_file
-    # ends with the full path; that's a user-confirmed exact resolution.
+    # 1b. path-qualified query. Two shapes the agent reaches for:
+    #
+    #   `tools/metric_diagnostic.py` — disambiguate by directory because
+    #     basename collides with sibling files in other dirs. We match
+    #     where label == basename AND source_file ends with the path.
+    #
+    #   `crates/foo/bar.rs/VectorIndex` — disambiguate a symbol that
+    #     collides across many files (10 `VectorIndex` in larql crates).
+    #     We match where label == basename (the symbol) AND source_file
+    #     of that node ends with the path-prefix segment.
+    #
+    # Without this branch a `/`-bearing query never hits step 1 (idx is
+    # keyed on basename, not path), substring fails (key is longer than
+    # any single label), and we fall through to fuzzy — which returns
+    # basename-similar typos and calls them "ambiguous (3)" even though
+    # the user told us exactly which file.
     if "/" in key:
-        basename = key.rsplit("/", 1)[-1]
+        prefix, _, basename = key.rpartition("/")
         path_hits = []
         for nid in idx.get(basename, []):
             sf = _norm(G.nodes[nid].get("source_file") or "")
+            # File-shape: source_file matches the full path
             if sf == key or sf.endswith("/" + key):
+                path_hits.append(nid)
+                continue
+            # Symbol-shape: source_file ends with the path-prefix segment
+            if prefix and (sf == prefix or sf.endswith("/" + prefix)):
                 path_hits.append(nid)
         if len(path_hits) == 1:
             return path_hits[0], [], "exact", []
