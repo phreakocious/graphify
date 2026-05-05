@@ -111,6 +111,12 @@ def generate(
         score = cohesion_scores.get(cid, 0.0)
         # Filter method/function stubs from display - they're structural noise
         real_nodes = [n for n in nodes if not _ifn(G, n)]
+        # If filtering left nothing, the community is just file/stub plumbing
+        # — emitting `Nodes (0):` produces noise the reader can't act on.
+        # Skip the entry; the community count in the header is still
+        # accurate because we report `len(real_nodes)` not `len(nodes)`.
+        if not real_nodes:
+            continue
         display = [G.nodes[n].get("label", n) for n in real_nodes[:8]]
         suffix = f" (+{len(real_nodes)-8} more)" if len(real_nodes) > 8 else ""
         lines += [

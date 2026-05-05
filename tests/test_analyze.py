@@ -277,6 +277,36 @@ def test_suggest_questions_excludes_rationale_from_isolated():
     assert isolated_qs == [], f"rationale nodes flagged as isolated: {isolated_qs}"
 
 
+def test_report_skips_communities_with_no_real_nodes():
+    """A community whose entire membership is file/stub nodes filters down
+    to zero displayable members. Don't emit `Nodes (0):` — skip the entry."""
+    from graphify.report import generate
+    G = nx.Graph()
+    # File-stub-only community: file label matches source_file basename
+    # → _is_file_node returns True → real_nodes will be empty.
+    G.add_node("f1", label="solo.py", file_type="code", source_file="solo.py", source_location="L1")
+    G.add_node("f2", label="other.py", file_type="code", source_file="other.py", source_location="L1")
+    G.add_edge("f1", "f2", relation="imports", confidence="EXTRACTED", source_file="solo.py")
+    # Padding community with real (non-stub) code nodes
+    for i, lbl in enumerate(("X", "Y", "Z", "W")):
+        G.add_node(lbl.lower(), label=lbl, file_type="code", source_file="o.py",
+                   source_location=f"L{i+1}")
+    G.add_edge("x", "y", relation="calls", confidence="EXTRACTED", source_file="o.py")
+    G.add_edge("y", "z", relation="calls", confidence="EXTRACTED", source_file="o.py")
+    G.add_edge("z", "w", relation="calls", confidence="EXTRACTED", source_file="o.py")
+    communities = {0: ["f1", "f2"], 1: ["x", "y", "z", "w"]}
+    cohesion = {0: 1.0, 1: 1.0}
+    labels = {0: "FilesOnly", 1: "Other"}
+    detection = {"total_files": 2, "total_words": 100, "needs_graph": True, "warning": None}
+    report = generate(G, communities, cohesion, labels, [], [], detection,
+                      {"input": 0, "output": 0}, "./p")
+    assert "Nodes (0)" not in report
+    # Community 0 should be elided since all its members are file stubs
+    assert "### Community 0" not in report
+    # Community 1 should still appear
+    assert "### Community 1" in report
+
+
 def test_report_skips_singleton_communities():
     """A community of size 1 isn't a thin community — it's clustering noise.
     Reporting "Community X (1 node) too small to be meaningful" produces no
