@@ -1205,6 +1205,104 @@ def _extract_generic(path: Path, config: LanguageConfig) -> dict:
     for caller_nid, body_node in function_bodies:
         walk_calls(body_node, caller_nid)
 
+    # ── JS/TS closure-as-module pass ─────────────────────────────────────────
+    # The factory pattern in TS:
+    #
+    #   export function buildDecodeEngine(...) {
+    #     async function probeForward(...) { ... }
+    #     const injectGenerate = (...) => { ... };
+    #     ...
+    #     return { probeForward, injectGenerate, ... }
+    #   }
+    #
+    # The default walker stops at `function_declaration` and registers the
+    # body, so nested declarations inside the factory body are invisible.
+    # `@probeForward` then falls through to fuzzy and lands on something
+    # unrelated. Walk each registered function body for nested function
+    # declarations and arrow-bound lexical declarations, register them as
+    # method-shaped children of the outer factory.
+    #
+    # Why method (not contains): structurally these closures *belong* to
+    # the outer factory the way methods belong to a class, and it lets
+    # `@buildDecodeEngine methods` surface them — the same intent the
+    # agent has when typing it.
+    if config.ts_module in ("tree_sitter_javascript", "tree_sitter_typescript"):
+        def _walk_nested_funcs(body_node):
+            """Yield (kind, name, name_line, body_node) for every nested
+            function-shape inside the given body. `kind` ∈ {"function",
+            "arrow"}. Arrow case covers `const x = (a) => {...}` and
+            `let x = function(...) {...}` declared inside the factory.
+            """
+            for child in body_node.children:
+                if child.type == "function_declaration":
+                    name = child.child_by_field_name("name")
+                    body = child.child_by_field_name("body")
+                    if name and body:
+                        yield ("function",
+                               _read_text(name, source),
+                               child.start_point[0] + 1,
+                               body)
+                elif child.type == "lexical_declaration":
+                    for declarator in child.children:
+                        if declarator.type != "variable_declarator":
+                            continue
+                        name_n = declarator.child_by_field_name("name")
+                        value_n = declarator.child_by_field_name("value")
+                        if not name_n or not value_n:
+                            continue
+                        if value_n.type in ("arrow_function", "function_expression"):
+                            body = value_n.child_by_field_name("body")
+                            if body:
+                                yield ("arrow",
+                                       _read_text(name_n, source),
+                                       declarator.start_point[0] + 1,
+                                       body)
+                # Recurse into compound bodies (statement_block, if, try,
+                # etc.) so nested-conditional declarations are caught.
+                # Don't recurse into another `function_declaration` or
+                # `arrow_function` body — those are scopes of their own
+                # and their inner declarations don't belong on the outer.
+                elif child.type not in (
+                    "function_declaration", "function_expression",
+                    "arrow_function", "method_definition",
+                    "class_declaration",
+                ) and child.is_named:
+                    yield from _walk_nested_funcs(child)
+
+        # Snapshot first — adding to function_bodies inside the loop
+        # would let nested closures of nested closures register as
+        # methods of the wrong outer factory (we want each function's
+        # nested funcs as its direct methods, not transitively cascading).
+        outer_pairs = list(function_bodies)
+        for outer_nid, outer_body in outer_pairs:
+            outer_label = next(
+                (n["label"] for n in nodes if n["id"] == outer_nid), None
+            )
+            if not outer_label:
+                continue
+            outer_base = outer_label.rstrip("()")
+            seen_inner: set[str] = set()
+            for kind, name, name_line, inner_body in _walk_nested_funcs(outer_body):
+                if not name or name in seen_inner:
+                    continue
+                if not name.replace("_", "").replace("$", "").isalnum():
+                    continue
+                seen_inner.add(name)
+                inner_nid = _make_id(stem, f"{outer_base}_{name}")
+                add_node(inner_nid, f"{name}()", name_line)
+                add_edge(outer_nid, inner_nid, "method", name_line)
+                # Register the new closure in `label_to_nid` so
+                # `walk_calls` resolves intra-closure calls correctly
+                # (`label_to_nid` was built before this pass ran). Without
+                # this, a call from `injectForward` to `probeForward`
+                # falls through unresolved and the call edge is lost.
+                label_to_nid[name.lower()] = inner_nid
+                # Walk inside the closure for any calls. We're past the
+                # main call walker, so do it inline. Don't append to
+                # function_bodies (would re-fire this pass and double-
+                # register grandchild closures under the outer factory).
+                walk_calls(inner_body, inner_nid)
+
     # ── Event listener pass ───────────────────────────────────────────────────
     seen_listen_pairs: set[tuple[str, str]] = set()
     for event_name, listener_name, line in pending_listen_edges:

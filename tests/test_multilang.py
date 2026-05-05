@@ -61,6 +61,51 @@ def test_ts_no_dangling_edges():
             assert e["source"] in node_ids
 
 
+def test_ts_closure_factory_surfaces_inner_closures():
+    """Closure-as-module: `function f() { function inner() {...}; const
+    arrow = () => {}; return { inner, arrow } }`. Without the closure-
+    pass, `inner`/`arrow` were invisible (`@inner` fell through to fuzzy
+    on unrelated names). Now they're method-shaped children of the
+    outer factory."""
+    r = extract_js(FIXTURES / "closure_factory.ts")
+    labels = _labels(r)
+    # Outer factory still registered
+    assert "buildEngine()" in labels
+    # All three inner closures lifted to nodes
+    assert "probeForward()" in labels, f"missing probeForward; got {labels}"
+    assert "injectForward()" in labels, f"missing injectForward; got {labels}"
+    assert "embeddingGenerate()" in labels, f"missing embeddingGenerate; got {labels}"
+    # Method edges from the factory to each closure
+    method_pairs = {
+        (e["source"], e["target"])
+        for e in r["edges"] if e["relation"] == "method"
+    }
+    label_to_id = {n["label"]: n["id"] for n in r["nodes"]}
+    outer = label_to_id["buildEngine()"]
+    for inner in ("probeForward()", "injectForward()", "embeddingGenerate()"):
+        assert (outer, label_to_id[inner]) in method_pairs, (
+            f"missing method edge buildEngine → {inner}"
+        )
+
+
+def test_ts_closure_factory_intra_call_attributes_correctly():
+    """A call inside a nested closure must register the closure as the
+    caller, not the outer factory. Without this, `injectForward calls
+    probeForward` would attribute as `buildEngine calls probeForward` —
+    semantically wrong, swamps the outer factory's call list."""
+    r = extract_js(FIXTURES / "closure_factory.ts")
+    label_to_id = {n["label"]: n["id"] for n in r["nodes"]}
+    inner_caller = label_to_id["injectForward()"]
+    inner_callee = label_to_id["probeForward()"]
+    call_edges = {
+        (e["source"], e["target"])
+        for e in r["edges"] if e["relation"] == "calls"
+    }
+    assert (inner_caller, inner_callee) in call_edges, (
+        f"closure-internal call not attributed to closure; got: {call_edges}"
+    )
+
+
 # ── Go ────────────────────────────────────────────────────────────────────────
 
 def test_go_finds_struct():
