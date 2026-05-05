@@ -32,9 +32,14 @@ Turn any folder of files into a navigable knowledge graph with community detecti
 /graphify add <url> --author "Name"                   # tag who wrote it
 /graphify add <url> --contributor "Name"              # tag who added it to the corpus
 /graphify navigate "@<label>"                         # *primary exploration surface* — focus a node, see typed pivots
-/graphify navigate <op>                               # apply pivot: in | out | methods | contains | coc | rat | inh | parent
+/graphify navigate <op>                               # apply pivot: in | out | methods | contains | coc | rat | inh | parent | siblings | callers | callees | dependents | dependencies | read | filter | where-used
 /graphify navigate "[N]"                              # focus on Nth item from last listing
 /graphify navigate --session <id>                     # resume a prior session (id is printed in every output)
+/graphify navigate --show-session <id>                # peek a saved session's frontier without mutating the cursor
+/graphify navigate --quiet-hints                      # suppress hint lines (per-session dedup also applies on --session)
+/graphify peek "<symbol>"                             # one-shot body read — resolve, dump body, no session/cursor side-effects (accepts Class.method)
+/graphify search "<pattern>"                          # body-text grep across nodes — returns hits with symbol context (label, file:line, container, community, degree)
+/graphify shape "<file>"                              # file structure summary: N classes / M fns / K consts / X imports / longest fn — wc -l + ctags equivalent
 /graphify query "<question>"                          # BFS traversal - broad context (use after navigate narrows scope)
 /graphify query "<question>" --dfs                    # DFS - trace a specific path
 /graphify query "<question>" --budget 1500            # cap answer at N tokens
@@ -1300,11 +1305,18 @@ Op forms:
 - `callers` / `callees` — sugar for `in --kind=calls` / `out --kind=calls`. Drops uses/imports/references noise.
 - `dependents` / `dependencies` — transitive callers/callees on call edges, default depth 3 (`--depth N` to override). Verbs map onto coupling rather than graph direction.
 - `coc summary` — structural shape of the focus's coc community (top hubs, composition, edge mix) instead of enumerating. Cheap on big communities.
+- `where-used` (alias `wu`) — superop combining `in` with text-mention search of the symbol's bare name. Edge-discovered rows first, text-discovered rows below carry `[mentions L<line>]` tags. Catches dynamic dispatch / string-keyed lookup that AST-only `in` misses.
 - `read` (or `body`) — dump the focused node's body inline (default 200 lines, cap with `read N`). Folds focus + Read into one call. On file nodes, flat-dumps the first N lines.
 - `filter <regex>` (or `f <regex>`) — narrow the most recent listing by regex on label. Works after any listing op. Renumbers picks 1-based against the filtered view (`methods filter "_deficit" 2` lands on the second match). Falls back to case-insensitive substring when regex fails to compile (header tags `, substring`).
 - `[N]` — focus on the Nth item from the most recent listing
 - `back` / `reset` / `status` (or no arg) — pop history / clear cursor / show frontier
-- Single-letter chain aliases: `i`=in, `o`=out, `m`=methods, `p`=parent, `s`=siblings, `r`=rat. No `c` alias (keeps `coc`/`contains` unambiguous).
+- Single-letter chain aliases: `i`=in, `o`=out, `m`=methods, `p`=parent, `s`=siblings, `r`=rat, `wu`=where-used. No `c` alias (keeps `coc`/`contains` unambiguous).
+- Class.method dotted syntax — `@Runner.__init__`, `@Klein.compute()`, etc. resolve to the method node directly when the class part is unambiguous.
+
+### Sibling subcommands (one-shot, no cursor)
+- `graphify peek "<symbol>"` — body dump. Same resolver ladder as navigate, including `Class.method` and `<dir>/<file>/<symbol>` qualifiers. `--lines N` for cap (default 200), `--md` for clickable label.
+- `graphify search "<pattern>"` — body-text grep with symbol context. `--kind code|rationale|all`, `--context N` for pre/post lines around each match, `--limit N`. Pattern is a case-insensitive regex; falls back to literal substring on `re.error` (mode surfaced in header). Eliminates the grep fallback for "where does this string appear in code" — every hit comes back with label, file:line, community, degree.
+- `graphify shape "<file>"` — counts of classes, fns, consts, imports + the longest fn by line span. Saves a `contains` pivot for orientation.
 
 ### Output format
 

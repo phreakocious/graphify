@@ -17,8 +17,8 @@ def _body_content(content: bytes) -> bytes:
     return content
 
 
-def file_hash(path: Path, root: Path = Path(".")) -> str:
-    """SHA256 of file contents + path relative to root.
+def file_hash(path: Path, root: Path = Path("."), version: str = "") -> str:
+    """SHA256 of file contents + path relative to root + optional cache version.
 
     Using a relative path (not absolute) makes cache entries portable across
     machines and checkout directories, so shared caches and CI work correctly.
@@ -26,6 +26,12 @@ def file_hash(path: Path, root: Path = Path(".")) -> str:
 
     For Markdown files (.md), only the body below the YAML frontmatter is hashed,
     so metadata-only changes (e.g. reviewed, status, tags) do not invalidate the cache.
+
+    When `version` is non-empty, it is mixed into the digest. Bumping the version
+    invalidates all cache entries created with a different version — the right
+    move whenever an extractor adds new node/edge kinds. Without this, a file
+    whose contents haven't changed since a prior run would return the stale
+    extraction.
     """
     p = Path(path)
     raw = p.read_bytes()
@@ -38,6 +44,9 @@ def file_hash(path: Path, root: Path = Path(".")) -> str:
         h.update(str(rel).encode())
     except ValueError:
         h.update(str(p.resolve()).encode())
+    if version:
+        h.update(b"\x00")
+        h.update(version.encode())
     return h.hexdigest()
 
 
@@ -48,15 +57,18 @@ def cache_dir(root: Path = Path(".")) -> Path:
     return d
 
 
-def load_cached(path: Path, root: Path = Path(".")) -> dict | None:
+def load_cached(path: Path, root: Path = Path("."), version: str = "") -> dict | None:
     """Return cached extraction for this file if hash matches, else None.
 
-    Cache key: SHA256 of file contents.
+    Cache key: SHA256 of file contents (+ rel path + optional version).
     Cache value: stored as graphify-out/cache/{hash}.json
     Returns None if no cache entry or file has changed.
+
+    Pass `version` to scope the lookup to a particular extractor schema.
+    A bumped version means a clean miss on entries written by older extractors.
     """
     try:
-        h = file_hash(path, root)
+        h = file_hash(path, root, version=version)
     except OSError:
         return None
     entry = cache_dir(root) / f"{h}.json"
@@ -68,13 +80,14 @@ def load_cached(path: Path, root: Path = Path(".")) -> dict | None:
         return None
 
 
-def save_cached(path: Path, result: dict, root: Path = Path(".")) -> None:
+def save_cached(path: Path, result: dict, root: Path = Path("."), version: str = "") -> None:
     """Save extraction result for this file.
 
-    Stores as graphify-out/cache/{hash}.json where hash = SHA256 of current file contents.
+    Stores as graphify-out/cache/{hash}.json where hash = SHA256 of current file contents
+    (+ rel path + optional version).
     result should be a dict with 'nodes' and 'edges' lists.
     """
-    h = file_hash(path, root)
+    h = file_hash(path, root, version=version)
     entry = cache_dir(root) / f"{h}.json"
     tmp = entry.with_suffix(".tmp")
     try:

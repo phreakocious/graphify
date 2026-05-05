@@ -10,6 +10,18 @@ from pathlib import Path
 from typing import Callable, Any
 from .cache import load_cached, save_cached
 
+# Bump when extractors gain new node kinds, edge kinds, or change resolver
+# behaviour in ways that would let stale per-file cache entries hide the new
+# information. The cache key mixes this in, so a bump invalidates every entry
+# written by an older version. History:
+#   "v1" — first versioned baseline (post lap-13b TS resolver fix). Forces a
+#          re-extract of every file cached under the unversioned scheme,
+#          which had quietly hidden lap-12 cross-language / interface-property /
+#          closure-method work on any file whose contents hadn't changed.
+# Note: lap-15's phantom-node resolution runs at MERGE time over the
+# combined per-file results, so it fires on cached output too — no bump.
+AST_CACHE_VERSION = "v1"
+
 
 def _make_id(*parts: str) -> str:
     """Build a stable node ID from one or more name parts."""
@@ -3476,13 +3488,13 @@ def extract(paths: list[Path], cache_root: Path | None = None) -> dict:
             extractor = _DISPATCH.get(path.suffix)
         if extractor is None:
             continue
-        cached = load_cached(path, cache_root or root)
+        cached = load_cached(path, cache_root or root, version=AST_CACHE_VERSION)
         if cached is not None:
             per_file.append(cached)
             continue
         result = extractor(path)
         if "error" not in result:
-            save_cached(path, result, cache_root or root)
+            save_cached(path, result, cache_root or root, version=AST_CACHE_VERSION)
         per_file.append(result)
     if total >= _PROGRESS_INTERVAL:
         print(f"  AST extraction: {total}/{total} files (100%)", flush=True)
@@ -3594,12 +3606,83 @@ def extract(paths: list[Path], cache_root: Path | None = None) -> dict:
                     "weight": 1.0,
                 })
 
+    # Phantom resolution pass — redirect inheritance edges from
+    # placeholder nodes (empty source coords) to the real cross-file
+    # class when the lookup is unambiguous.
+    all_nodes, all_edges = _resolve_phantom_nodes(all_nodes, all_edges)
+
     return {
         "nodes": all_nodes,
         "edges": all_edges,
         "input_tokens": 0,
         "output_tokens": 0,
     }
+
+
+def _resolve_phantom_nodes(all_nodes: list[dict],
+                            all_edges: list[dict]) -> tuple[list[dict], list[dict]]:
+    """Redirect edges from placeholder nodes to the real cross-file decl.
+
+    Some extractors (Python superclass walker, Swift conformance walker,
+    C# base_list walker) emit a placeholder node for an unresolved
+    inheritance target — empty `source_file`, empty `source_location` —
+    so the inheritance edge has somewhere to land same-file. When the
+    post-merge graph has a single REAL node with the same label (extracted
+    from another file we also processed), redirect inbound edges to the
+    real node and drop the phantom.
+
+    Without this, disambiguation listings show two same-label rows — one
+    with a `?` for source — and the agent can't tell whether the second
+    is a stub, a re-export, or a graph artifact. (It's the third.)
+
+    When multiple real candidates exist for the same label, we leave the
+    phantom alone: the inheritance target is genuinely ambiguous across
+    files and dropping the phantom would lose the edge entirely.
+    """
+    label_to_real: dict[str, list[str]] = {}
+    for n in all_nodes:
+        if n.get("source_file") and n.get("source_location"):
+            label = n.get("label") or ""
+            if label:
+                label_to_real.setdefault(label, []).append(n["id"])
+
+    phantom_ids: set[str] = set()
+    redirect: dict[str, str] = {}
+    for n in all_nodes:
+        if (not n.get("source_file") and not n.get("source_location")
+                and n.get("label")):
+            candidates = label_to_real.get(n["label"]) or []
+            if len(candidates) == 1:
+                phantom_ids.add(n["id"])
+                redirect[n["id"]] = candidates[0]
+
+    if not phantom_ids:
+        return all_nodes, all_edges
+
+    # Rewrite edges. (src, tgt) pair-dedup: if the redirected edge would
+    # collide with an existing real edge, drop the duplicate.
+    existing_pairs = {(e["source"], e["target"]) for e in all_edges
+                      if e["source"] not in phantom_ids
+                      and e["target"] not in phantom_ids}
+    rewritten: list[dict] = []
+    for e in all_edges:
+        src = e.get("source")
+        tgt = e.get("target")
+        new_src = redirect.get(src, src)
+        new_tgt = redirect.get(tgt, tgt)
+        if new_src == new_tgt:
+            # Self-loop after redirect — drop. A class inheriting from
+            # itself via the resolver is never meaningful.
+            continue
+        if (new_src, new_tgt) in existing_pairs:
+            continue
+        existing_pairs.add((new_src, new_tgt))
+        ne = dict(e)
+        ne["source"] = new_src
+        ne["target"] = new_tgt
+        rewritten.append(ne)
+    new_nodes = [n for n in all_nodes if n["id"] not in phantom_ids]
+    return new_nodes, rewritten
 
 
 def collect_files(target: Path, *, follow_symlinks: bool = False, root: Path | None = None) -> list[Path]:

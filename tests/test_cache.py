@@ -124,3 +124,32 @@ def test_body_content_no_frontmatter():
     """_body_content returns content unchanged when no frontmatter present."""
     content = b"No frontmatter here."
     assert _body_content(content) == content
+
+
+def test_file_hash_version_changes_digest(tmp_file):
+    """A non-empty version mixes into the digest — same file, different versions, different hashes."""
+    h_unversioned = file_hash(tmp_file)
+    h_v1 = file_hash(tmp_file, version="v1")
+    h_v2 = file_hash(tmp_file, version="v2")
+    assert h_unversioned != h_v1
+    assert h_v1 != h_v2
+    # Empty version stays back-compatible with the unversioned digest.
+    assert file_hash(tmp_file, version="") == h_unversioned
+
+
+def test_version_bump_invalidates_cache(tmp_file, cache_root):
+    """An entry saved under one version is invisible to load_cached with a different version."""
+    result = {"nodes": [{"id": "n1"}], "edges": []}
+    save_cached(tmp_file, result, root=cache_root, version="v1")
+    assert load_cached(tmp_file, root=cache_root, version="v1") == result
+    # Bumped version: clean miss, even though file contents are unchanged.
+    assert load_cached(tmp_file, root=cache_root, version="v2") is None
+    # Unversioned reader also misses (digest differs).
+    assert load_cached(tmp_file, root=cache_root) is None
+
+
+def test_unversioned_save_load_roundtrip_unchanged(tmp_file, cache_root):
+    """Existing unversioned callers (e.g. semantic cache) still work."""
+    result = {"nodes": [], "edges": [{"source": "a", "target": "b"}]}
+    save_cached(tmp_file, result, root=cache_root)
+    assert load_cached(tmp_file, root=cache_root) == result

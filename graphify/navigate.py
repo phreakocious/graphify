@@ -164,6 +164,12 @@ class Cursor:
     # rest of the chain. Cleared on `back`/`reset` or if the next call
     # starts with a non-pick op (treat it as an override).
     queued_ops: list[str] = field(default_factory=list)
+    # Per-session hint dedup: stable keys of hints already emitted in this
+    # session. Each hint kind shows once; subsequent identical conditions
+    # don't re-emit. Reset by `reset` (clears the cursor entirely).
+    # Ephemeral non-session calls start with this empty every time, so
+    # dedup only takes effect once the agent commits to `--session <id>`.
+    hints_emitted: list[str] = field(default_factory=list)
 
     @classmethod
     def load(cls, path: Path) -> "Cursor":
@@ -823,6 +829,19 @@ def _frontier_data(G: nx.DiGraph, communities: dict[int, list[str]],
                     callers.add(u)
         via_methods = len(callers)
 
+    # Rationale-share-of-contains: how many of this node's contained
+    # children are rationale (doc/comment) fragments. When most/all of
+    # them are rationale on a file hub, the file's `contains` listing is
+    # mostly docs — the renderer surfaces a "docs/rationale-mostly file"
+    # hint pointing at `read [N]` instead of a productive symbol drill.
+    contains_rationale_count = 0
+    for v in G.successors(nid):
+        e = G.edges[nid, v]
+        if (e.get("relation") == "contains"
+                and _passes_confidence(e, extracted_only, min_confidence)
+                and G.nodes[v].get("file_type") == "rationale"):
+            contains_rationale_count += 1
+
     # Sibling count: union of parents' contained children minus self.
     # Approximate but accurate for the common case of single-parent containment.
     sib_set: set[str] = set()
@@ -878,6 +897,7 @@ def _frontier_data(G: nx.DiGraph, communities: dict[int, list[str]],
         "last_pivot": cursor.last_pivot,
         "last_listing_size": len(cursor.last_listing),
         "show_history": show_history,
+        "contains_rationale_count": contains_rationale_count,
     }
 
 
@@ -1400,7 +1420,27 @@ LEGEND = (
 )
 
 
-def _render_frontier_text(data: dict, cursor: Cursor, *, show_ops: bool, md: bool = False) -> str:
+def _emit_hint(out: list[str], key: str, message: str,
+               cursor: Cursor | None, quiet_hints: bool) -> None:
+    """Append a hint line subject to two gates:
+       1. `quiet_hints=True` → suppress all hints (CLI: `--quiet-hints`).
+       2. `key in cursor.hints_emitted` → already shown this hint kind in
+          this session — skip the repeat.
+    Records emitted keys on the cursor for future calls. Non-session
+    (ephemeral) cursors discard the record on save, so dedup only takes
+    effect once the agent commits to `--session <id>`.
+    """
+    if quiet_hints:
+        return
+    if cursor is not None and key in cursor.hints_emitted:
+        return
+    out.append(message)
+    if cursor is not None:
+        cursor.hints_emitted.append(key)
+
+
+def _render_frontier_text(data: dict, cursor: Cursor, *, show_ops: bool,
+                           md: bool = False, quiet_hints: bool = False) -> str:
     if data.get("current") is None:
         # First-contact: surface the cheat-sheet unconditionally so a brand-new
         # agent doesn't have to know `--ops-hint` exists. After a focus lands,
@@ -1513,60 +1553,49 @@ def _render_frontier_text(data: dict, cursor: Cursor, *, show_ops: bool, md: boo
         if p['contains']['count'] > 0:
             kind = ("script-leaf — call edges live in the contained nodes"
                     if is_code_file else "no direct edges")
-            out.append(
+            _emit_hint(out, "drill_via_contains",
                 f"  hint: {kind}. drill: `contains` ({p['contains']['count']}) "
-                f"→ pick a function → then `out`."
-            )
+                f"→ pick a function → then `out`.",
+                cursor, quiet_hints)
         elif p['methods']['count'] > 0:
             via = p['in'].get('via_methods', 0)
             if via:
-                out.append(
+                _emit_hint(out, "class_shape_via_methods",
                     f"  hint: class-shaped — direct callers=0 but {via} reach via "
                     f"its methods. drill: `methods` ({p['methods']['count']}) → "
-                    f"pick a method → then `in`."
-                )
+                    f"pick a method → then `in`.",
+                    cursor, quiet_hints)
             else:
-                out.append(
+                _emit_hint(out, "drill_via_methods",
                     f"  hint: no direct call edges. drill: `methods` "
-                    f"({p['methods']['count']}) → pick a method → then `in`/`out`."
-                )
+                    f"({p['methods']['count']}) → pick a method → then `in`/`out`.",
+                    cursor, quiet_hints)
         elif (p['contains']['count'] == 0 and p['methods']['count'] == 0
               and p['parent']['count'] == 0 and p['rat']['count'] == 0
               and p['inh']['count'] == 0):
-            # Truly orphaned: no parent, no children, no rationale, no inheritance.
-            # Often a top-level constant, isolated import, or genuinely dead node.
-            # The agent should pivot through `coc` (Leiden cluster) for context
-            # rather than poking at empty pivots.
             coc_n = p.get('coc', {}).get('count', 0)
             if coc_n > 0:
-                out.append(
+                _emit_hint(out, "orphan_in_cluster",
                     f"  hint: orphan — no in/out/parent/contains/methods. "
-                    f"closest context is its community ({coc_n} members) — try `coc`."
-                )
+                    f"closest context is its community ({coc_n} members) — try `coc`.",
+                    cursor, quiet_hints)
             else:
-                out.append(
+                _emit_hint(out, "fully_isolated",
                     "  hint: fully isolated — no edges and no community peers. "
-                    "graph likely has stale extraction; consider `graphify update .`."
-                )
+                    "graph likely has stale extraction; consider `graphify update .`.",
+                    cursor, quiet_hints)
     elif p['methods']['count'] > 0 and p['in'].get('via_methods', 0) > p['in']['count']:
-        # Has direct callers but methods see far more — class-shape signal.
-        # Surface the rollup so the agent doesn't anchor on the direct count.
-        out.append(
+        _emit_hint(out, "class_shape_rollup",
             f"  hint: class-shaped — {p['in']['count']} direct callers vs "
-            f"{p['in']['via_methods']} via methods. `methods` then `in` reveals the wider call graph."
-        )
+            f"{p['in']['via_methods']} via methods. `methods` then `in` reveals the wider call graph.",
+            cursor, quiet_hints)
     elif (is_code_file and p['methods']['count'] == 0
           and p['contains']['count'] > 0):
-        # File-shape: even with in/out nonzero (importers/imports), the
-        # symbol-level call graph lives one hop in via `contains`. Without
-        # this the agent tries `methods` (0), gets nothing, and stalls —
-        # the field report had `@compile-v2.ts methods` returning 0 with
-        # no signpost to `contains` (which had 5).
-        out.append(
+        _emit_hint(out, "file_shape",
             f"  hint: file — {p['contains']['count']} contained, "
             f"{p['in']['count']} importer(s); drill: `contains` for the "
-            f"symbols inside, `in` to see who imports."
-        )
+            f"symbols inside, `in` to see who imports.",
+            cursor, quiet_hints)
 
     # Lap-9 specific-cause empty hints. The generic "0 in" message doesn't
     # explain WHY a node has no callers. These cases turn a misleading
@@ -1599,7 +1628,7 @@ def _render_frontier_text(data: dict, cursor: Cursor, *, show_ops: bool, md: boo
                f"AST drops to inferred on dynamic dispatch. "
                f"widen with `--include-inferred --min-confidence 0.85` "
                f"(or `in --kind=impl_of` on interface methods).")
-        out.append(msg)
+        _emit_hint(out, "closure_iface_dispatch", msg, cursor, quiet_hints)
 
     # Module-config: code file focused as a node, 0 contains, file > 50 lines.
     # Likely a `const X = {...}` / data-only module. The current "fully
@@ -1619,13 +1648,13 @@ def _render_frontier_text(data: dict, cursor: Cursor, *, show_ops: bool, md: boo
             and p['methods']['count'] == 0):
         nlines = _file_meta(sf).get("lines") if sf else None
         if isinstance(nlines, int) and nlines > 50:
-            out.append(
+            _emit_hint(out, "module_config",
                 f"  hint: file is {nlines} lines but 0 decls — likely a "
                 f"`const X = ...` / data module (config/spec/registry). "
                 f"AST extraction skips top-level value-bindings; "
                 f"`read [N]` dumps the file inline (cursor already knows "
-                f"the path) — no separate Read needed."
-            )
+                f"the path) — no separate Read needed.",
+                cursor, quiet_hints)
 
     # Kind-based steering hints. The header surfaces the [iface]/[impl]/[type]
     # tag, but the tag alone doesn't tell a fresh agent what pivots are
@@ -1633,34 +1662,80 @@ def _render_frontier_text(data: dict, cursor: Cursor, *, show_ops: bool, md: boo
     # query doesn't waste a turn finding out the hard way. node_kind is
     # already defined at the top of the hint section.
     if node_kind in ("interface", "iface_method"):
-        # Interfaces receive `impl_of` from classes that implement them.
-        # The default `in` pivot also surfaces these, but `--kind=impl_of`
-        # narrows to the runtime-binding question ("who actually implements
-        # this contract?") and skips type_ref noise.
-        out.append(
+        _emit_hint(out, "interface_kind",
             "  hint: interface — runtime call sites bind to implementations. "
             "find them with `in --kind=impl_of`. `methods` lists the contract; "
-            "`inh` shows interface chains."
-        )
+            "`inh` shows interface chains.",
+            cursor, quiet_hints)
     elif node_kind == "type_alias":
-        # Type aliases collect `type_ref` edges from callers using the type.
-        # Without naming the relation the agent ends up running plain `in`,
-        # getting type_ref-tagged rows, and inferring the connection — slow.
-        out.append(
+        _emit_hint(out, "type_alias_kind",
             "  hint: type alias — usage sites attach as `type_ref` edges. "
             "find them with `in --kind=type_ref`. for runtime impls, find "
-            "the class implementing this type."
-        )
+            "the class implementing this type.",
+            cursor, quiet_hints)
     elif (cur.get("file_type") == "rationale"
           and p['contains']['count'] == 0
           and p['out']['count'] == 0):
-        # Lone rationale node — typically a doc fragment with no anchored
-        # symbols. The natural pivots are `in` (what symbols this rationale
-        # is attached to) and `coc` (other rationale in the same cluster).
-        out.append(
+        _emit_hint(out, "rationale_node",
             "  hint: rationale node — find the symbol(s) it's anchored to "
-            "via `in` (rationale_for edges)."
-        )
+            "via `in` (rationale_for edges).",
+            cursor, quiet_hints)
+    elif (node_kind == "class"
+          and p['methods']['count'] == 0
+          and p['contains']['count'] == 0):
+        impl_n = p.get('inh', {}).get('count', 0)
+        suffix = (f". `inh` ({impl_n}) shows the parent contract"
+                  if impl_n else "")
+        _emit_hint(out, "empty_class_protocol",
+            f"  hint: class with no methods/contains — likely a "
+            f"protocol/abstract/marker class. find implementers via "
+            f"`in --kind=inherits` or `in --kind=impl_of`{suffix}; "
+            f"`read` dumps the body inline.",
+            cursor, quiet_hints)
+
+    # Docs/rationale-mostly file: a code-file hub whose only contains-children
+    # are rationale fragments (doc comments/module docstrings extracted by the
+    # python rationale pass). A `contains` listing here returns N rationale
+    # rows that look like decls but aren't callable. Saving a wasted pivot.
+    is_file_hub = bool(cur.get("source_file") and cur.get("label") == Path(cur.get("source_file") or "").name)
+    contains_rat_n = data.get("contains_rationale_count", 0)
+    contains_n = p['contains']['count']
+    if (is_file_hub and contains_n >= 3 and contains_rat_n == contains_n):
+        _emit_hint(out, "docs_mostly_file",
+            f"  hint: file's `contains` is {contains_n} rationale fragments "
+            f"(doc/comment-extracted, not callable symbols). `read [N]` "
+            f"dumps the file inline; for the actual call graph, look at "
+            f"another file in this community via `coc`.",
+            cursor, quiet_hints)
+
+    # Loose orphan-in-cluster: focus has no in/out and no method/contains
+    # structure, but DOES have parent/rat/inh AND a non-trivial community.
+    # The hard-orphan branch above only fires when literally everything is
+    # zero — which misses the common pattern where a leaf function has an
+    # owning parent (so `parent>0`) but no callers (so `in==0`) yet. Without
+    # this, the agent gets no signpost between "0 callers" and the cluster
+    # context that explains why the function is here.
+    has_some_structural = (p['parent']['count'] > 0
+                            or p['rat']['count'] > 0
+                            or p['inh']['count'] > 0)
+    if (p['in']['count'] == 0 and p['out']['count'] == 0
+            and p['contains']['count'] == 0 and p['methods']['count'] == 0
+            and has_some_structural
+            and p.get('coc', {}).get('count', 0) > 0):
+        # Already-fired hints (script-leaf, class-shaped, hard-orphan) all
+        # require contains/methods OR full emptiness — so this branch is
+        # exclusive with them and won't double-emit.
+        coc_n = p['coc']['count']
+        bits = []
+        if p['parent']['count'] > 0:
+            bits.append(f"`parent` ({p['parent']['count']}) climbs back up")
+        if p['rat']['count'] > 0:
+            bits.append(f"`rat` ({p['rat']['count']}) for design notes")
+        bits.append(f"`coc` ({coc_n}) for cluster context")
+        _emit_hint(out, "loose_orphan_in_cluster",
+            f"  hint: 0 in/out/contains/methods but lives in a community — "
+            f"{'; '.join(bits)}.",
+            cursor, quiet_hints)
 
     # If any pivot has hidden inferred/low-confidence edges, surface
     # the flag inline once so the affordance is discovered, not just
@@ -1671,10 +1746,10 @@ def _render_frontier_text(data: dict, cursor: Cursor, *, show_ops: bool, md: boo
         for k in ("in", "out", "methods", "contains", "coc")
     )
     if has_hidden_inf:
-        out.append(
+        _emit_hint(out, "hidden_inferred",
             "  hint: hidden inferred edges available — "
-            "add `--include-inferred` to widen pivots beyond AST ground truth."
-        )
+            "add `--include-inferred` to widen pivots beyond AST ground truth.",
+            cursor, quiet_hints)
 
     if data.get("last_listing_size") and data.get("last_pivot"):
         out.append(f"  last: {data['last_pivot']}({data['last_listing_size']}) · pick [N]")
@@ -1806,6 +1881,14 @@ def _render_listing_text(data: dict, *, show_ops: bool, md: bool = False) -> str
         drop_bits.append(f"+{drops['archived']} archived hidden")
     if drops.get("files"):
         drop_bits.append(f"+{drops['files']} files hidden — pass --include-files to widen")
+    # `where-used` breakdown: split edge-callers from text-mentions in the
+    # header so the agent sees the trust split at a glance. Edge hits are
+    # AST-grounded; text hits could be string literals, comments, or
+    # similarly-named symbols in unrelated code.
+    if "edge_hits" in drops or "text_only_hits" in drops:
+        eh = drops.get("edge_hits", 0)
+        th = drops.get("text_only_hits", 0)
+        drop_bits.append(f"{eh} via edges + {th} text-only mentions")
     if drop_bits:
         # Mention the flag inline once when only inferred edges were
         # dropped — discoverable becomes discovered without forcing the
@@ -1844,6 +1927,17 @@ def _render_listing_text(data: dict, *, show_ops: bool, md: bool = False) -> str
                    f"`[N]` picks the first member; pivot via "
                    f"`@<dir>/<file>/<sym>` for a specific dupe. "
                    f"Pass `--no-collapse` to expand.")
+
+    # Auto-widen note: 0 extracted, fell back to inferred. Without this the
+    # `(auto-widened)` tag in the pivot header is opaque — the agent doesn't
+    # know that the rows below are NOT AST ground truth, just that something
+    # got widened. Stating the contract inline ("[inf] tags") plus the manual
+    # equivalent (`--include-inferred`) keeps trust calibrated.
+    if drops.get("auto_widened_from_extracted"):
+        out.append(f"  note: 0 extracted; auto-widened to {data['total']} "
+                   f"inferred edge(s). rows below carry [inf@<score>] tags — "
+                   f"name-collision risk; pass `--include-inferred` "
+                   f"explicitly to silence this auto-widen.")
 
     if use_table:
         # Only emit letters that are actually referenced (suppression of
@@ -1934,6 +2028,15 @@ def _render_listing_text(data: dict, *, show_ops: bool, md: bool = False) -> str
         # `[N]` index targets the group's first member; an agent who
         # needs a specific dupe pivots via `@<dir>/<file>/<sym>`.
         dupe_count = item.get("dupe_count", 0)
+        # `where-used` superop tags rows that came from text-mention scan
+        # rather than graph edges. Append `[mentions L<line>...]` so the
+        # agent sees the discovery source — without it, edge-discovered
+        # and text-discovered rows visually merge.
+        mention_lines = item.get("mention_lines")
+        if mention_lines:
+            line_str = ",".join(f"L{ln}" for ln in mention_lines[:3])
+            edge_tag = (edge_tag + f" [mentions {line_str}]"
+                        if edge_tag else f" [mentions {line_str}]")
         if dupe_count >= _DUPE_COLLAPSE_THRESHOLD:
             samples = item.get("dupe_samples") or []
             sample_paths = []
@@ -2610,6 +2713,46 @@ def resolve_focus(G: nx.DiGraph, idx: dict[str, list[str]],
             path_hits.sort(key=lambda n: _rank_match(G, key, n))
             return None, path_hits, "exact", []
 
+    # 1c. dotted Class.method qualifier. `Runner.__init__`, `Klein.compute()`,
+    # or `Cell.bar` should resolve to the method node directly. Today the
+    # natural dotted form (the one the agent reaches for from Python/JS/TS
+    # idiom) falls through to fuzzy and returns "no node matches" because
+    # the label is `.bar()` (method-shape, no class qualifier in the
+    # label itself). The fix: when target has exactly one `.` (and isn't
+    # a path), split into class + method, resolve the class, walk its
+    # method/contains edges, match by normalized method name.
+    if "." in key and "/" not in key and not key.startswith("."):
+        cls_part, _, meth_part = key.partition(".")
+        # Guard: only fire when both halves look like names (no extra dots,
+        # no spaces, non-empty). Multi-segment paths like `pkg.mod.Class`
+        # are ambiguous between "pkg.mod" being a class with method "Class"
+        # and "pkg" being a class with method "mod.Class". Defer those.
+        if cls_part and meth_part and "." not in meth_part:
+            # Strip method decoration on the user-typed form so a user
+            # who typed `compute()` resolves the same as `compute`.
+            meth_target = meth_part.rstrip("()").lstrip("_")
+            cls_matches = idx.get(cls_part, [])
+            # If the class part is itself ambiguous, don't try to walk
+            # all candidate classes — that would silently pick one. The
+            # fall-through to fuzzy gives the agent a disambig listing.
+            if len(cls_matches) == 1:
+                cls_nid = cls_matches[0]
+                method_hits: list[str] = []
+                for v in G.successors(cls_nid):
+                    e = G.edges[cls_nid, v]
+                    rel = e.get("relation") or ""
+                    if rel not in ("method", "contains"):
+                        continue
+                    child_label = _norm(G.nodes[v].get("label", v))
+                    child_stripped = child_label.rstrip("()").lstrip(".").lstrip("_")
+                    if child_stripped == meth_target or child_label == meth_part:
+                        method_hits.append(v)
+                if len(method_hits) == 1:
+                    return method_hits[0], [], "exact", []
+                if len(method_hits) > 1:
+                    method_hits.sort(key=lambda n: _rank_match(G, key, n))
+                    return None, method_hits, "exact", []
+
     # 2. substring fallback (rank: public-first, shorter, higher degree).
     # Distinguish "prefix" (label starts with key) from generic "substring" so
     # the agent can gauge match strength — `@multi_axis_fingerprint` matching
@@ -2659,6 +2802,410 @@ def resolve_focus(G: nx.DiGraph, idx: dict[str, list[str]],
     # — the score gap with many candidates isn't reliable enough to silently
     # commit. The disambig itself acts as the pivot menu.
     return None, fuzzy_ids, "fuzzy", []
+
+
+# --- body-text search ------------------------------------------------------
+
+def _attribute_match_to_node(match_line: int,
+                              node_starts: list[tuple[int, str]]) -> str | None:
+    """Pick the deepest node whose start_line <= match_line.
+
+    `node_starts` is a list of (start_line, nid) pre-sorted ascending by
+    start_line. Returns the nid of the LAST (highest start_line) node
+    whose start_line <= match_line — that's the most-deeply-nested
+    enclosing decl in the typical AST emission order.
+    """
+    chosen: str | None = None
+    for start_line, nid in node_starts:
+        if start_line <= match_line:
+            chosen = nid
+        else:
+            break
+    return chosen
+
+
+def search_bodies(G: nx.DiGraph,
+                  pattern: str, *,
+                  kind: str = "code",
+                  archived_mode: str = "no",
+                  limit: int = 50,
+                  context: int = 0) -> dict:
+    """Body-text search across all nodes that have source_file + source_location.
+
+    Returns hits with the containing node's metadata (label, file:line,
+    community, degree). Eliminates the grep fallback for "where does
+    spectral_coherence appear?" — the agent stays in symbol-aware
+    coordinates without dropping to file:line tuples.
+
+    `kind`: filter on file_type.
+        - "code" (default): code-file nodes only. Skips rationale fragments
+          since they're doc-comment text — usually noise for the agent's
+          "where is this used in code" question.
+        - "rationale": rationale nodes only.
+        - "all": both.
+    `archived_mode`: "no" (skip archived, default), "all", "only".
+    `limit`: max hits returned. Per-file scan continues past the limit
+        only to compute the truncated count.
+    `context`: lines of pre/post context around each match line. Default 0
+        (just the match line). Up to 3 saves a separate `read` round-trip.
+
+    The pattern is compiled as a case-insensitive regex; on `re.error` we
+    fall back to a literal case-insensitive substring match. The mode is
+    surfaced in the result so the agent knows whether their `[(` would
+    be treated as regex or substring.
+    """
+    try:
+        rx = re.compile(pattern, re.IGNORECASE)
+        match_fn = rx.search
+        mode = "regex"
+    except re.error:
+        needle = pattern.lower()
+        match_fn = lambda s: needle in s.lower()  # noqa: E731
+        mode = "substring"
+
+    # Group nodes by source_file with parsed start lines. We only consider
+    # nodes that have BOTH source_file and a parseable source_location;
+    # nodes without source coordinates can't carry a body match.
+    by_file: dict[str, list[tuple[int, str]]] = defaultdict(list)
+    for nid, attrs in G.nodes(data=True):
+        sf = attrs.get("source_file")
+        loc = attrs.get("source_location") or ""
+        if not sf:
+            continue
+        ft = attrs.get("file_type") or ""
+        if kind == "code" and ft != "code":
+            continue
+        if kind == "rationale" and ft != "rationale":
+            continue
+        if archived_mode == "no" and _is_archived_path(sf):
+            continue
+        if archived_mode == "only" and not _is_archived_path(sf):
+            continue
+        if not loc.startswith("L"):
+            continue
+        try:
+            start_line = int(loc[1:].split("-", 1)[0].split(":", 1)[0])
+        except ValueError:
+            continue
+        by_file[sf].append((start_line, nid))
+
+    hits: list[dict] = []
+    truncated_count = 0
+    files_scanned = 0
+    files_read_failed = 0
+
+    for sf, node_starts in by_file.items():
+        node_starts.sort(key=lambda x: x[0])
+        try:
+            with open(sf, "r", encoding="utf-8", errors="replace") as f:
+                lines = f.readlines()
+        except OSError:
+            files_read_failed += 1
+            continue
+        files_scanned += 1
+        for i, raw in enumerate(lines, 1):
+            line = raw.rstrip("\n")
+            if not match_fn(line):
+                continue
+            owner_nid = _attribute_match_to_node(i, node_starts)
+            if owner_nid is None:
+                continue
+            if len(hits) >= limit:
+                truncated_count += 1
+                continue
+            owner_attrs = G.nodes[owner_nid]
+            ctx_pre: list[str] = []
+            ctx_post: list[str] = []
+            if context > 0:
+                for k in range(max(0, i - 1 - context), i - 1):
+                    ctx_pre.append(lines[k].rstrip("\n"))
+                for k in range(i, min(len(lines), i + context)):
+                    ctx_post.append(lines[k].rstrip("\n"))
+            hits.append({
+                "id": owner_nid,
+                "label": owner_attrs.get("label", owner_nid),
+                "source_file": sf,
+                "source_location": owner_attrs.get("source_location"),
+                "match_line": i,
+                "snippet": line.strip(),
+                "ctx_pre": ctx_pre,
+                "ctx_post": ctx_post,
+                "community": owner_attrs.get("community"),
+                "degree": G.degree(owner_nid),
+                "node_kind": owner_attrs.get("node_kind"),
+                "file_type": owner_attrs.get("file_type"),
+            })
+
+    # Rank: archived last, then degree desc (load-bearing first), then label.
+    def _rank(h: dict) -> tuple[int, int, str]:
+        is_arch = 1 if _is_archived_path(h["source_file"]) else 0
+        return (is_arch, -h["degree"], h["label"])
+    hits.sort(key=_rank)
+
+    return {
+        "type": "search",
+        "pattern": pattern,
+        "mode": mode,
+        "kind": kind,
+        "archived_mode": archived_mode,
+        "limit": limit,
+        "hits": hits,
+        "total": len(hits),
+        "truncated": truncated_count,
+        "files_scanned": files_scanned,
+        "files_read_failed": files_read_failed,
+    }
+
+
+def _render_search_text(data: dict, *, md: bool = False) -> str:
+    """Plain-text render for `graphify search` results.
+
+    Header names the pattern, mode, scan stats. Each hit shows
+    `[N] @<label>  file:match_line  d=K  cN`  with the matched line
+    shown indented below. With context>0, pre/post lines are interleaved.
+    """
+    pat = data["pattern"]
+    mode = data["mode"]
+    total = data["total"]
+    truncated = data["truncated"]
+    files_scanned = data["files_scanned"]
+    files_failed = data["files_read_failed"]
+    kind = data["kind"]
+
+    out: list[str] = []
+    header = f"  search /{pat}/ ({mode}, kind={kind}): {total} hit(s)"
+    if total == 0:
+        if files_scanned == 0:
+            return f"{header}  (no files scanned — graph may have no source-located nodes)"
+        return f"{header}  ({files_scanned} files scanned)"
+    if truncated:
+        header += f" — showing first {data['limit']}, +{truncated} more"
+    header += f"  ({files_scanned} files scanned"
+    if files_failed:
+        header += f", {files_failed} unreadable"
+    header += ")"
+    out.append(header)
+
+    # File-letter table when files repeat.
+    file_to_letter: dict[str, str] = {}
+    file_use_count: dict[str, int] = defaultdict(int)
+    for h in data["hits"]:
+        sf = h["source_file"]
+        file_use_count[sf] += 1
+        if sf not in file_to_letter:
+            file_to_letter[sf] = _file_letter(len(file_to_letter))
+    use_table = any(c >= 2 for c in file_use_count.values()) and len(data["hits"]) >= 3
+    if use_table:
+        out.append("  files:")
+        for sf, letter in file_to_letter.items():
+            count = file_use_count[sf]
+            out.append(f"    [{letter}] {sf}  ×{count}")
+
+    for i, h in enumerate(data["hits"], 1):
+        sf = h["source_file"]
+        cid = h.get("community")
+        cstr = f"c{cid}" if cid not in (None, -1) else ""
+        kind_tag = ""
+        nk = h.get("node_kind") or ""
+        if nk == "interface" or nk == "iface_method":
+            kind_tag = " [iface]"
+        elif nk == "impl_method":
+            kind_tag = " [impl]"
+        elif nk == "type_alias":
+            kind_tag = " [type]"
+        elif h.get("file_type") == "rationale":
+            kind_tag = " [rat]"
+        if use_table and sf in file_to_letter:
+            loc_str = f"{file_to_letter[sf]}:{h['match_line']}"
+        else:
+            loc_str = f"{sf}:{h['match_line']}"
+        label = h.get("label") or h["id"]
+        if md:
+            label = _maybe_link(label, sf, f"L{h['match_line']}", md)
+        line_a = (f"    [{i:>2}] @{label:<40} d={h['degree']:<4} {cstr:<5} "
+                  f"{loc_str}{kind_tag}").rstrip()
+        out.append(line_a)
+        # Pre-context, then the matched line, then post-context.
+        for ctx in h.get("ctx_pre") or []:
+            out.append(f"          | {ctx[:120]}")
+        snip = h["snippet"]
+        if len(snip) > 160:
+            snip = snip[:159] + "…"
+        out.append(f"        > {snip}")
+        for ctx in h.get("ctx_post") or []:
+            out.append(f"          | {ctx[:120]}")
+
+    return "\n".join(out)
+
+
+# --- file shape summary ----------------------------------------------------
+
+def shape_file(G: nx.DiGraph, file_nid: str) -> dict:
+    """Summarize a file's structure: class/fn/const/import counts + the
+    longest top-level function by line span.
+
+    The agent's `wc -l + ctags` equivalent: "what's in this file at a
+    glance, before I commit to drilling into it?" Saves a `contains`
+    pivot + a Read for orientation. Operates on the existing graph
+    nodes/edges plus a one-shot file read for line spans.
+
+    Returns a dict with `classes`, `fns`, `consts`, `imports`,
+    `longest_fn` (None or {label, lines}), `total_lines`,
+    `source_file`, `label`.
+    """
+    fattrs = G.nodes[file_nid]
+    sf = fattrs.get("source_file") or ""
+    label = fattrs.get("label") or file_nid
+
+    # Direct children via contains/method edges. methods are emitted as a
+    # separate relation by some extractors, so include both.
+    children: list[tuple[str, dict]] = []
+    for v in G.successors(file_nid):
+        e = G.edges[file_nid, v]
+        if e.get("relation") in ("contains", "method"):
+            children.append((v, G.nodes[v]))
+
+    classes: list[str] = []
+    iface_or_type: list[str] = []
+    fns: list[str] = []
+    consts: list[str] = []
+    rationale: list[str] = []
+
+    for nid, attrs in children:
+        kind = attrs.get("node_kind") or ""
+        ft = attrs.get("file_type") or ""
+        lab = attrs.get("label") or ""
+        if ft == "rationale":
+            rationale.append(nid)
+            continue
+        # Prefer node_kind when set (TS extractor populates it). When the
+        # extractor doesn't tag node_kind (Python pass leaves it empty),
+        # fall back to label-shape: `Capitalized` no-parens → class,
+        # `name()` or `.name()` → function, anything else → const/other.
+        if kind == "class":
+            classes.append(nid)
+        elif kind in ("interface", "type_alias"):
+            iface_or_type.append(nid)
+        elif kind in ("impl_method", "iface_method") or kind == "function":
+            fns.append(nid)
+        elif lab.endswith("()"):
+            fns.append(nid)
+        elif (lab and not lab.startswith(".") and lab[0:1].isalpha()
+              and lab[0].isupper() and "(" not in lab and " " not in lab
+              and any(c.islower() for c in lab)):
+            # Class-shape fallback: PascalCase identifier (leading upper
+            # AND at least one lowercase letter) with no parens. Catches
+            # Python classes whose extractor doesn't set node_kind.
+            # Excludes `.method()` (leading dot), rationale text (spaces),
+            # and ALL_CAPS constants like `MAX_RETRIES` / `DEBUG`.
+            classes.append(nid)
+        else:
+            # Anything else: ALL_CAPS constants, snake_case bindings,
+            # registry dicts, etc. Useful as a "this file has N non-fn
+            # nodes worth a `read`" signal, even though AST extraction
+            # only surfaces a subset of these.
+            consts.append(nid)
+
+    # imports edges out of the file
+    imports = sum(1 for v in G.successors(file_nid)
+                  if G.edges[file_nid, v].get("relation") == "imports")
+
+    # Compute longest fn by line span. Read the file once, sort all
+    # children by start_line, attribute spans by next-sibling-start.
+    file_lines: list[str] | None = None
+    try:
+        with open(sf, "r", encoding="utf-8", errors="replace") as f:
+            file_lines = f.readlines()
+    except OSError:
+        file_lines = None
+
+    fn_spans: dict[str, int] = {}
+    if file_lines:
+        starts: list[tuple[int, str]] = []
+        for nid, attrs in children:
+            loc = attrs.get("source_location") or ""
+            if not loc.startswith("L"):
+                continue
+            try:
+                start = int(loc[1:].split("-", 1)[0].split(":", 1)[0])
+            except ValueError:
+                continue
+            starts.append((start, nid))
+        starts.sort(key=lambda x: x[0])
+        # Each child's span runs from its start to the next sibling's
+        # start (or end of file). Approximation — nested decls would
+        # bleed into the parent's span — but for top-level decls in a
+        # file this is accurate to within ~2 lines.
+        for idx, (start, nid) in enumerate(starts):
+            end = starts[idx + 1][0] - 1 if idx + 1 < len(starts) else len(file_lines)
+            fn_spans[nid] = max(1, end - start + 1)
+
+    longest_fn: dict | None = None
+    if fns and fn_spans:
+        candidates = [(fn_spans.get(nid, 0), nid) for nid in fns
+                      if nid in fn_spans]
+        if candidates:
+            best_lines, best_nid = max(candidates, key=lambda x: x[0])
+            longest_fn = {
+                "label": G.nodes[best_nid].get("label", best_nid),
+                "lines": best_lines,
+                "source_location": G.nodes[best_nid].get("source_location"),
+            }
+
+    total_lines = len(file_lines) if file_lines else None
+    return {
+        "type": "shape",
+        "label": label,
+        "source_file": sf,
+        "classes": len(classes),
+        "interfaces_or_types": len(iface_or_type),
+        "fns": len(fns),
+        "consts": len(consts),
+        "rationale": len(rationale),
+        "imports": imports,
+        "longest_fn": longest_fn,
+        "total_lines": total_lines,
+        "class_labels": [G.nodes[n].get("label", n) for n in classes][:8],
+        "fn_labels": [G.nodes[n].get("label", n) for n in fns][:8],
+    }
+
+
+def _render_shape_text(data: dict) -> str:
+    """Compact one-screen shape summary: counts + samples + longest fn."""
+    parts: list[str] = []
+    parts.append(f"  shape @{data['label']}  {data.get('source_file') or '?'}")
+    bits: list[str] = []
+    if data["classes"]:
+        bits.append(f"{data['classes']} class(es)")
+    if data["interfaces_or_types"]:
+        bits.append(f"{data['interfaces_or_types']} iface/type(s)")
+    if data["fns"]:
+        bits.append(f"{data['fns']} fn(s)")
+    if data["consts"]:
+        bits.append(f"{data['consts']} const/other")
+    if data["rationale"]:
+        bits.append(f"{data['rationale']} rationale")
+    if data["imports"]:
+        bits.append(f"{data['imports']} import(s)")
+    if data["total_lines"]:
+        bits.append(f"{data['total_lines']} ln total")
+    parts.append("    " + (" · ".join(bits) if bits else "(empty file)"))
+
+    if data.get("class_labels"):
+        more = data["classes"] - len(data["class_labels"])
+        sfx = f" +{more} more" if more > 0 else ""
+        parts.append(f"    classes: {', '.join(data['class_labels'])}{sfx}")
+    if data.get("fn_labels"):
+        more = data["fns"] - len(data["fn_labels"])
+        sfx = f" +{more} more" if more > 0 else ""
+        parts.append(f"    fns: {', '.join(data['fn_labels'])}{sfx}")
+    if data.get("longest_fn"):
+        lf = data["longest_fn"]
+        loc = lf.get("source_location") or ""
+        loc_str = (f":{loc[1:]}" if loc.startswith("L") else "")
+        parts.append(f"    longest fn: {lf['label']}  {lf['lines']} ln{loc_str}")
+
+    return "\n".join(parts)
 
 
 # --- op chain --------------------------------------------------------------
@@ -2723,7 +3270,9 @@ def navigate(ops: list[str] | str, *,
              collapse_dupes: bool = True,
              explain_cost: bool = False,
              md: bool = False,
-             transitive: bool = False) -> str:
+             transitive: bool = False,
+             show_session: str | None = None,
+             quiet_hints: bool = False) -> str:
     """Apply a chain of ops, return rendered output.
 
     ops: list of ops or a single string. Strings get split on whitespace.
@@ -2782,6 +3331,10 @@ def navigate(ops: list[str] | str, *,
         aggregates their out edges. Collapses the script-leaf "drill via
         contained nodes" workflow into one call. No-op when `out` already
         has direct edges or focus isn't a file node.
+    show_session: when set (CLI: `--show-session <id>`), load the cursor
+        saved under that id, render its current frontier, and exit. No
+        ops processed, no cursor mutation, no persist. Lets an agent ask
+        "where am I in this session?" without committing a navigate step.
     """
     if isinstance(ops, str):
         ops = ops.strip().split() if ops.strip() else []
@@ -2809,6 +3362,38 @@ def navigate(ops: list[str] | str, *,
     _META_CACHE.clear()
 
     G, communities = load_graph(gpath)
+
+    # --- show-session: read-only cursor introspection ------------------------
+    # `--show-session <id>` is a peek, not a navigate step. Load the cursor,
+    # render its frontier, exit. No ops processed, no mutation, no persist.
+    # Useful for picking up a long-running session after a context break, or
+    # asking "where did I leave the cursor?" without committing a step.
+    if show_session:
+        cpath = _cursor_path(gpath, show_session)
+        if not cpath.exists():
+            msg = (f"error: session `{show_session}` not found. "
+                   f"sessions live under {gpath.parent / CURSOR_DIR}/.")
+            return json.dumps({"type": "error", "message": msg}) if fmt == "json" else msg
+        cursor = Cursor.load(cpath)
+        cursor.graph_path = str(gpath)
+        if not cursor.current:
+            msg = f"session `{show_session}` exists but has no cursor (empty history)."
+            if fmt == "json":
+                return json.dumps({"type": "status", "message": msg})
+            return f"  note: {msg}"
+        last_data = _frontier_data(G, communities, cursor,
+                                   extracted_only=extracted_only,
+                                   min_confidence=min_confidence,
+                                   show_history=True)
+        if fmt == "json":
+            last_data["session"] = show_session
+            return json.dumps(last_data)
+        body = _render_frontier_text(last_data, cursor,
+                                     show_ops=show_ops_hint, md=md,
+                                     quiet_hints=quiet_hints)
+        # Header pins this output as a peek (not a step) so the agent
+        # doesn't read the frontier as the result of an op they didn't run.
+        return f"  show-session: {show_session}\n{body}"
 
     # --- session resolution -------------------------------------------------
     # session=False  → no disk, no id, no print
@@ -3134,6 +3719,90 @@ def navigate(ops: list[str] | str, *,
                         trace.append(
                             f"  > filter /{pattern}/{mode_note} matched 0 of {prior_count}"
                         )
+            elif op_str in ("where-used", "wu", "⚯"):
+                # `where-used` superop: edge-callers (`in`) ∪ literal-string
+                # mentions of the symbol's name in code bodies. Combines the
+                # "who calls X?" graph query with "where is X mentioned by
+                # name?" text query into one call. Common navigation when
+                # the agent suspects dynamic dispatch / string-keyed lookup
+                # would hide some callers from the AST graph.
+                if not cursor.current:
+                    last_data = {"type": "error",
+                                 "message": "no cursor. focus with @<label> first."}
+                else:
+                    # 1. Edge-discovered callers via `in`. Reuse _pivot_data
+                    #    so confidence/kind filtering is consistent with the
+                    #    bare `in` op the agent would otherwise run.
+                    pname_in, ids_in, edge_for_in, sort_in, drops_in = _pivot_data(
+                        G, communities, cursor, "in",
+                        extracted_only=extracted_only,
+                        min_confidence=min_confidence,
+                        kinds=kinds,
+                        depth=depth,
+                        include_files=include_files,
+                        transitive=False,
+                    )
+                    # 2. Text-discovered mentions. Strip method/property
+                    #    decoration (`.foo()` → `foo`) so we search for the
+                    #    bare identifier with word-boundary anchors. That
+                    #    keeps `init` from matching `__init__` everywhere.
+                    cur_label = G.nodes[cursor.current].get("label") or ""
+                    bare = cur_label.lstrip(".").rstrip("()").strip()
+                    text_hits: list[str] = []
+                    text_hit_lines: dict[str, list[int]] = {}
+                    if bare and bare.replace("_", "").isalnum():
+                        # Word-boundary regex; case-sensitive (use exact
+                        # name to reduce false positives like `name` →
+                        # `Name`/`getName`/etc).
+                        pat = rf"\b{re.escape(bare)}\b"
+                        sres = search_bodies(
+                            G, pat, kind="code",
+                            archived_mode=("no" if archived_mode == "no" else "all"),
+                            limit=200,
+                        )
+                        seen = set(ids_in) | {cursor.current}
+                        for h in sres["hits"]:
+                            if h["id"] in seen:
+                                # Already discovered via edge (or it's the
+                                # def itself) — track the line for context
+                                # rendering but don't double-list as a row.
+                                text_hit_lines.setdefault(h["id"], []).append(h["match_line"])
+                                continue
+                            seen.add(h["id"])
+                            text_hits.append(h["id"])
+                            text_hit_lines.setdefault(h["id"], []).append(h["match_line"])
+                    # Combined ids: edges first (ranked by `in` already),
+                    # then text-only.
+                    combined = list(ids_in) + text_hits
+                    combined, archived_hidden = _filter_archived_ids(
+                        G, combined, archived_mode)
+                    drops = dict(drops_in or {})
+                    if archived_hidden:
+                        drops["archived"] = archived_hidden
+                    drops["text_only_hits"] = len(text_hits)
+                    drops["edge_hits"] = len(ids_in)
+                    last_data = _listing_data(
+                        G, combined, "⚯where-used",
+                        edge_for_in,  # only edge-discovered rows carry edge tags
+                        total=len(combined),
+                        sort_label=f"{sort_in}, then text-mention",
+                        limit=effective_limit,
+                        drops=drops,
+                        kinds=kinds,
+                        bodies=None,
+                        extracted_only=extracted_only,
+                        collapse_dupes=collapse_dupes,
+                    )
+                    # Annotate text-only rows with the line number(s) of
+                    # the mention(s). Without this the agent doesn't know
+                    # which row is edge vs text or where to look.
+                    edge_id_set = set(ids_in)
+                    for it in last_data["items"]:
+                        nid_it = it["id"]
+                        if nid_it not in edge_id_set:
+                            it["mention_lines"] = text_hit_lines.get(nid_it, [])[:3]
+                    cursor.last_listing = [it["id"] for it in last_data["items"]]
+                    cursor.last_pivot = "where-used"
             elif (pkey := PIVOT_KEYS.get(op_str)) is not None:
                 # pivot
                 if not cursor.current:
@@ -3149,6 +3818,38 @@ def navigate(ops: list[str] | str, *,
                         include_files=include_files,
                         transitive=transitive,
                     )
+                    # Auto-widen empty in/out to inferred edges. When extracted-only
+                    # returns 0 but inferred>0, the agent is staring at a misleading
+                    # "0 callers" that actually has the answer one flag away. Re-run
+                    # with extracted_only=False, mark the result as auto-widened so
+                    # the renderer surfaces "auto-widened" + INFERRED tags per row.
+                    # Scope: only `in`/`out` (where the empty result is actually
+                    # misleading), no `--kind` filter (the user is filtering on
+                    # purpose), no `--depth>1` (transitive inferred walks explode),
+                    # no `--transitive` (already widening structurally).
+                    auto_widened = False
+                    if (pkey in ("in", "out")
+                            and extracted_only
+                            and not ids
+                            and depth == 1
+                            and not transitive
+                            and not kinds
+                            and (drops.get("inferred") or 0) > 0):
+                        wname, wids, wedge_for, wsort_label, wdrops = _pivot_data(
+                            G, communities, cursor, pkey,
+                            extracted_only=False,
+                            min_confidence=min_confidence,
+                            kinds=kinds,
+                            depth=depth,
+                            include_files=include_files,
+                            transitive=transitive,
+                        )
+                        if wids:
+                            pname = f"{wname} (auto-widened)"
+                            ids, edge_for, sort_label = wids, wedge_for, wsort_label
+                            drops = dict(wdrops or {})
+                            drops["auto_widened_from_extracted"] = True
+                            auto_widened = True
                     ids, archived_hidden = _filter_archived_ids(G, ids, archived_mode)
                     if archived_hidden:
                         # Track in drops so the renderer surfaces the count rather
@@ -3270,6 +3971,12 @@ def navigate(ops: list[str] | str, *,
     # used to leave the cursor as write-once garbage swept 30 minutes
     # later. Lap-13 field-report fix: skip the write entirely so
     # `.navigate/` only accumulates resumable sessions.
+    #
+    # Lap-15: the save deferred until AFTER render so renderer-side
+    # cursor mutations (hints_emitted bookkeeping, future bits) get
+    # persisted with the rest of the cursor state. Previously save ran
+    # before render and the per-session hint dedup never carried across
+    # calls because the appended hint keys never reached disk.
     can_resume = (
         session_id is not None
         and (
@@ -3278,8 +3985,6 @@ def navigate(ops: list[str] | str, *,
             or len(cursor.history) >= 1                   # walked > 1 step
         )
     )
-    if persist and can_resume:
-        cursor.save(_cursor_path(gpath, session_id))
 
     # Log surfaced source paths so the PreToolUse hook can suppress its
     # "scout cheaper" nudge on files this session just navigated to.
@@ -3313,7 +4018,9 @@ def navigate(ops: list[str] | str, *,
     if last_data is None:
         parts.append("(no output)")
     elif last_data.get("type") == "frontier":
-        parts.append(_render_frontier_text(last_data, cursor, show_ops=show_ops_hint, md=md))
+        parts.append(_render_frontier_text(last_data, cursor,
+                                           show_ops=show_ops_hint, md=md,
+                                           quiet_hints=quiet_hints))
     elif last_data.get("type") == "listing":
         parts.append(_render_listing_text(last_data, show_ops=show_ops_hint, md=md))
     elif last_data.get("type") == "body":
@@ -3335,5 +4042,11 @@ def navigate(ops: list[str] | str, *,
     # persisted cursor and vice versa).
     if can_resume:
         parts.append(f"  session: {session_id}  (resume with --session {session_id})")
+
+    # Persist cursor AFTER render so renderer-side mutations (hints_emitted)
+    # land on disk. This must run after the body of work that might mutate
+    # cursor state but before returning the result.
+    if persist and can_resume:
+        cursor.save(_cursor_path(gpath, session_id))
 
     return "\n".join(parts)

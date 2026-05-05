@@ -63,6 +63,26 @@ _HELP_BLOCKS: dict[str, list[str]] = {
         "    --md                    render the focus label as a clickable `[label](file:line)` link",
         "    --graph <path>          path to graph.json (default graphify-out/graph.json)",
         "    Pairs with `navigate ... read` — use peek when you don't want to commit to a session.",
+        "    Accepts `Class.method` and `dir/file/Symbol` qualifiers, same as navigate.",
+    ],
+    "shape": [
+        "  shape <file>            file structure summary: N classes / M fns / K consts / X imports / longest fn — orientation without committing to a `contains` pivot",
+        "    --json                  structured JSON output",
+        "    --graph <path>          path to graph.json (default graphify-out/graph.json)",
+        "    Resolves the same as `peek` (path-qualified, fuzzy fallback). Errors if target isn't a file.",
+    ],
+    "search": [
+        "  search <pattern>        body-text grep across nodes — return hits with symbol context (label, file:line, container, community, degree)",
+        "    --kind code|rationale|all   restrict by node file_type (default code: skips doc-comment fragments)",
+        "    --no-archived           skip archived paths (default)",
+        "    --archived-only         show only matches in archived/legacy code",
+        "    --all-archived          include both active and archived",
+        "    --limit N               max hits (default 50)",
+        "    --context N             N lines of pre/post context around each match (default 0)",
+        "    --md                    label rendered as `[label](file:line)` markdown link",
+        "    --json                  structured JSON output",
+        "    --graph <path>          path to graph.json (default graphify-out/graph.json)",
+        "    Pattern is a case-insensitive regex; falls back to literal substring on `re.error`. The mode is surfaced in the header so unintended substring fallbacks are visible.",
     ],
     "navigate": [
         "  navigate [ops...]       cursor-based graph navigation (LLM-friendly)",
@@ -82,6 +102,8 @@ _HELP_BLOCKS: dict[str, list[str]] = {
         "    back | reset            pop history / clear cursor",
         "    --session <id>          resume a prior session (id printed when chaining is in flight: --session was passed, a chain paused at disambig, or the cursor walked >1 step)",
         "    --no-session            disable session entirely (no disk, no id printed)",
+        "    --show-session <id>     render the saved cursor's frontier without mutating it (peek where you left off; no ops processed)",
+        "    --quiet-hints           suppress all `hint:` lines (also: per-session dedup means each hint kind shows once when --session <id> is passed)",
         "    --json                  structured JSON output",
         "    --include-inferred      include LLM-inferred edges (default: AST-extracted only)",
         "    --min-confidence X      drop edges below score X (only meaningful with --include-inferred)",
@@ -1126,6 +1148,10 @@ def main() -> None:
             print(line)
         for line in _HELP_BLOCKS["peek"]:
             print(line)
+        for line in _HELP_BLOCKS["shape"]:
+            print(line)
+        for line in _HELP_BLOCKS["search"]:
+            print(line)
         print("  add <url>               fetch a URL and save it to ./raw, then update the graph")
         print("    --author \"Name\"         tag the author of the content")
         print("    --contributor \"Name\"    tag who added it to the corpus")
@@ -2096,6 +2122,157 @@ def main() -> None:
         }
         print(_render_body_text(data, md=md))
 
+    elif cmd == "shape":
+        # File-shape summary: "N classes, M fns, K consts, X imports,
+        # longest fn=foo() (200 ln)". Equivalent of `wc -l + ctags --list`
+        # for orientation. Read-only one-shot — no cursor, no session.
+        if any(a in ("-h", "--help") for a in sys.argv[2:]):
+            _print_subcmd_help("shape")
+            return
+        from graphify.navigate import (
+            DEFAULT_GRAPH_PATH, load_graph, label_index, resolve_focus,
+            shape_file, _render_shape_text,
+        )
+        from graphify.analyze import _is_file_node
+        args = sys.argv[2:]
+        graph_path = DEFAULT_GRAPH_PATH
+        target: str | None = None
+        fmt = "text"
+        i = 0
+        while i < len(args):
+            a = args[i]
+            if a == "--graph" and i + 1 < len(args):
+                graph_path = args[i + 1]; i += 2
+            elif a.startswith("--graph="):
+                graph_path = a.split("=", 1)[1]; i += 1
+            elif a == "--json":
+                fmt = "json"; i += 1
+            elif target is None:
+                target = a; i += 1
+            else:
+                print(f"warning: ignoring extra arg `{a}`. shape takes a single target.",
+                      file=sys.stderr)
+                i += 1
+        if not target:
+            print("Usage: graphify shape <file> [--json] [--graph PATH]",
+                  file=sys.stderr)
+            sys.exit(1)
+        gp = Path(graph_path)
+        if not gp.exists():
+            print(f"error: graph not found at {gp}. run `graphify update <path>` first.",
+                  file=sys.stderr)
+            sys.exit(1)
+        G, _comm = load_graph(gp)
+        idx = label_index(G)
+        chosen, candidates, match_type, _alts = resolve_focus(G, idx, target)
+        if not chosen:
+            if candidates:
+                print(f"ambiguous `{target}` ({len(candidates)} matches). "
+                      f"qualify with @<dir>/<file>:", file=sys.stderr)
+                for nid in candidates[:8]:
+                    a = G.nodes[nid]
+                    sf = a.get("source_file", "?")
+                    print(f"  {a.get('label', nid)}  {sf}", file=sys.stderr)
+                sys.exit(1)
+            print(f"no node matches `{target}`.", file=sys.stderr)
+            sys.exit(1)
+        if not _is_file_node(G, chosen):
+            # `shape` only makes sense on a file. If the agent landed on
+            # a class/fn, redirect to the file containing it.
+            sf = G.nodes[chosen].get("source_file")
+            print(f"error: `{target}` resolved to {G.nodes[chosen].get('label', chosen)} "
+                  f"(not a file). try `graphify shape \"@{sf}\"` if you meant the file.",
+                  file=sys.stderr)
+            sys.exit(1)
+        data = shape_file(G, chosen)
+        if fmt == "json":
+            print(json.dumps(data))
+        else:
+            print(_render_shape_text(data))
+
+    elif cmd == "search":
+        # Body-text search across nodes. Walks each non-archived code-file,
+        # greps for the pattern, attributes each match line to the deepest
+        # enclosing node so the agent gets back symbol context (label,
+        # community, degree) instead of naked file:line tuples. Eliminates
+        # the grep fallback for "where does this string appear in code".
+        if any(a in ("-h", "--help") for a in sys.argv[2:]):
+            _print_subcmd_help("search")
+            return
+        from graphify.navigate import (
+            DEFAULT_GRAPH_PATH, load_graph, search_bodies, _render_search_text,
+        )
+        args = sys.argv[2:]
+        graph_path = DEFAULT_GRAPH_PATH
+        pattern: str | None = None
+        kind = "code"
+        archived_mode = "no"
+        limit = 50
+        context = 0
+        md = False
+        fmt = "text"
+        i = 0
+        while i < len(args):
+            a = args[i]
+            if a == "--graph" and i + 1 < len(args):
+                graph_path = args[i + 1]; i += 2
+            elif a.startswith("--graph="):
+                graph_path = a.split("=", 1)[1]; i += 1
+            elif a == "--kind" and i + 1 < len(args):
+                kind = args[i + 1]; i += 2
+            elif a.startswith("--kind="):
+                kind = a.split("=", 1)[1]; i += 1
+            elif a == "--no-archived":
+                archived_mode = "no"; i += 1
+            elif a == "--archived-only":
+                archived_mode = "only"; i += 1
+            elif a == "--all-archived":
+                archived_mode = "all"; i += 1
+            elif a == "--limit" and i + 1 < len(args):
+                limit = max(1, int(args[i + 1])); i += 2
+            elif a.startswith("--limit="):
+                limit = max(1, int(a.split("=", 1)[1])); i += 1
+            elif a == "--context" and i + 1 < len(args):
+                context = max(0, int(args[i + 1])); i += 2
+            elif a.startswith("--context="):
+                context = max(0, int(a.split("=", 1)[1])); i += 1
+            elif a == "--md":
+                md = True; i += 1
+            elif a == "--json":
+                fmt = "json"; i += 1
+            elif pattern is None:
+                pattern = a; i += 1
+            else:
+                # `graphify search foo bar` — concatenate as alternation? No,
+                # safer to error out. The user can quote the regex if they
+                # need spaces.
+                print(f"warning: ignoring extra arg `{a}`. search takes a single pattern.",
+                      file=sys.stderr)
+                i += 1
+        if not pattern:
+            print("Usage: graphify search <pattern> [--kind code|rationale|all] "
+                  "[--limit N] [--context N] [--md] [--json] [--no-archived|"
+                  "--archived-only|--all-archived] [--graph PATH]",
+                  file=sys.stderr)
+            sys.exit(1)
+        if kind not in ("code", "rationale", "all"):
+            print(f"error: --kind must be one of code|rationale|all (got `{kind}`)",
+                  file=sys.stderr)
+            sys.exit(1)
+        gp = Path(graph_path)
+        if not gp.exists():
+            print(f"error: graph not found at {gp}. run `graphify update <path>` first.",
+                  file=sys.stderr)
+            sys.exit(1)
+        G, _comm = load_graph(gp)
+        data = search_bodies(G, pattern, kind=kind,
+                              archived_mode=archived_mode,
+                              limit=limit, context=context)
+        if fmt == "json":
+            print(json.dumps(data))
+        else:
+            print(_render_search_text(data, md=md))
+
     elif cmd == "add":
         if len(sys.argv) < 3:
             print("Usage: graphify add <url> [--author Name] [--contributor Name] [--dir ./raw]", file=sys.stderr)
@@ -2210,6 +2387,8 @@ def main() -> None:
         explain_cost: bool = False    # --explain-cost short-circuits pivots to size preview
         md: bool = False              # --md wraps labels and src:line in markdown links
         transitive: bool = False      # --transitive routes script-leaf out through contains
+        show_session: str | None = None  # --show-session <id> renders saved cursor without mutating it
+        quiet_hints: bool = False  # --quiet-hints suppresses all hint lines
         i = 0
         ops: list[str] = []
         # `--help` / `-h` mid-args takes precedence over op parsing — without
@@ -2283,6 +2462,12 @@ def main() -> None:
                 md = True; i += 1
             elif a == "--transitive":
                 transitive = True; i += 1
+            elif a == "--show-session" and i + 1 < len(args):
+                show_session = args[i + 1]; i += 2
+            elif a.startswith("--show-session="):
+                show_session = a.split("=", 1)[1]; i += 1
+            elif a == "--quiet-hints":
+                quiet_hints = True; i += 1
             else:
                 ops.append(a); i += 1
         out = navigate(
@@ -2304,6 +2489,8 @@ def main() -> None:
             explain_cost=explain_cost,
             md=md,
             transitive=transitive,
+            show_session=show_session,
+            quiet_hints=quiet_hints,
         )
         print(out)
 

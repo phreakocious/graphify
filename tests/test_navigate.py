@@ -1977,3 +1977,662 @@ def test_chained_walk_does_persist_cursor(tmp_path, monkeypatch):
     assert files, (
         f"multi-step walk should persist cursor, got nothing in {nav_dir}"
     )
+
+
+def test_auto_widen_in_when_extracted_zero_inferred_present(tmp_path, monkeypatch):
+    """When `in` returns 0 EXTRACTED edges but ≥1 INFERRED edge is hidden,
+    auto-widen so the agent sees the data instead of "+N INFERRED hidden"
+    + a forced retry. Header surfaces `(auto-widened)`; a note line below
+    explains the contract; rows render with [inf@<score>] tags."""
+    from graphify.navigate import navigate
+    nodes = [
+        {"id": "tgt", "label": "doStuff()", "file_type": "code",
+         "source_file": "a.ts", "source_location": "L10"},
+        {"id": "caller1", "label": "callerA()", "file_type": "code",
+         "source_file": "b.ts", "source_location": "L5"},
+        {"id": "caller2", "label": "callerB()", "file_type": "code",
+         "source_file": "b.ts", "source_location": "L15"},
+    ]
+    links = [
+        # No EXTRACTED in-edges to tgt; only INFERRED.
+        {"source": "caller1", "target": "tgt", "relation": "calls",
+         "confidence": "INFERRED", "confidence_score": 0.8},
+        {"source": "caller2", "target": "tgt", "relation": "calls",
+         "confidence": "INFERRED", "confidence_score": 0.8},
+    ]
+    _write_graph(tmp_path / "graphify-out", nodes, links)
+    monkeypatch.chdir(tmp_path)
+    # Default extracted_only=True. Listing should auto-widen.
+    out = navigate(["@doStuff", "in"], session=False, fmt="text")
+    assert "auto-widened" in out, f"expected (auto-widened) tag:\n{out}"
+    # The two inferred callers should show up
+    assert "callerA()" in out and "callerB()" in out, (
+        f"both inferred callers should be in widened listing:\n{out}"
+    )
+    # Per-row inferred tag is the trust signal
+    assert "[calls/inf@" in out, (
+        f"rows should be tagged [calls/inf@<score>]:\n{out}"
+    )
+    # The auto-widen note should explain what happened
+    assert "0 extracted; auto-widened" in out, (
+        f"explanatory note missing:\n{out}"
+    )
+
+
+def test_auto_widen_does_not_fire_when_extracted_present(tmp_path, monkeypatch):
+    """When at least one EXTRACTED in-edge exists, return only those —
+    don't widen, even though INFERRED edges exist too. Auto-widen is for
+    the empty-extracted case only."""
+    from graphify.navigate import navigate
+    nodes = [
+        {"id": "tgt", "label": "doStuff()", "file_type": "code",
+         "source_file": "a.ts", "source_location": "L10"},
+        {"id": "real", "label": "realCaller()", "file_type": "code",
+         "source_file": "b.ts", "source_location": "L5"},
+        {"id": "guess", "label": "guessedCaller()", "file_type": "code",
+         "source_file": "c.ts", "source_location": "L1"},
+    ]
+    links = [
+        {"source": "real", "target": "tgt", "relation": "calls",
+         "confidence": "EXTRACTED"},
+        {"source": "guess", "target": "tgt", "relation": "calls",
+         "confidence": "INFERRED", "confidence_score": 0.8},
+    ]
+    _write_graph(tmp_path / "graphify-out", nodes, links)
+    monkeypatch.chdir(tmp_path)
+    out = navigate(["@doStuff", "in"], session=False, fmt="text")
+    assert "auto-widened" not in out, (
+        f"should NOT widen when EXTRACTED edges exist:\n{out}"
+    )
+    assert "realCaller()" in out, f"missing real caller:\n{out}"
+    # The inferred edge should be filtered (not widened in), so the +1 INFERRED
+    # hidden drop count surfaces instead.
+    assert "guessedCaller()" not in out, (
+        f"inferred edge should be hidden, not auto-widened:\n{out}"
+    )
+    assert "1 INFERRED hidden" in out, (
+        f"expected normal +1 INFERRED hidden tag:\n{out}"
+    )
+
+
+def test_quiet_hints_suppresses_all_hint_lines(tmp_path, monkeypatch):
+    """`--quiet-hints` (or `quiet_hints=True`) suppresses every `hint:`
+    line. The user's bro flagged hint repetition as the most common
+    noise — `--quiet-hints` is the full-silence escape hatch."""
+    from graphify.navigate import navigate
+    nodes = [
+        # An empty class triggers the protocol/marker hint.
+        {"id": "p", "label": "Pet", "file_type": "code",
+         "source_file": "p.py", "source_location": "L1",
+         "node_kind": "class"},
+    ]
+    _write_graph(tmp_path / "graphify-out", nodes, [])
+    monkeypatch.chdir(tmp_path)
+    # Default: hint should appear.
+    out_default = navigate(["@Pet"], session=False, fmt="text")
+    assert "hint:" in out_default, (
+        f"baseline: hint should appear by default:\n{out_default}"
+    )
+    # With --quiet-hints: no hint anywhere in output.
+    out_quiet = navigate(["@Pet"], session=False, fmt="text",
+                         quiet_hints=True)
+    assert "hint:" not in out_quiet, (
+        f"--quiet-hints should suppress all hint lines:\n{out_quiet}"
+    )
+
+
+def test_hint_dedup_per_named_session(tmp_path, monkeypatch):
+    """Each hint kind shows once per `--session <id>` session. A second
+    call with the same focus should not re-emit the same hint."""
+    from graphify.navigate import navigate
+    nodes = [
+        {"id": "p", "label": "Pet", "file_type": "code",
+         "source_file": "p.py", "source_location": "L1",
+         "node_kind": "class"},
+    ]
+    _write_graph(tmp_path / "graphify-out", nodes, [])
+    monkeypatch.chdir(tmp_path)
+    out1 = navigate(["@Pet"], session="ded1", fmt="text")
+    assert "hint: class with no methods/contains" in out1, (
+        f"first call should emit the hint:\n{out1}"
+    )
+    # Same session, same focus — hint already shown, should not repeat.
+    out2 = navigate([], session="ded1", fmt="text")
+    assert "hint: class with no methods/contains" not in out2, (
+        f"per-session dedup: same hint should not re-emit:\n{out2}"
+    )
+
+
+def test_hint_dedup_does_not_apply_to_ephemeral(tmp_path, monkeypatch):
+    """Ephemeral (default session=True) calls don't dedup across calls
+    because each is a fresh cursor. The agent gets the hint on every
+    call until they commit to `--session <id>`."""
+    from graphify.navigate import navigate
+    nodes = [
+        {"id": "p", "label": "Pet", "file_type": "code",
+         "source_file": "p.py", "source_location": "L1",
+         "node_kind": "class"},
+    ]
+    _write_graph(tmp_path / "graphify-out", nodes, [])
+    monkeypatch.chdir(tmp_path)
+    # Two ephemeral calls — both should show the hint (no carry-over).
+    out1 = navigate(["@Pet"], session=False, fmt="text")
+    out2 = navigate(["@Pet"], session=False, fmt="text")
+    assert "hint: class with no methods/contains" in out1, out1
+    assert "hint: class with no methods/contains" in out2, (
+        f"ephemeral mode should re-emit hints (no session means no dedup):\n{out2}"
+    )
+
+
+def test_where_used_combines_edges_and_text_mentions(tmp_path, monkeypatch):
+    """`where-used` (alias `wu`) returns: (a) AST-edge callers via `in`,
+    plus (b) text mentions of the symbol's name in code bodies — combined
+    in one listing. Edge-discovered rows are listed first; text-only rows
+    follow with `[mentions L<line>]` tags so the agent sees the discovery
+    source. Solves the dynamic-dispatch / string-keyed-lookup gap where
+    AST callers are 0 but the symbol IS used."""
+    from graphify.navigate import navigate
+    sf_caller = str(tmp_path / "caller.py")
+    sf_target = str(tmp_path / "target.py")
+    sf_mention = str(tmp_path / "registry.py")
+    nodes = [
+        {"id": "tgt", "label": "spectral_coherence", "file_type": "code",
+         "source_file": sf_target, "source_location": "L1"},
+        # Edge-caller: real `calls` edge into tgt.
+        {"id": "ec", "label": "edge_caller()", "file_type": "code",
+         "source_file": sf_caller, "source_location": "L1"},
+        # Text-mention: separate node whose body contains the literal name.
+        {"id": "reg", "label": "build_registry()", "file_type": "code",
+         "source_file": sf_mention, "source_location": "L1"},
+    ]
+    links = [
+        {"source": "ec", "target": "tgt", "relation": "calls",
+         "confidence": "EXTRACTED"},
+    ]
+    _write_graph(tmp_path / "graphify-out", nodes, links)
+    (tmp_path / "caller.py").write_text("def edge_caller():\n    pass\n")
+    (tmp_path / "target.py").write_text("def spectral_coherence():\n    pass\n")
+    (tmp_path / "registry.py").write_text(
+        "def build_registry():\n"
+        "    return {'spectral_coherence': lookup}\n"
+    )
+    monkeypatch.chdir(tmp_path)
+    out = navigate(["@spectral_coherence", "where-used"], session=False, fmt="text")
+    assert "edge_caller()" in out, (
+        f"edge-discovered caller missing:\n{out}"
+    )
+    assert "build_registry()" in out, (
+        f"text-mentioned node missing:\n{out}"
+    )
+    assert "[mentions L" in out, (
+        f"text-only rows should carry [mentions L<n>] tag:\n{out}"
+    )
+    assert "via edges" in out and "text-only" in out, (
+        f"header breakdown should show edge vs text counts:\n{out}"
+    )
+
+
+def test_where_used_alias_wu_works(tmp_path, monkeypatch):
+    """`wu` is the short alias. Both should route to the same dispatch."""
+    from graphify.navigate import navigate
+    nodes = [
+        {"id": "tgt", "label": "X", "file_type": "code",
+         "source_file": str(tmp_path / "t.py"), "source_location": "L1"},
+    ]
+    _write_graph(tmp_path / "graphify-out", nodes, [])
+    (tmp_path / "t.py").write_text("X = 1\n")
+    monkeypatch.chdir(tmp_path)
+    out = navigate(["@X", "wu"], session=False, fmt="text")
+    assert "where-used" in out, (
+        f"`wu` alias should dispatch to where-used:\n{out}"
+    )
+
+
+def test_shape_file_returns_counts_and_longest_fn(tmp_path, monkeypatch):
+    """`shape_file` summarizes a file's structure: N classes / M fns /
+    K consts / X imports / longest fn (line span). Saves a `contains`
+    pivot when the agent just wants orientation."""
+    from graphify.navigate import shape_file, load_graph
+    sf = str(tmp_path / "lib.py")
+    nodes = [
+        {"id": "f", "label": "lib.py", "file_type": "code",
+         "source_file": sf, "source_location": "L1"},
+        # 2 classes
+        {"id": "ca", "label": "Alpha", "file_type": "code",
+         "source_file": sf, "source_location": "L5",
+         "node_kind": "class"},
+        {"id": "cb", "label": "Beta", "file_type": "code",
+         "source_file": sf, "source_location": "L40",
+         "node_kind": "class"},
+        # 3 functions; one big one in the middle
+        {"id": "fn1", "label": "small()", "file_type": "code",
+         "source_file": sf, "source_location": "L70"},
+        {"id": "fn2", "label": "huge()", "file_type": "code",
+         "source_file": sf, "source_location": "L75"},
+        {"id": "fn3", "label": "tiny()", "file_type": "code",
+         "source_file": sf, "source_location": "L155"},
+        # 1 const
+        {"id": "k", "label": "MAX_RETRIES", "file_type": "code",
+         "source_file": sf, "source_location": "L160"},
+        # 1 imported module
+        {"id": "ext", "label": "math", "file_type": "code",
+         "source_file": "math.py", "source_location": "L1"},
+    ]
+    links = [
+        {"source": "f", "target": "ca", "relation": "contains",
+         "confidence": "EXTRACTED"},
+        {"source": "f", "target": "cb", "relation": "contains",
+         "confidence": "EXTRACTED"},
+        {"source": "f", "target": "fn1", "relation": "contains",
+         "confidence": "EXTRACTED"},
+        {"source": "f", "target": "fn2", "relation": "contains",
+         "confidence": "EXTRACTED"},
+        {"source": "f", "target": "fn3", "relation": "contains",
+         "confidence": "EXTRACTED"},
+        {"source": "f", "target": "k", "relation": "contains",
+         "confidence": "EXTRACTED"},
+        # 1 import
+        {"source": "f", "target": "ext", "relation": "imports",
+         "confidence": "EXTRACTED"},
+    ]
+    _write_graph(tmp_path / "graphify-out", nodes, links)
+    # File needs to be N lines so total_lines is real
+    (tmp_path / "lib.py").write_text("# line\n" * 200)
+    monkeypatch.chdir(tmp_path)
+    G, _comm = load_graph(tmp_path / "graphify-out" / "graph.json")
+    data = shape_file(G, "f")
+    assert data["classes"] == 2, data
+    assert data["fns"] == 3, data
+    assert data["consts"] == 1, data
+    # The longest fn is `huge()` spanning L75..L154 = 80 lines.
+    assert data["longest_fn"] is not None
+    assert data["longest_fn"]["label"] == "huge()", data["longest_fn"]
+    assert data["longest_fn"]["lines"] == 80, data["longest_fn"]
+    assert data["total_lines"] == 200
+
+
+def test_search_bodies_returns_hits_with_symbol_context(tmp_path, monkeypatch):
+    """`search_bodies` greps each node's source file and attaches symbol
+    context (label, file:line, community, degree) to each match. The
+    contract: an agent searching for `spectral_coherence` should never
+    have to drop to bare grep."""
+    from graphify.navigate import search_bodies, load_graph
+    nodes = [
+        {"id": "f1", "label": "metrics.py", "file_type": "code",
+         "source_file": str(tmp_path / "metrics.py"), "source_location": "L1",
+         "community": 0},
+        {"id": "fn", "label": "compute_metrics()", "file_type": "code",
+         "source_file": str(tmp_path / "metrics.py"), "source_location": "L5",
+         "community": 0},
+    ]
+    links = [{"source": "f1", "target": "fn", "relation": "contains",
+              "confidence": "EXTRACTED"}]
+    _write_graph(tmp_path / "graphify-out", nodes, links)
+    (tmp_path / "metrics.py").write_text(
+        "import math\n"
+        "import statistics\n"
+        "\n"
+        "\n"
+        "def compute_metrics(data):\n"
+        "    spectral_coherence = compute_spectral(data)\n"
+        "    peakedness = compute_peak(data)\n"
+        "    return {'spectral_coherence': spectral_coherence}\n"
+    )
+    monkeypatch.chdir(tmp_path)
+    G, _comm = load_graph(tmp_path / "graphify-out" / "graph.json")
+    res = search_bodies(G, "spectral_coherence")
+    assert res["total"] >= 2, f"expected ≥2 hits, got {res['total']}: {res}"
+    labels = {h["label"] for h in res["hits"]}
+    # All hits should attribute to the function (deepest enclosing decl).
+    assert "compute_metrics()" in labels, (
+        f"deepest-enclosing-decl attribution failed: {res['hits']}"
+    )
+    # Match line numbers should land on actual hit lines.
+    match_lines = sorted(h["match_line"] for h in res["hits"])
+    assert match_lines == [6, 8], (
+        f"expected match lines [6, 8], got {match_lines}"
+    )
+
+
+def test_search_bodies_substring_fallback_on_bad_regex(tmp_path, monkeypatch):
+    """A pattern that fails `re.compile` (unbalanced paren etc.) should
+    fall back to literal substring search and surface mode='substring'
+    so the agent knows their `(` wasn't read as regex."""
+    from graphify.navigate import search_bodies, load_graph
+    nodes = [
+        {"id": "fn", "label": "f()", "file_type": "code",
+         "source_file": str(tmp_path / "f.py"), "source_location": "L1"},
+    ]
+    _write_graph(tmp_path / "graphify-out", nodes, [])
+    (tmp_path / "f.py").write_text("def f(x):\n    return foo(x)\n")
+    monkeypatch.chdir(tmp_path)
+    G, _comm = load_graph(tmp_path / "graphify-out" / "graph.json")
+    res = search_bodies(G, "foo(")  # unclosed group → re.error
+    assert res["mode"] == "substring", f"expected substring fallback: {res}"
+    assert res["total"] >= 1
+
+
+def test_search_bodies_skips_archived_by_default(tmp_path, monkeypatch):
+    """Archive heuristic (`frozen|legacy|deprecated|archive(d)/...`)
+    should drop archived hits unless --archived-only / --all-archived
+    is set. Default: active code only."""
+    from graphify.navigate import search_bodies, load_graph
+    legacy_dir = tmp_path / "legacy"
+    active_dir = tmp_path / "src"
+    legacy_dir.mkdir()
+    active_dir.mkdir()
+    (legacy_dir / "old.py").write_text("# uses NEEDLE in legacy\n")
+    (active_dir / "new.py").write_text("# uses NEEDLE in active\n")
+    nodes = [
+        {"id": "old", "label": "old.py", "file_type": "code",
+         "source_file": "legacy/old.py", "source_location": "L1"},
+        {"id": "new", "label": "new.py", "file_type": "code",
+         "source_file": "src/new.py", "source_location": "L1"},
+    ]
+    _write_graph(tmp_path / "graphify-out", nodes, [])
+    monkeypatch.chdir(tmp_path)
+    G, _comm = load_graph(tmp_path / "graphify-out" / "graph.json")
+    res = search_bodies(G, "NEEDLE", archived_mode="no")
+    files = {h["source_file"] for h in res["hits"]}
+    assert "src/new.py" in files
+    assert "legacy/old.py" not in files, (
+        f"archived path should be excluded by default: {res['hits']}"
+    )
+
+
+def test_class_dot_method_resolves_to_method_node(tmp_path, monkeypatch):
+    """Dotted Class.method form should resolve directly to the method node.
+    Lap-15 (consumer-Claude friction): `peek "Runner.__init__"` returned
+    "no node matches" — natural Python/JS/TS dotted form should just work."""
+    from graphify.navigate import navigate
+    nodes = [
+        {"id": "cls", "label": "Runner", "file_type": "code",
+         "source_file": "r.py", "source_location": "L1",
+         "node_kind": "class"},
+        {"id": "init", "label": ".__init__()", "file_type": "code",
+         "source_file": "r.py", "source_location": "L5",
+         "node_kind": "impl_method"},
+        {"id": "run", "label": ".run()", "file_type": "code",
+         "source_file": "r.py", "source_location": "L20",
+         "node_kind": "impl_method"},
+    ]
+    links = [
+        {"source": "cls", "target": "init", "relation": "method",
+         "confidence": "EXTRACTED"},
+        {"source": "cls", "target": "run", "relation": "method",
+         "confidence": "EXTRACTED"},
+    ]
+    _write_graph(tmp_path / "graphify-out", nodes, links)
+    monkeypatch.chdir(tmp_path)
+    out = navigate(["@Runner.__init__"], session=False, fmt="text")
+    assert ".__init__()" in out, (
+        f"Class.method should resolve to method node:\n{out}"
+    )
+    # Also test bare `name.method` (no underscore prefix on method).
+    out2 = navigate(["@Runner.run"], session=False, fmt="text")
+    assert ".run()" in out2, f"Class.method (no underscore):\n{out2}"
+    # And the parenthesised form should work too.
+    out3 = navigate(["@Runner.run()"], session=False, fmt="text")
+    assert ".run()" in out3, f"Class.method() with parens:\n{out3}"
+
+
+def test_class_dot_method_via_peek_subcommand(tmp_path, monkeypatch):
+    """peek `<Class>.<method>` should resolve via the same shared resolver,
+    so the natural dotted form works for one-shot body reads too."""
+    import subprocess, sys
+    nodes = [
+        {"id": "cls", "label": "Runner", "file_type": "code",
+         "source_file": "r.py", "source_location": "L1",
+         "node_kind": "class"},
+        {"id": "init", "label": ".__init__()", "file_type": "code",
+         "source_file": "r.py", "source_location": "L5",
+         "node_kind": "impl_method"},
+    ]
+    links = [{"source": "cls", "target": "init", "relation": "method",
+              "confidence": "EXTRACTED"}]
+    _write_graph(tmp_path / "graphify-out", nodes, links)
+    # Have to write a stub source file for the body-read to land somewhere.
+    (tmp_path / "r.py").write_text("class Runner:\n    def __init__(self):\n        pass\n")
+    monkeypatch.chdir(tmp_path)
+    res = subprocess.run(
+        [sys.executable, "-m", "graphify", "peek", "Runner.__init__"],
+        capture_output=True, text=True, cwd=str(tmp_path),
+    )
+    assert res.returncode == 0, (
+        f"peek Runner.__init__ should resolve, got rc={res.returncode}; "
+        f"stderr={res.stderr!r}; stdout={res.stdout!r}"
+    )
+    assert ".__init__()" in res.stdout, (
+        f"peek output should include resolved label:\n{res.stdout}"
+    )
+
+
+def test_hint_empty_class_points_at_inheritance_and_read(tmp_path, monkeypatch):
+    """A class node with 0 methods + 0 contains is likely a Protocol/ABC
+    or marker. The hint should name the shape and point at `inh` /
+    `in --kind=inherits` / `read` instead of leaving the agent staring
+    at empty pivots."""
+    from graphify.navigate import navigate
+    nodes = [
+        {"id": "p", "label": "Pet", "file_type": "code",
+         "source_file": "p.py", "source_location": "L1",
+         "node_kind": "class"},
+        {"id": "anim", "label": "Animal", "file_type": "code",
+         "source_file": "anim.py", "source_location": "L1",
+         "node_kind": "class"},
+    ]
+    links = [
+        # Pet inherits from Animal; Pet has no methods or contains.
+        {"source": "p", "target": "anim", "relation": "inherits",
+         "confidence": "EXTRACTED"},
+    ]
+    _write_graph(tmp_path / "graphify-out", nodes, links)
+    monkeypatch.chdir(tmp_path)
+    out = navigate(["@Pet"], session=False, fmt="text")
+    assert "protocol/abstract/marker class" in out, (
+        f"empty-class hint missing:\n{out}"
+    )
+    assert "inh" in out and "read" in out, (
+        f"hint should name `inh` and `read`:\n{out}"
+    )
+
+
+def test_hint_file_with_only_rationale_points_at_read(tmp_path, monkeypatch):
+    """When a code-file hub's only contains-children are rationale
+    fragments (docs/comments), surface that so the agent doesn't waste
+    a `contains` pivot reading doc rows masquerading as decls."""
+    from graphify.navigate import navigate
+    nodes = [
+        {"id": "f", "label": "doc.py", "file_type": "code",
+         "source_file": "doc.py", "source_location": "L1"},
+        {"id": "r1", "label": "module-doc", "file_type": "rationale",
+         "source_file": "doc.py", "source_location": "L1"},
+        {"id": "r2", "label": "fn-doc", "file_type": "rationale",
+         "source_file": "doc.py", "source_location": "L20"},
+        {"id": "r3", "label": "class-doc", "file_type": "rationale",
+         "source_file": "doc.py", "source_location": "L40"},
+    ]
+    links = [
+        {"source": "f", "target": "r1", "relation": "contains",
+         "confidence": "EXTRACTED"},
+        {"source": "f", "target": "r2", "relation": "contains",
+         "confidence": "EXTRACTED"},
+        {"source": "f", "target": "r3", "relation": "contains",
+         "confidence": "EXTRACTED"},
+    ]
+    _write_graph(tmp_path / "graphify-out", nodes, links)
+    monkeypatch.chdir(tmp_path)
+    out = navigate(["@doc.py"], session=False, fmt="text")
+    assert "rationale fragments" in out, (
+        f"docs-mostly file hint missing:\n{out}"
+    )
+    assert "read" in out, f"hint should point at `read`:\n{out}"
+
+
+def test_hint_loose_orphan_with_parent_points_at_coc_and_parent(tmp_path, monkeypatch):
+    """A function with no in/out/contains/methods but a parent and
+    community membership should suggest `parent` (climb up) and `coc`
+    (cluster context). Hard-orphan hint requires literal emptiness; this
+    looser case is more common (uncalled helpers under a parent class)."""
+    from graphify.navigate import navigate
+    nodes = [
+        # Parent file containing helper, plus 2 community siblings (so coc>0).
+        {"id": "f", "label": "tools.py", "file_type": "code",
+         "source_file": "tools.py", "source_location": "L1",
+         "community": 0},
+        {"id": "h", "label": "helper()", "file_type": "code",
+         "source_file": "tools.py", "source_location": "L10",
+         "community": 0},
+        {"id": "s1", "label": "sib1()", "file_type": "code",
+         "source_file": "tools.py", "source_location": "L20",
+         "community": 0},
+        {"id": "s2", "label": "sib2()", "file_type": "code",
+         "source_file": "tools.py", "source_location": "L30",
+         "community": 0},
+    ]
+    links = [
+        # f contains h (parent>0 for h), and contains the siblings (so
+        # coc community has members).
+        {"source": "f", "target": "h", "relation": "contains",
+         "confidence": "EXTRACTED"},
+        {"source": "f", "target": "s1", "relation": "contains",
+         "confidence": "EXTRACTED"},
+        {"source": "f", "target": "s2", "relation": "contains",
+         "confidence": "EXTRACTED"},
+    ]
+    _write_graph(tmp_path / "graphify-out", nodes, links)
+    monkeypatch.chdir(tmp_path)
+    out = navigate(["@helper"], session=False, fmt="text")
+    assert "lives in a community" in out, (
+        f"loose-orphan-in-cluster hint missing:\n{out}"
+    )
+    assert "`parent`" in out and "`coc`" in out, (
+        f"hint should point at parent and coc:\n{out}"
+    )
+
+
+def test_back_reset_widgets_hidden_on_ephemeral_session(tmp_path, monkeypatch):
+    """Backlog #9: with default ephemeral session (session=True), the cursor
+    can be persisted (when chained ≥1 step) and the id is printed, but
+    `back`/`reset`/`↺(N)` UI should not appear because the agent has no
+    way to act on history without --session <id> first. Show those
+    widgets only on resumed sessions."""
+    from graphify.navigate import navigate
+    nodes = [
+        {"id": "f", "label": "Foo", "file_type": "code",
+         "source_file": "a.py", "source_location": "L1",
+         "node_kind": "class"},
+        {"id": "m", "label": ".bar()", "file_type": "code",
+         "source_file": "a.py", "source_location": "L5",
+         "node_kind": "impl_method"},
+    ]
+    links = [{"source": "f", "target": "m", "relation": "method",
+              "confidence": "EXTRACTED"}]
+    _write_graph(tmp_path / "graphify-out", nodes, links)
+    monkeypatch.chdir(tmp_path)
+    # Walk 2 steps so cursor.history is non-empty under default ephemeral session.
+    out = navigate(["@Foo", "methods", "[1]"], session=True, fmt="text",
+                   show_ops_hint=True)
+    assert "↺(" not in out, (
+        f"history-depth widget should hide on ephemeral sessions:\n{out}"
+    )
+    assert "back | reset" not in out, (
+        f"back/reset ops should hide on ephemeral sessions:\n{out}"
+    )
+
+
+def test_back_reset_widgets_visible_on_named_session(tmp_path, monkeypatch):
+    """Counterpart: when --session <id> is explicitly passed, the agent
+    has committed to a resumable session and back/reset are meaningful.
+    The widgets should appear."""
+    from graphify.navigate import navigate
+    nodes = [
+        {"id": "f", "label": "Foo", "file_type": "code",
+         "source_file": "a.py", "source_location": "L1",
+         "node_kind": "class"},
+        {"id": "m", "label": ".bar()", "file_type": "code",
+         "source_file": "a.py", "source_location": "L5",
+         "node_kind": "impl_method"},
+    ]
+    links = [{"source": "f", "target": "m", "relation": "method",
+              "confidence": "EXTRACTED"}]
+    _write_graph(tmp_path / "graphify-out", nodes, links)
+    monkeypatch.chdir(tmp_path)
+    out = navigate(["@Foo", "methods", "[1]"], session="explicit_id",
+                   fmt="text", show_ops_hint=True)
+    assert "↺(" in out, (
+        f"history widget should show on named session:\n{out}"
+    )
+    assert "back | reset" in out, (
+        f"back/reset ops should show on named session:\n{out}"
+    )
+
+
+def test_show_session_renders_cursor_without_mutation(tmp_path, monkeypatch):
+    """`--show-session <id>` reads the saved cursor, renders the frontier,
+    and exits without persisting. The session file should be unchanged
+    after the call (modulo nothing — peek is byte-for-byte read-only)."""
+    from graphify.navigate import navigate
+    nodes = [
+        {"id": "f", "label": "Foo", "file_type": "code",
+         "source_file": "a.py", "source_location": "L1",
+         "node_kind": "class"},
+        {"id": "m", "label": ".bar()", "file_type": "code",
+         "source_file": "a.py", "source_location": "L5",
+         "node_kind": "impl_method"},
+    ]
+    links = [{"source": "f", "target": "m", "relation": "method",
+              "confidence": "EXTRACTED"}]
+    _write_graph(tmp_path / "graphify-out", nodes, links)
+    monkeypatch.chdir(tmp_path)
+    # Create a session by walking 2 steps so it persists.
+    navigate(["@Foo", "methods", "[1]"], session="peek1", fmt="text")
+    cpath = tmp_path / "graphify-out" / ".navigate" / "peek1.json"
+    assert cpath.exists(), "precondition: session file should exist"
+    before = cpath.read_bytes()
+    # Peek with --show-session: render cursor (which is on .bar() after the pick).
+    out = navigate([], show_session="peek1", fmt="text")
+    after = cpath.read_bytes()
+    assert before == after, (
+        f"--show-session must not mutate the cursor file"
+    )
+    assert "show-session: peek1" in out, f"missing peek header:\n{out}"
+    assert ".bar()" in out, f"frontier should show current node .bar():\n{out}"
+
+
+def test_show_session_missing_id_returns_error(tmp_path, monkeypatch):
+    """Asking for a session id that doesn't exist returns a clean error,
+    not an empty render."""
+    from graphify.navigate import navigate
+    nodes = [{"id": "n", "label": "x", "file_type": "code",
+              "source_file": "a.py", "source_location": "L1"}]
+    _write_graph(tmp_path / "graphify-out", nodes, [])
+    monkeypatch.chdir(tmp_path)
+    out = navigate([], show_session="does_not_exist", fmt="text")
+    assert "error" in out and "does_not_exist" in out, (
+        f"missing-session should produce an actionable error:\n{out}"
+    )
+
+
+def test_auto_widen_not_triggered_with_kinds_filter(tmp_path, monkeypatch):
+    """When `--kind=...` is passed the user is filtering on purpose. An
+    empty result + inferred-hidden under the kind filter should NOT
+    auto-widen — the user's filter intent wins."""
+    from graphify.navigate import navigate
+    nodes = [
+        {"id": "tgt", "label": "doStuff()", "file_type": "code",
+         "source_file": "a.ts", "source_location": "L10"},
+        {"id": "c1", "label": "caller1()", "file_type": "code",
+         "source_file": "b.ts", "source_location": "L5"},
+    ]
+    links = [
+        {"source": "c1", "target": "tgt", "relation": "calls",
+         "confidence": "INFERRED", "confidence_score": 0.8},
+    ]
+    _write_graph(tmp_path / "graphify-out", nodes, links)
+    monkeypatch.chdir(tmp_path)
+    out = navigate(["@doStuff", "in"], session=False, fmt="text",
+                   kinds={"uses"})
+    assert "auto-widened" not in out, (
+        f"--kind filter should suppress auto-widen:\n{out}"
+    )

@@ -168,3 +168,76 @@ def test_calls_deduplication():
     result = extract_python(FIXTURES / "sample_calls.py")
     call_pairs = [(e["source"], e["target"]) for e in result["edges"] if e["relation"] == "calls"]
     assert len(call_pairs) == len(set(call_pairs)), "Duplicate calls edges found"
+
+
+def test_resolve_phantom_nodes_redirects_to_real_class():
+    """A phantom node (empty source coords) emitted by the inheritance
+    walker for a cross-file base should be replaced by edges pointing
+    at the real class node when there's a unique label match. Lap-15
+    consumer-Claude friction: `?` source_location in disambig listings."""
+    from graphify.extract import _resolve_phantom_nodes
+    nodes = [
+        {"id": "foo_base", "label": "Base", "file_type": "code",
+         "source_file": "foo.py", "source_location": "L1"},
+        # Phantom from bar.py's class Sub(Base): inheritance
+        {"id": "base", "label": "Base", "file_type": "code",
+         "source_file": "", "source_location": ""},
+        {"id": "bar_sub", "label": "Sub", "file_type": "code",
+         "source_file": "bar.py", "source_location": "L1"},
+    ]
+    edges = [
+        {"source": "bar_sub", "target": "base", "relation": "inherits",
+         "confidence": "EXTRACTED"},
+    ]
+    new_nodes, new_edges = _resolve_phantom_nodes(nodes, edges)
+    # Phantom dropped
+    assert "base" not in {n["id"] for n in new_nodes}
+    # Edge rewritten to real class
+    assert any(e["source"] == "bar_sub" and e["target"] == "foo_base"
+               and e["relation"] == "inherits" for e in new_edges), new_edges
+
+
+def test_resolve_phantom_nodes_keeps_ambiguous():
+    """When MULTIPLE real candidates have the same label, leave the
+    phantom alone — silently picking one would propagate a bug into
+    inheritance edges."""
+    from graphify.extract import _resolve_phantom_nodes
+    nodes = [
+        {"id": "a_x", "label": "X", "file_type": "code",
+         "source_file": "a.py", "source_location": "L1"},
+        {"id": "b_x", "label": "X", "file_type": "code",
+         "source_file": "b.py", "source_location": "L1"},
+        {"id": "x", "label": "X", "file_type": "code",
+         "source_file": "", "source_location": ""},
+        {"id": "c_y", "label": "Y", "file_type": "code",
+         "source_file": "c.py", "source_location": "L1"},
+    ]
+    edges = [
+        {"source": "c_y", "target": "x", "relation": "inherits",
+         "confidence": "EXTRACTED"},
+    ]
+    new_nodes, new_edges = _resolve_phantom_nodes(nodes, edges)
+    # Phantom kept (ambiguous)
+    assert "x" in {n["id"] for n in new_nodes}
+    # Edge unchanged
+    assert any(e["source"] == "c_y" and e["target"] == "x"
+               for e in new_edges), new_edges
+
+
+def test_resolve_phantom_nodes_drops_redirected_self_loop():
+    """If redirect collides with the source itself, drop the resulting
+    self-loop edge — never meaningful in inheritance graphs."""
+    from graphify.extract import _resolve_phantom_nodes
+    nodes = [
+        {"id": "real_x", "label": "X", "file_type": "code",
+         "source_file": "x.py", "source_location": "L1"},
+        {"id": "phantom_x", "label": "X", "file_type": "code",
+         "source_file": "", "source_location": ""},
+    ]
+    edges = [
+        {"source": "real_x", "target": "phantom_x", "relation": "inherits",
+         "confidence": "EXTRACTED"},
+    ]
+    new_nodes, new_edges = _resolve_phantom_nodes(nodes, edges)
+    assert "phantom_x" not in {n["id"] for n in new_nodes}
+    assert new_edges == [], f"self-loop should be dropped, got {new_edges}"
