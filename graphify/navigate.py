@@ -227,6 +227,23 @@ def _drop_breakdown(edges: list[dict], extracted_only: bool,
     return {"inferred": inferred_hidden, "low_confidence": low_conf_hidden}
 
 
+def _kind_drops(edges: list[dict], kinds: set[str] | None) -> dict[str, int]:
+    """When --kind is active, count what each *excluded* relation contributed.
+
+    Returned shape: `{"<rel>": count, ...}`. Lets the renderer say
+    `+12 [uses,imports] hidden via --kind` so the agent knows what they
+    asked the filter to drop. Empty when kinds is None (filter inactive).
+    """
+    if not kinds:
+        return {}
+    out: dict[str, int] = defaultdict(int)
+    for e in edges:
+        rel = e.get("relation") or ""
+        if rel and rel not in kinds:
+            out[rel] += 1
+    return dict(out)
+
+
 def _format_hidden(drops: dict[str, int]) -> str:
     """Render a drop breakdown as ' / +Ninf hidden, +Mlc hidden' or '' if none."""
     bits = []
@@ -234,6 +251,11 @@ def _format_hidden(drops: dict[str, int]) -> str:
         bits.append(f"+{drops['inferred']}inf hidden")
     if drops.get("low_confidence"):
         bits.append(f"+{drops['low_confidence']}lc hidden")
+    by_rel = drops.get("by_rel") or {}
+    if by_rel:
+        total = sum(by_rel.values())
+        rels = ",".join(sorted(by_rel.keys()))
+        bits.append(f"+{total} [{rels}] kind-hidden")
     return f" / {', '.join(bits)}" if bits else ""
 
 
@@ -343,7 +365,9 @@ def _frontier_data(G: nx.DiGraph, communities: dict[int, list[str]],
 def _listing_data(G: nx.DiGraph, ids: list[str], pivot_name: str,
                   edge_for: dict[str, dict] | None, total: int,
                   sort_label: str, limit: int,
-                  drops: dict[str, int] | None = None) -> dict:
+                  drops: dict[str, int] | None = None,
+                  kinds: set[str] | None = None,
+                  bodies: int | None = None) -> dict:
     items = []
     for nid in ids[:limit]:
         item = _node_summary(G, nid)
@@ -354,6 +378,12 @@ def _listing_data(G: nx.DiGraph, ids: list[str], pivot_name: str,
                 "confidence": e.get("confidence"),
                 "confidence_score": e.get("confidence_score"),
             }
+        if bodies and bodies > 0:
+            preview = _read_body_preview(item.get("source_file"),
+                                         item.get("source_location"),
+                                         bodies)
+            if preview:
+                item["body_preview"] = preview
         items.append(item)
     return {
         "type": "listing",
@@ -363,7 +393,74 @@ def _listing_data(G: nx.DiGraph, ids: list[str], pivot_name: str,
         "sort": sort_label,
         "items": items,
         "drops": drops or {},
+        "kinds": sorted(kinds) if kinds else None,
+        "bodies": bodies,
     }
+
+
+def _read_body_preview(source_file: str | None, source_location: str | None,
+                       n: int) -> list[str]:
+    """Read the first `n` non-blank source lines starting at source_location.
+
+    Best-effort: returns [] on missing file / unreadable / no usable location.
+    Stops at the next dedent past the first body line so the preview doesn't
+    bleed into the next sibling. The preview is meant to surface stubs and
+    one-line redirects, not full bodies.
+    """
+    if not source_file or not source_location or n <= 0:
+        return []
+    loc = source_location
+    line_no: int | None = None
+    if loc.startswith("L"):
+        try:
+            line_no = int(loc[1:].split("-", 1)[0].split(":", 1)[0])
+        except ValueError:
+            return []
+    if line_no is None:
+        return []
+    try:
+        # Limit read window — function bodies past 200 lines aren't preview material
+        with open(source_file, "r", encoding="utf-8", errors="replace") as f:
+            lines = f.readlines()
+    except OSError:
+        return []
+    start = max(0, line_no - 1)
+    if start >= len(lines):
+        return []
+    # First, find the def/class line indent so we know where the body starts.
+    header = lines[start]
+    header_indent = len(header) - len(header.lstrip(" \t"))
+    body_indent: int | None = None
+    out: list[str] = []
+    for raw in lines[start:start + 200]:
+        stripped = raw.rstrip()
+        if not stripped.strip():
+            continue
+        cur_indent = len(stripped) - len(stripped.lstrip(" \t"))
+        # First non-blank past the header sets the body's indent baseline.
+        if body_indent is None:
+            if raw is header or len(out) == 0:
+                # Always include the header itself as the first preview line —
+                # signature is part of the orientation (decorator-only,
+                # multi-line def, etc).
+                out.append(stripped)
+                continue
+            if cur_indent > header_indent:
+                body_indent = cur_indent
+                out.append(stripped)
+                if len(out) >= n:
+                    break
+                continue
+            # If the next non-blank is at or below the header's indent, the
+            # function body is empty (or the header was multi-line) — bail.
+            break
+        # Subsequent body lines: stop if we've dedented past the body baseline.
+        if cur_indent < body_indent:
+            break
+        out.append(stripped)
+        if len(out) >= n:
+            break
+    return out
 
 
 # --- text renderers --------------------------------------------------------
@@ -467,8 +564,16 @@ def _render_listing_text(data: dict, *, show_ops: bool) -> str:
             bits.append(f"+{drops['inferred']} INFERRED hidden")
         if drops.get("low_confidence"):
             bits.append(f"+{drops['low_confidence']} below --min-confidence")
-        suffix = f"  ({', '.join(bits)}, --include-inferred to show)" if bits else ""
-        return f"  {data['pivot']}: empty{suffix}"
+        by_rel = drops.get("by_rel") or {}
+        if by_rel:
+            total = sum(by_rel.values())
+            rels = ",".join(f"{r}:{c}" for r, c in sorted(by_rel.items(), key=lambda x: -x[1]))
+            bits.append(f"+{total} hidden via --kind ({rels})")
+        suffix = f"  ({', '.join(bits)}, drop the filter to show)" if bits else ""
+        kinds_tag = ""
+        if data.get("kinds"):
+            kinds_tag = f" [--kind={','.join(data['kinds'])}]"
+        return f"  {data['pivot']}{kinds_tag}: empty{suffix}"
 
     items = data["items"]
 
@@ -486,7 +591,10 @@ def _render_listing_text(data: dict, *, show_ops: bool) -> str:
     use_table = has_repeat and len(items) >= 3
 
     out: list[str] = []
-    header = f"  {data['pivot']} ({data['total']})"
+    kinds_tag = ""
+    if data.get("kinds"):
+        kinds_tag = f" [--kind={','.join(data['kinds'])}]"
+    header = f"  {data['pivot']}{kinds_tag} ({data['total']})"
     if data["total"] > data["showing"]:
         sort = data.get("sort") or ""
         if sort:
@@ -499,8 +607,13 @@ def _render_listing_text(data: dict, *, show_ops: bool) -> str:
         drop_bits.append(f"+{drops['inferred']} INFERRED hidden")
     if drops.get("low_confidence"):
         drop_bits.append(f"+{drops['low_confidence']} below --min-confidence")
+    by_rel = drops.get("by_rel") or {}
+    if by_rel:
+        total = sum(by_rel.values())
+        rels = ",".join(f"{r}:{c}" for r, c in sorted(by_rel.items(), key=lambda x: -x[1]))
+        drop_bits.append(f"+{total} hidden via --kind ({rels})")
     if drop_bits:
-        header += f"  ({', '.join(drop_bits)}, --include-inferred to show)"
+        header += f"  ({', '.join(drop_bits)})"
     out.append(header)
 
     if use_table:
@@ -554,6 +667,12 @@ def _render_listing_text(data: dict, *, show_ops: bool) -> str:
         cid = item.get("community", -1)
         deg = item.get("degree", 0)
         out.append(f"    [{i:>2}] {label:<44} c{cid:<3} d={deg:<4} {src_str}{ft_tag}{edge_tag}")
+        # Optional body preview: surfaces stub/redirect/decorator-only patterns
+        # without an actual Read. Truncate long lines so the preview doesn't
+        # blow out the line budget; one signal per line is enough.
+        for line in (item.get("body_preview") or []):
+            shown = line if len(line) <= 90 else line[:89] + "…"
+            out.append(f"         | {shown}")
 
     if data["total"] > data["showing"]:
         out.append(f"    … +{data['total'] - data['showing']} more  · raise --limit to see more")
@@ -575,10 +694,25 @@ def _rank_key(G: nx.DiGraph, nid: str, edge: dict) -> tuple[int, int, int]:
     return (ext_first, is_rat, -deg)
 
 
+def _semantic_pass(rel: str, kinds: set[str] | None) -> bool:
+    """Predicate for `in`/`out` pivots after pivot-internal structural exclusion.
+
+    Without --kind: drop _STRUCTURAL edges (those have their own pivots).
+    With --kind: ignore _STRUCTURAL list entirely; the user's allowlist is
+    the source of truth, so `out --kind=contains` is honored even though
+    contains is normally surfaced via the dedicated pivot.
+    """
+    if kinds is not None:
+        return rel in kinds
+    return rel not in _STRUCTURAL
+
+
 def _pivot_data(G: nx.DiGraph, communities: dict[int, list[str]],
                 cursor: Cursor, key: str, *,
                 extracted_only: bool,
-                min_confidence: float | None) -> tuple[str, list[str], dict[str, dict], str, dict[str, int]]:
+                min_confidence: float | None,
+                kinds: set[str] | None = None
+                ) -> tuple[str, list[str], dict[str, dict], str, dict[str, int]]:
     """Return (pivot_label, ordered_ids, edge_for_dict, sort_label, drops) for a pivot key.
 
     `drops` records what the current confidence filter excluded (inferred,
@@ -586,32 +720,47 @@ def _pivot_data(G: nx.DiGraph, communities: dict[int, list[str]],
     of the pivot's semantics (e.g. `in` excluding _STRUCTURAL) aren't drops
     — those edges live under their own pivot (methods/contains/parent) and
     are reported there.
+
+    `kinds`: optional allowlist of edge relation names. When set, `in`/`out`
+    pivots restrict to those relations and surface kind-excluded counts so
+    the agent sees what they filtered away.
     """
     nid = cursor.current
     if not nid:
         return ("", [], {}, "", {})
 
     if key == "in":
+        # All non-structural in-edges, plus kind-drop visibility when --kind active
+        full_semantic_in = [G.edges[u, nid] for u in G.predecessors(nid)
+                            if G.edges[u, nid].get("relation") not in _STRUCTURAL]
         all_in = [G.edges[u, nid] for u in G.predecessors(nid)
-                  if G.edges[u, nid].get("relation") not in _STRUCTURAL]
+                  if _semantic_pass(G.edges[u, nid].get("relation") or "", kinds)]
         preds = [u for u in G.predecessors(nid)
-                 if G.edges[u, nid].get("relation") not in _STRUCTURAL
+                 if _semantic_pass(G.edges[u, nid].get("relation") or "", kinds)
                  and _passes_confidence(G.edges[u, nid], extracted_only, min_confidence)]
         edge_for = {u: G.edges[u, nid] for u in preds}
         preds.sort(key=lambda x: _rank_key(G, x, edge_for[x]))
-        return ("↗in", preds, edge_for, "extracted-first, then degree desc",
-                _drop_breakdown(all_in, extracted_only, min_confidence))
+        drops = _drop_breakdown(all_in, extracted_only, min_confidence)
+        kd = _kind_drops(full_semantic_in, kinds)
+        if kd:
+            drops["by_rel"] = kd
+        return ("↗in", preds, edge_for, "extracted-first, then degree desc", drops)
 
     if key == "out":
+        full_semantic_out = [G.edges[nid, v] for v in G.successors(nid)
+                             if G.edges[nid, v].get("relation") not in _STRUCTURAL]
         all_out = [G.edges[nid, v] for v in G.successors(nid)
-                   if G.edges[nid, v].get("relation") not in _STRUCTURAL]
+                   if _semantic_pass(G.edges[nid, v].get("relation") or "", kinds)]
         succs = [v for v in G.successors(nid)
-                 if G.edges[nid, v].get("relation") not in _STRUCTURAL
+                 if _semantic_pass(G.edges[nid, v].get("relation") or "", kinds)
                  and _passes_confidence(G.edges[nid, v], extracted_only, min_confidence)]
         edge_for = {v: G.edges[nid, v] for v in succs}
         succs.sort(key=lambda x: _rank_key(G, x, edge_for[x]))
-        return ("↘out", succs, edge_for, "extracted-first, then degree desc",
-                _drop_breakdown(all_out, extracted_only, min_confidence))
+        drops = _drop_breakdown(all_out, extracted_only, min_confidence)
+        kd = _kind_drops(full_semantic_out, kinds)
+        if kd:
+            drops["by_rel"] = kd
+        return ("↘out", succs, edge_for, "extracted-first, then degree desc", drops)
 
     if key == "methods":
         all_m = [G.edges[nid, v] for v in G.successors(nid)
@@ -823,7 +972,9 @@ def navigate(ops: list[str] | str, *,
              min_confidence: float | None = None,
              show_legend: bool = False,
              show_ops_hint: bool = True,
-             limit: int = LIST_LIMIT) -> str:
+             limit: int = LIST_LIMIT,
+             kinds: set[str] | None = None,
+             bodies: int | None = None) -> str:
     """Apply a chain of ops, return rendered output.
 
     ops: list of ops or a single string. Strings get split on whitespace.
@@ -842,6 +993,13 @@ def navigate(ops: list[str] | str, *,
     show_legend: prepend a one-line legend before output.
     show_ops_hint: append the ops cheat-sheet (turn off in chained agent calls).
     limit: max items per listing (default 25).
+    kinds: optional allowlist of edge relation names (e.g. {"calls", "uses"}).
+        When set, `in`/`out` pivots include only edges whose relation is in
+        the set; counts of kind-excluded edges are surfaced in the drop
+        breakdown so the agent can choose to widen.
+    bodies: optional N. When set, `contains`/`methods` listings render the
+        first N non-blank source lines under each item — surfaces dead/
+        redirect/`raise NotImplementedError` stubs without a separate Read.
     """
     if isinstance(ops, str):
         ops = ops.strip().split() if ops.strip() else []
@@ -1004,6 +1162,7 @@ def navigate(ops: list[str] | str, *,
                         G, communities, cursor, pkey,
                         extracted_only=extracted_only,
                         min_confidence=min_confidence,
+                        kinds=kinds,
                     )
                     # Persist only the rendered window — keeps the cursor file
                     # small (coc on a 1000-node community would otherwise be ~40KB).
@@ -1013,7 +1172,9 @@ def navigate(ops: list[str] | str, *,
                                               total=len(ids),
                                               sort_label=sort_label,
                                               limit=limit,
-                                              drops=drops)
+                                              drops=drops,
+                                              kinds=kinds,
+                                              bodies=bodies if pkey in ("contains", "methods") else None)
             else:
                 handled = False
                 last_data = {"type": "error",

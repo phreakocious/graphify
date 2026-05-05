@@ -41,10 +41,14 @@ _SETTINGS_HOOK = {
     "hooks": [
         {
             "type": "command",
+            # Defer the gating decision to `graphify _hook` so we can suppress
+            # the nudge on non-code Reads (graphify only indexes source —
+            # nudging on a .md/.json/.yaml read is noise) without ballooning
+            # this shell line into something unmaintainable. The shell guard
+            # avoids paying python startup when no graph exists.
             "command": (
                 "[ -f graphify-out/graph.json ] && "
-                r"""echo '{"hookSpecificOutput":{"hookEventName":"PreToolUse","additionalContext":"graphify-out/graph.json exists. Before reading/grepping unfamiliar code, scout it cheaper: `graphify navigate \"@<symbol>\"` returns a dense affordance frame (~200 tok). Then pivot with in/out/methods/coc/parent/[N], or jump to file:line once a node is load-bearing. See ~/.claude/skills/graphify/SKILL.md."}}' """
-                "|| true"
+                "graphify _hook 2>/dev/null || true"
             ),
         }
     ],
@@ -1051,6 +1055,8 @@ def main() -> None:
         print("    --json                  structured JSON output")
         print("    --include-inferred      include LLM-inferred edges (default: AST-extracted only)")
         print("    --min-confidence X      drop edges below score X (only meaningful with --include-inferred)")
+        print("    --kind <rel[,rel,...]>  restrict in/out listings to edges of these relations (e.g. calls,uses)")
+        print("    --bodies N              show first N source lines under each contains/methods item")
         print("    --limit N               max items per listing (default 25)")
         print("    --legend                prepend column-key legend")
         print("    --no-ops-hint           omit the ops cheat-sheet line")
@@ -1093,6 +1099,51 @@ def main() -> None:
         return
 
     cmd = sys.argv[1]
+    if cmd == "_hook":
+        # PreToolUse hook handler — read JSON tool call on stdin, decide
+        # whether to emit the navigate-nudge. Suppresses on non-code Read
+        # because graphify only indexes source; nudging on a .md/.json/.yaml
+        # read is noise. Glob and Grep stay un-gated since both search code.
+        # Stdlib-only and quick-return so the hook adds minimal latency.
+        import os.path as _osp
+        try:
+            payload = json.loads(sys.stdin.read() or "{}")
+        except Exception:
+            return
+        tool = payload.get("tool_name") or ""
+        inp = payload.get("tool_input") or {}
+        fp = (inp.get("file_path") or "").strip()
+        if tool == "Read":
+            ext = _osp.splitext(fp)[1].lower()
+            # Mirror of graphify.detect.CODE_EXTENSIONS — kept inline so the
+            # hook stays stdlib-only (importing detect pulls in the rest of
+            # the package). Update both lists if either changes.
+            CODE_EXTS = {
+                ".py", ".ts", ".js", ".jsx", ".tsx", ".mjs", ".ejs", ".go",
+                ".rs", ".java", ".cpp", ".cc", ".cxx", ".c", ".h", ".hpp",
+                ".rb", ".swift", ".kt", ".kts", ".cs", ".scala", ".php",
+                ".lua", ".toc", ".zig", ".ps1", ".ex", ".exs", ".m", ".mm",
+                ".jl", ".vue", ".svelte", ".dart", ".v", ".sv",
+            }
+            if ext not in CODE_EXTS:
+                return
+            # Reading our own report → no nudge needed
+            if "graphify-out/" in fp:
+                return
+        msg = (
+            "graphify-out/graph.json exists. Before reading/grepping "
+            "unfamiliar code, scout it cheaper: `graphify navigate "
+            "\"@<symbol>\"` returns a dense affordance frame (~200 tok). "
+            "Then pivot with in/out/methods/coc/parent/[N], or jump to "
+            "file:line once a node is load-bearing. See "
+            "~/.claude/skills/graphify/SKILL.md."
+        )
+        out_payload = {"hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "additionalContext": msg,
+        }}
+        sys.stdout.write(json.dumps(out_payload))
+        return
     if cmd == "install":
         # Default to windows platform on Windows, claude elsewhere
         default_platform = "windows" if platform.system() == "Windows" else "claude"
@@ -1568,6 +1619,8 @@ def main() -> None:
         show_legend = False
         show_ops_hint = True
         limit = LIST_LIMIT
+        kinds: set[str] | None = None
+        bodies: int | None = None
         i = 0
         ops: list[str] = []
         while i < len(args):
@@ -1601,6 +1654,16 @@ def main() -> None:
                 limit = int(args[i + 1]); i += 2
             elif a.startswith("--limit="):
                 limit = int(a.split("=", 1)[1]); i += 1
+            elif a == "--kind" and i + 1 < len(args):
+                kinds = {k.strip() for k in args[i + 1].split(",") if k.strip()}
+                i += 2
+            elif a.startswith("--kind="):
+                kinds = {k.strip() for k in a.split("=", 1)[1].split(",") if k.strip()}
+                i += 1
+            elif a == "--bodies" and i + 1 < len(args):
+                bodies = int(args[i + 1]); i += 2
+            elif a.startswith("--bodies="):
+                bodies = int(a.split("=", 1)[1]); i += 1
             elif a == "--legend":
                 show_legend = True; i += 1
             elif a == "--no-ops-hint":
@@ -1617,6 +1680,8 @@ def main() -> None:
             show_legend=show_legend,
             show_ops_hint=show_ops_hint,
             limit=limit,
+            kinds=kinds,
+            bodies=bodies,
         )
         print(out)
 
