@@ -142,18 +142,29 @@ def generate(
         and not _is_rationale_node(G, n)
     ]
 
-    def _is_docstring_pair(nodes: list[str]) -> bool:
-        """A 2-node community of {1 code, 1 rationale} is a docstring + the
-        symbol it documents — canonical, not noise."""
-        if len(nodes) != 2:
-            return False
-        a_rat = _is_rationale_node(G, nodes[0])
-        b_rat = _is_rationale_node(G, nodes[1])
-        return a_rat ^ b_rat
+    def _is_uninteresting_thin(nodes: list[str]) -> bool:
+        """Exclude thin-community shapes that are clustering noise rather
+        than actionable gaps:
+
+          - Singleton communities (1 node) — a community of one isn't a
+            thin community, it's an unclustered node. Reporting it as
+            "needs more connections" doesn't suggest any action; the node
+            either has no semantic edges by nature (file leaves, isolated
+            rationale) or wasn't grouped by Leiden for structural reasons.
+          - 2-node {code + rationale} pairs — canonical docstring shape.
+        """
+        if len(nodes) <= 1:
+            return True
+        if len(nodes) == 2:
+            a_rat = _is_rationale_node(G, nodes[0])
+            b_rat = _is_rationale_node(G, nodes[1])
+            if a_rat ^ b_rat:
+                return True
+        return False
 
     thin_communities = {
         cid: nodes for cid, nodes in communities.items()
-        if len(nodes) < 3 and not _is_docstring_pair(nodes)
+        if len(nodes) < 3 and not _is_uninteresting_thin(nodes)
     }
     gap_count = len(isolated) + len(thin_communities)
 

@@ -277,6 +277,32 @@ def test_suggest_questions_excludes_rationale_from_isolated():
     assert isolated_qs == [], f"rationale nodes flagged as isolated: {isolated_qs}"
 
 
+def test_report_skips_singleton_communities():
+    """A community of size 1 isn't a thin community — it's clustering noise.
+    Reporting "Community X (1 node) too small to be meaningful" produces no
+    actionable signal, so suppress."""
+    from graphify.report import generate
+    G = nx.Graph()
+    # Singleton community: just an isolated file node
+    G.add_node("loner", label="loner.py", file_type="code",
+               source_file="loner.py", source_location="L1")
+    # Padding community with ≥3 nodes so report has something else to report
+    for i, lbl in enumerate(("X", "Y", "Z", "W")):
+        G.add_node(lbl.lower(), label=lbl, file_type="code", source_file="o.py",
+                   source_location=f"L{i+1}")
+    G.add_edge("x", "y", relation="calls", confidence="EXTRACTED", source_file="o.py")
+    G.add_edge("y", "z", relation="calls", confidence="EXTRACTED", source_file="o.py")
+    G.add_edge("z", "w", relation="calls", confidence="EXTRACTED", source_file="o.py")
+    communities = {0: ["loner"], 1: ["x", "y", "z", "w"]}
+    cohesion = {0: 1.0, 1: 1.0}
+    labels = {0: "Loner", 1: "Other"}
+    detection = {"total_files": 2, "total_words": 100, "needs_graph": True, "warning": None}
+    report = generate(G, communities, cohesion, labels, [], [], detection,
+                      {"input": 0, "output": 0}, "./p")
+    assert "Loner" not in report.split("## Knowledge Gaps")[-1] if "## Knowledge Gaps" in report else True
+    assert "loner.py" not in report.split("## Knowledge Gaps")[-1] if "## Knowledge Gaps" in report else True
+
+
 def test_report_skips_docstring_pair_thin_community():
     """A 2-node community of {1 code, 1 rationale} is a docstring pair, not noise."""
     from graphify.report import generate
