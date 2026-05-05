@@ -158,6 +158,7 @@ def _short_src(src: str | None, loc: str | None) -> str:
 # rendered item, but we only want one stat per file per `navigate` call.
 _META_CACHE: dict[str, dict] = {}
 _GIT_LOG_CACHE: dict[str, dict[str, int]] = {}  # repo_root → {file: last_commit_unixtime}
+_GRAPH_MTIME: float = 0.0  # set per-call so per-file staleness can be flagged
 
 
 def _file_meta(src: str | None) -> dict:
@@ -401,6 +402,10 @@ def _meta_tag(item: dict) -> str:
     actually change") over fs mtime ("when did I last touch it locally").
     Line count is added for code files only and only when known. Returns ''
     if no metadata is available so callers can append unconditionally.
+
+    Also surfaces a `!stale` marker when the file's mtime is newer than the
+    graph's mtime — strong signal that the graph doesn't reflect this file's
+    current state and `graphify update .` may be due.
     """
     parts: list[str] = []
     age_src = item.get("git_mtime") or item.get("mtime")
@@ -414,6 +419,9 @@ def _meta_tag(item: dict) -> str:
     lines = item.get("lines")
     if isinstance(lines, int) and lines > 0:
         parts.append(f"{lines}ln")
+    fs_mtime = item.get("mtime")
+    if fs_mtime and _GRAPH_MTIME and fs_mtime > _GRAPH_MTIME:
+        parts.append("!stale")
     return (" · " + " · ".join(parts)) if parts else ""
 
 
@@ -1286,6 +1294,16 @@ def navigate(ops: list[str] | str, *,
     if not gpath.exists():
         msg = f"error: graph not found at {gpath}. run `graphify update <path>` first."
         return json.dumps({"type": "error", "message": msg}) if fmt == "json" else msg
+
+    # Capture graph mtime so `_meta_tag` can flag files newer than the graph
+    # (likely stale extraction). Also reset the per-process meta cache — the
+    # filesystem may have moved between calls in long-running session usage.
+    global _GRAPH_MTIME
+    try:
+        _GRAPH_MTIME = gpath.stat().st_mtime
+    except OSError:
+        _GRAPH_MTIME = 0.0
+    _META_CACHE.clear()
 
     G, communities = load_graph(gpath)
 
