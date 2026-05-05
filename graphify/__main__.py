@@ -1289,7 +1289,7 @@ def main() -> None:
         if len(sys.argv) < 4:
             print("Usage: graphify path \"<source>\" \"<target>\" [--graph path] [--include-inferred]", file=sys.stderr)
             sys.exit(1)
-        from graphify.serve import _score_nodes
+        from graphify.navigate import resolve_focus, label_index
         from networkx.readwrite import json_graph
         import networkx as _nx
         source_label = sys.argv[2]
@@ -1319,46 +1319,89 @@ def main() -> None:
                              if d.get("confidence") and d["confidence"] != "EXTRACTED"]
             G = G.copy()
             G.remove_edges_from(edges_to_drop)
-        src_scored = _score_nodes(G, [t.lower() for t in source_label.split()])
-        tgt_scored = _score_nodes(G, [t.lower() for t in target_label.split()])
-        if not src_scored:
-            print(f"No node matching '{source_label}' found.", file=sys.stderr)
-            sys.exit(1)
-        if not tgt_scored:
-            print(f"No node matching '{target_label}' found.", file=sys.stderr)
-            sys.exit(1)
-        src_nid, tgt_nid = src_scored[0][1], tgt_scored[0][1]
+        # Use navigate's resolver so `path` shares the same `@<label>` /
+        # plain-label syntax, NFC/prefix/substring/fuzzy ranking, and
+        # public-over-rationale preference. Without this `path` would land
+        # on rationale comments first because they tie on substring score.
+        idx = label_index(G)
+        def _resolve(label: str) -> tuple[str | None, list[str], str]:
+            chosen, candidates, match_type, _alts = resolve_focus(G, idx, label)
+            return chosen, candidates, match_type
+        src_nid, src_cands, src_match = _resolve(source_label)
+        tgt_nid, tgt_cands, tgt_match = _resolve(target_label)
+        for who, label, nid, cands in (("source", source_label, src_nid, src_cands),
+                                        ("target", target_label, tgt_nid, tgt_cands)):
+            if nid is None:
+                if cands:
+                    print(f"{who} '{label}' is ambiguous ({len(cands)} matches). pick a more specific label.", file=sys.stderr)
+                    for c in cands[:5]:
+                        print(f"  - {G.nodes[c].get('label', c)}", file=sys.stderr)
+                else:
+                    print(f"No node matching '{label}' found.", file=sys.stderr)
+                sys.exit(1)
+        # Weight `contains` (structural co-location) higher than semantic
+        # edges so a class→method→callee path beats a class→file→class
+        # shortcut of the same hop count. Without this, A and B that share
+        # a parent file always look "2 hops apart" via `contains`, which is
+        # technically true but uninformative — the real relationship is
+        # the call/method chain, even when it's the same length.
+        # (Both routes are 2 hops; the weighted path makes the semantic
+        # one cheaper so shortest_path prefers it.)
+        STRUCTURAL_RELS = {"contains"}
+        for u, v, d in G.edges(data=True):
+            d["_path_weight"] = 10.0 if d.get("relation") in STRUCTURAL_RELS else 1.0
         try:
-            path_nodes = _nx.shortest_path(G, src_nid, tgt_nid)
+            path_nodes = _nx.shortest_path(G, src_nid, tgt_nid, weight="_path_weight")
         except (_nx.NetworkXNoPath, _nx.NodeNotFound):
             hint = "" if include_inferred else " (try --include-inferred to widen)"
             print(f"No path found between '{source_label}' and '{target_label}'.{hint}")
             sys.exit(0)
         hops = len(path_nodes) - 1
+        relations: list[str] = []
         segments = []
         for i in range(len(path_nodes) - 1):
             u, v = path_nodes[i], path_nodes[i + 1]
             edata = G.edges[u, v]
             rel = edata.get("relation", "")
+            relations.append(rel)
             conf = edata.get("confidence", "")
             conf_str = f" [{conf}]" if conf else ""
             if i == 0:
                 segments.append(G.nodes[u].get("label", u))
             segments.append(f"--{rel}{conf_str}--> {G.nodes[v].get('label', v)}")
+        annotation = ""
+        if hops >= 2 and all(r == "contains" for r in relations):
+            annotation = "  (co-located only — these nodes share a parent file but have no semantic call/use edge between them)"
+        elif hops >= 2 and all(r in ("contains", "method") for r in relations):
+            annotation = "  (structural-only path: contains/method — no direct call edge between endpoints)"
         print(f"Shortest path ({hops} hops):\n  " + " ".join(segments))
+        if annotation:
+            print(annotation)
 
     elif cmd == "explain":
         if len(sys.argv) < 3:
-            print("Usage: graphify explain \"<node>\" [--graph path]", file=sys.stderr)
+            print("Usage: graphify explain \"<node>\" [--graph path] [--include-inferred] [--limit N]", file=sys.stderr)
             sys.exit(1)
-        from graphify.serve import _find_node
+        from graphify.navigate import resolve_focus, label_index
         from networkx.readwrite import json_graph
         label = sys.argv[2]
         graph_path = "graphify-out/graph.json"
+        include_inferred = False  # default: AST ground truth only, matching navigate
+        limit = 20
         args = sys.argv[3:]
-        for i, a in enumerate(args):
+        i = 0
+        while i < len(args):
+            a = args[i]
             if a == "--graph" and i + 1 < len(args):
-                graph_path = args[i + 1]
+                graph_path = args[i + 1]; i += 2
+            elif a == "--include-inferred":
+                include_inferred = True; i += 1
+            elif a == "--limit" and i + 1 < len(args):
+                limit = int(args[i + 1]); i += 2
+            elif a.startswith("--limit="):
+                limit = int(a.split("=", 1)[1]); i += 1
+            else:
+                i += 1
         gp = Path(graph_path).resolve()
         if not gp.exists():
             print(f"error: graph file not found: {gp}", file=sys.stderr)
@@ -1368,11 +1411,18 @@ def main() -> None:
             G = json_graph.node_link_graph(_raw, edges="links")
         except TypeError:
             G = json_graph.node_link_graph(_raw)
-        matches = _find_node(G, label)
-        if not matches:
-            print(f"No node matching '{label}' found.")
-            sys.exit(0)
-        nid = matches[0]
+        # Use navigate's resolver so explain accepts both `@<label>` and
+        # plain `<label>` and shares the prefix/substring/fuzzy ranking.
+        idx = label_index(G)
+        nid, candidates, match_type, _alts = resolve_focus(G, idx, label)
+        if nid is None:
+            if candidates:
+                print(f"'{label}' is ambiguous ({len(candidates)} matches). pick one:", file=sys.stderr)
+                for c in candidates[:5]:
+                    print(f"  - {G.nodes[c].get('label', c)}", file=sys.stderr)
+            else:
+                print(f"No node matching '{label}' found.")
+            sys.exit(0 if not candidates else 1)
         d = G.nodes[nid]
         print(f"Node: {d.get('label', nid)}")
         print(f"  ID:        {nid}")
@@ -1381,15 +1431,40 @@ def main() -> None:
         print(f"  Community: {d.get('community', '')}")
         print(f"  Degree:    {G.degree(nid)}")
         neighbors = list(G.neighbors(nid))
-        if neighbors:
-            print(f"\nConnections ({len(neighbors)}):")
-            for nb in sorted(neighbors, key=lambda n: G.degree(n), reverse=True)[:20]:
+        # Filter by confidence (matching navigate's default) and sort
+        # EXTRACTED-first so the trustworthy edges aren't buried under
+        # bulk-tagged INFERRED noise.
+        def _edge_sort_key(nb):
+            e = G.edges[nid, nb]
+            ext = 0 if e.get("confidence") == "EXTRACTED" else 1
+            return (ext, -G.degree(nb))
+        neighbors_filtered = [
+            nb for nb in neighbors
+            if include_inferred or G.edges[nid, nb].get("confidence") == "EXTRACTED"
+        ]
+        dropped = len(neighbors) - len(neighbors_filtered)
+        if neighbors_filtered:
+            header = f"\nConnections ({len(neighbors_filtered)})"
+            if dropped > 0:
+                header += f" — {dropped} INFERRED hidden, --include-inferred to show"
+            print(header + ":")
+            sorted_nbrs = sorted(neighbors_filtered, key=_edge_sort_key)
+            prev_extracted: bool | None = None
+            boundary_inserted = False
+            for nb in sorted_nbrs[:limit]:
                 edata = G.edges[nid, nb]
                 rel = edata.get("relation", "")
                 conf = edata.get("confidence", "")
+                is_ext = conf == "EXTRACTED"
+                if (not boundary_inserted and prev_extracted is True and not is_ext):
+                    print("  ── inferred below ──")
+                    boundary_inserted = True
+                prev_extracted = is_ext
                 print(f"  --> {G.nodes[nb].get('label', nb)} [{rel}] [{conf}]")
-            if len(neighbors) > 20:
-                print(f"  ... and {len(neighbors) - 20} more")
+            if len(neighbors_filtered) > limit:
+                print(f"  ... and {len(neighbors_filtered) - limit} more")
+        elif dropped > 0:
+            print(f"\nNo EXTRACTED edges. {dropped} INFERRED edges hidden (use --include-inferred).")
 
     elif cmd == "add":
         if len(sys.argv) < 3:
