@@ -324,6 +324,33 @@ def _frontier_data(G: nx.DiGraph, communities: dict[int, list[str]],
     cid = node["community"] if node["community"] is not None else -1
     coc_size = max(0, len(communities.get(cid, [])) - 1) if cid != -1 else 0
 
+    # Class-level inbound rollup: when this node has method-out neighbors, sum
+    # the *unique* callers across all of them (deduped) and report alongside
+    # the direct in-count. A class node with `↗in(0)` is misleading when its
+    # methods are called from 50 places — surface that.
+    via_methods = 0
+    if methods_all:  # only matters for class-shaped nodes
+        callers: set[str] = set()
+        for e in methods:  # filter-respecting method out-edges only
+            v = None
+            # methods is a list of edges; we need the destination node ids,
+            # which we already collected separately for the listing pivot.
+            # Re-derive cheaply: any successor with relation=method passing filters.
+        # Easier: walk successors directly so we have the node id in hand.
+        for v in G.successors(nid):
+            e_mv = G.edges[nid, v]
+            if (e_mv.get("relation") != "method"
+                    or not _passes_confidence(e_mv, extracted_only, min_confidence)):
+                continue
+            for u in G.predecessors(v):
+                if u == nid:
+                    continue
+                e_uv = G.edges[u, v]
+                if (e_uv.get("relation") not in _STRUCTURAL
+                        and _passes_confidence(e_uv, extracted_only, min_confidence)):
+                    callers.add(u)
+        via_methods = len(callers)
+
     # Sibling count: union of parents' contained children minus self.
     # Approximate but accurate for the common case of single-parent containment.
     sib_set: set[str] = set()
@@ -357,11 +384,14 @@ def _frontier_data(G: nx.DiGraph, communities: dict[int, list[str]],
             "drops": _drop_breakdown(edges_all, extracted_only, min_confidence),
         }
 
+    in_pivot = pivot_summary("in", in_semantic, in_semantic_all)
+    if via_methods > 0:
+        in_pivot["via_methods"] = via_methods
     return {
         "type": "frontier",
         "current": node,
         "pivots": {
-            "in": pivot_summary("in", in_semantic, in_semantic_all),
+            "in": in_pivot,
             "out": pivot_summary("out", out_semantic, out_semantic_all),
             "methods": cnt("methods", methods, methods_all),
             "contains": cnt("contains", contains, contains_all),
@@ -506,18 +536,24 @@ def _render_frontier_text(data: dict, cursor: Cursor, *, show_ops: bool) -> str:
     header = f"@ {n['label']}  · c{cid} · deg={n['degree']} · {src}{ftype_tag}"
 
     def _glyph(prefix: str, pv: dict, with_conf: bool = False) -> str:
-        # Format: glyph(count[: conf-mix][; +Ninf hidden])
+        # Format: glyph(count[: conf-mix][; +Ninf hidden][; +M via methods])
         # Always show the drop-count when filtering hides edges, so the agent
         # never thinks a 0-count means "nothing exists" when it really means
         # "nothing matches the current filter".
+        # The via_methods rollup specifically guards against the trust-bug
+        # case: `↗in(0)` on a class whose methods are called from 50 places
+        # would suggest "nobody uses this", which is wrong.
         c = pv["count"]
         hidden = _format_hidden(pv.get("drops", {})).lstrip(" /").strip(", ").strip()
         # _format_hidden returns " / +Xinf hidden" — normalise to "; +Xinf hidden"
         hidden_suffix = f"; {hidden}" if hidden else ""
+        via = pv.get("via_methods")
+        via_suffix = f"; +{via} via methods" if via else ""
         if with_conf and c:
-            return f"{prefix}({c}: {pv['confidence_text']}{hidden_suffix})"
-        if hidden_suffix:
-            return f"{prefix}({c}{hidden_suffix})"
+            return f"{prefix}({c}: {pv['confidence_text']}{hidden_suffix}{via_suffix})"
+        suffix = hidden_suffix + via_suffix
+        if suffix:
+            return f"{prefix}({c}{suffix})"
         return f"{prefix}({c})"
 
     line_a = "  ".join([
@@ -556,10 +592,43 @@ def _render_frontier_text(data: dict, cursor: Cursor, *, show_ops: bool) -> str:
                 f"→ pick a function → then `out`."
             )
         elif p['methods']['count'] > 0:
-            out.append(
-                f"  hint: no direct call edges. drill: `methods` ({p['methods']['count']}) "
-                f"→ pick a method → then `in`/`out`."
-            )
+            via = p['in'].get('via_methods', 0)
+            if via:
+                out.append(
+                    f"  hint: class-shaped — direct callers=0 but {via} reach via "
+                    f"its methods. drill: `methods` ({p['methods']['count']}) → "
+                    f"pick a method → then `in`."
+                )
+            else:
+                out.append(
+                    f"  hint: no direct call edges. drill: `methods` "
+                    f"({p['methods']['count']}) → pick a method → then `in`/`out`."
+                )
+        elif (p['contains']['count'] == 0 and p['methods']['count'] == 0
+              and p['parent']['count'] == 0 and p['rat']['count'] == 0
+              and p['inh']['count'] == 0):
+            # Truly orphaned: no parent, no children, no rationale, no inheritance.
+            # Often a top-level constant, isolated import, or genuinely dead node.
+            # The agent should pivot through `coc` (Leiden cluster) for context
+            # rather than poking at empty pivots.
+            coc_n = p.get('coc', {}).get('count', 0)
+            if coc_n > 0:
+                out.append(
+                    f"  hint: orphan — no in/out/parent/contains/methods. "
+                    f"closest context is its community ({coc_n} members) — try `coc`."
+                )
+            else:
+                out.append(
+                    "  hint: fully isolated — no edges and no community peers. "
+                    "graph likely has stale extraction; consider `graphify update .`."
+                )
+    elif p['methods']['count'] > 0 and p['in'].get('via_methods', 0) > p['in']['count']:
+        # Has direct callers but methods see far more — class-shape signal.
+        # Surface the rollup so the agent doesn't anchor on the direct count.
+        out.append(
+            f"  hint: class-shaped — {p['in']['count']} direct callers vs "
+            f"{p['in']['via_methods']} via methods. `methods` then `in` reveals the wider call graph."
+        )
 
     if data.get("last_listing_size") and data.get("last_pivot"):
         out.append(f"  last: {data['last_pivot']}({data['last_listing_size']}) · pick [N]")
@@ -980,15 +1049,18 @@ def resolve_focus(G: nx.DiGraph, idx: dict[str, list[str]],
 # --- op chain --------------------------------------------------------------
 
 PIVOT_KEYS = {
-    "in": "in", "↗in": "in", "↗": "in",
-    "out": "out", "↘out": "out", "↘": "out",
-    "methods": "methods", "◉methods": "methods", "◉": "methods", "method": "methods",
+    # Single-letter aliases — token economy on chained calls. `c` is *not*
+    # aliased to keep `coc`/`contains` unambiguous; spell those out.
+    "in": "in", "i": "in", "↗in": "in", "↗": "in",
+    "out": "out", "o": "out", "↘out": "out", "↘": "out",
+    "methods": "methods", "m": "methods", "◉methods": "methods", "◉": "methods", "method": "methods",
     "contains": "contains", "◇contains": "contains", "◇": "contains",
     "coc": "coc", "⊕coc": "coc", "⊕": "coc", "community": "coc",
-    "rat": "rat", "←rat": "rat", "←": "rat", "rationale": "rat",
+    "rat": "rat", "r": "rat", "←rat": "rat", "←": "rat", "rationale": "rat",
     "inh": "inh", "→inh": "inh", "→": "inh", "inherits": "inh",
-    "parent": "parent", "⇡parent": "parent", "⇡": "parent",
-    "siblings": "siblings", "sib": "siblings", "◈sib": "siblings", "◈": "siblings",
+    "parent": "parent", "p": "parent", "⇡parent": "parent", "⇡": "parent",
+    "siblings": "siblings", "sib": "siblings", "s": "siblings",
+    "◈sib": "siblings", "◈": "siblings",
 }
 
 CONTROL_KEYS = {

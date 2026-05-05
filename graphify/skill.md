@@ -1285,7 +1285,8 @@ Op forms:
 - `coc` — co-community siblings, ranked by degree desc (capped at 25 — raise with `--limit N` for more)
 - `rat` — rationale anchors (docstring/comment nodes attached to this entity)
 - `inh` — inherits edges
-- `siblings` (or `sib`) — structural peers under the same parent file/class (disjoint from `coc`, which is the Leiden cluster). Use this for "what else is in this file?" without pivoting through `parent` then `contains`.
+- `siblings` (or `sib`, `s`) — structural peers under the same parent file/class (disjoint from `coc`, which is the Leiden cluster). Use this for "what else is in this file?" without pivoting through `parent` then `contains`.
+- Single-letter aliases for chained calls: `i`=in, `o`=out, `m`=methods, `p`=parent, `s`=siblings, `r`=rat (no alias for `c` to keep `coc` and `contains` unambiguous).
 - `[N]` — focus on the Nth item from the most recent listing (e.g. `[3]`)
 - `back` — pop history (returns to the previous focus)
 - `reset` — clear cursor state
