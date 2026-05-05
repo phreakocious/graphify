@@ -1048,6 +1048,7 @@ def main() -> None:
         print("    in | out | methods | contains    list typed pivots")
         print("    coc                     co-community siblings (same Leiden cluster)")
         print("    rat | inh | parent      rationale anchors / inherits / structural parent")
+        print("    siblings                structural peers (same parent file/class)")
         print("    [N] | N                 focus on Nth item from previous listing in the chain")
         print("    back | reset            pop history / clear cursor")
         print("    --session <id>          resume a prior session (id is printed at the bottom of every output)")

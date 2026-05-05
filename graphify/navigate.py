@@ -324,6 +324,22 @@ def _frontier_data(G: nx.DiGraph, communities: dict[int, list[str]],
     cid = node["community"] if node["community"] is not None else -1
     coc_size = max(0, len(communities.get(cid, [])) - 1) if cid != -1 else 0
 
+    # Sibling count: union of parents' contained children minus self.
+    # Approximate but accurate for the common case of single-parent containment.
+    sib_set: set[str] = set()
+    for u in G.predecessors(nid):
+        e_pu = G.edges[u, nid]
+        if (e_pu.get("relation") in ("contains", "method")
+                and _passes_confidence(e_pu, extracted_only, min_confidence)):
+            for v in G.successors(u):
+                if v == nid:
+                    continue
+                e_uv = G.edges[u, v]
+                if (e_uv.get("relation") in ("contains", "method")
+                        and _passes_confidence(e_uv, extracted_only, min_confidence)):
+                    sib_set.add(v)
+    sib_count = len(sib_set)
+
     def pivot_summary(name: str, edges: list[dict], edges_all: list[dict]) -> dict:
         return {
             "name": name,
@@ -354,6 +370,7 @@ def _frontier_data(G: nx.DiGraph, communities: dict[int, list[str]],
                     "drops": {"inferred": max(0, rat_all_count - len(rat))} if extracted_only else {}},
             "inh": cnt("inh", inh, inh_all),
             "parent": cnt("parent", parent_edges, parent_all),
+            "siblings": {"name": "siblings", "count": sib_count, "drops": {}},
         },
         "history_depth": len(cursor.history),
         "last_pivot": cursor.last_pivot,
@@ -469,7 +486,7 @@ LEGEND = (
     "  legend: c<N>=community · d=<degree> · src=<file>:<line> · "
     "ext=EXTRACTED edge (AST ground truth) · inf@<lo>-<hi>=INFERRED with score range · "
     "[N]=pick from listing · @<label>=focus · "
-    "ops: in out methods contains coc rat inh parent back reset"
+    "ops: in out methods contains coc rat inh parent siblings back reset"
 )
 
 
@@ -515,6 +532,8 @@ def _render_frontier_text(data: dict, cursor: Cursor, *, show_ops: bool) -> str:
         _glyph("→inh", p['inh']),
         _glyph("⇡parent", p['parent']),
     ]
+    if p.get("siblings", {}).get("count"):
+        line_b_parts.append(f"◈sib({p['siblings']['count']})")
     if data.get("show_history"):
         line_b_parts.append(f"↺({data['history_depth']})")
     line_b = "  ".join(line_b_parts)
@@ -545,7 +564,7 @@ def _render_frontier_text(data: dict, cursor: Cursor, *, show_ops: bool) -> str:
     if data.get("last_listing_size") and data.get("last_pivot"):
         out.append(f"  last: {data['last_pivot']}({data['last_listing_size']}) · pick [N]")
     if show_ops:
-        ops_line = "  ops: in | out | methods | contains | coc | rat | inh | parent"
+        ops_line = "  ops: in | out | methods | contains | coc | rat | inh | parent | siblings"
         if data.get("show_history"):
             ops_line += " | back | reset"
         ops_line += " | @<label> | [N]"
@@ -799,6 +818,30 @@ def _pivot_data(G: nx.DiGraph, communities: dict[int, list[str]],
         return ("⇡parent", preds, {u: G.edges[u, nid] for u in preds}, "source order",
                 _drop_breakdown(all_p, extracted_only, min_confidence))
 
+    if key == "siblings":
+        # Structural peers — other nodes that share at least one parent file or
+        # class with the current node. Disjoint from `coc` (semantic Leiden
+        # cluster) and useful for "what else is in this file?" / "what else does
+        # this class have?" without pivoting through `parent` then `contains`.
+        parents = [u for u in G.predecessors(nid)
+                   if G.edges[u, nid].get("relation") in ("contains", "method")
+                   and _passes_confidence(G.edges[u, nid], extracted_only, min_confidence)]
+        sibs: list[str] = []
+        seen = {nid}
+        sib_edges: dict[str, dict] = {}
+        for parent in parents:
+            for v in G.successors(parent):
+                if v in seen:
+                    continue
+                e = G.edges[parent, v]
+                if (e.get("relation") in ("contains", "method")
+                        and _passes_confidence(e, extracted_only, min_confidence)):
+                    seen.add(v)
+                    sibs.append(v)
+                    sib_edges[v] = e
+        sibs.sort(key=lambda x: -(G.in_degree(x) + G.out_degree(x)))
+        return ("◈sib", sibs, sib_edges, "degree desc", {})
+
     if key == "rat":
         rat = set()
         all_rat_edges: list[dict] = []
@@ -945,6 +988,7 @@ PIVOT_KEYS = {
     "rat": "rat", "←rat": "rat", "←": "rat", "rationale": "rat",
     "inh": "inh", "→inh": "inh", "→": "inh", "inherits": "inh",
     "parent": "parent", "⇡parent": "parent", "⇡": "parent",
+    "siblings": "siblings", "sib": "siblings", "◈sib": "siblings", "◈": "siblings",
 }
 
 CONTROL_KEYS = {

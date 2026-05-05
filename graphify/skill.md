@@ -1285,6 +1285,7 @@ Op forms:
 - `coc` — co-community siblings, ranked by degree desc (capped at 25 — raise with `--limit N` for more)
 - `rat` — rationale anchors (docstring/comment nodes attached to this entity)
 - `inh` — inherits edges
+- `siblings` (or `sib`) — structural peers under the same parent file/class (disjoint from `coc`, which is the Leiden cluster). Use this for "what else is in this file?" without pivoting through `parent` then `contains`.
 - `[N]` — focus on the Nth item from the most recent listing (e.g. `[3]`)
 - `back` — pop history (returns to the previous focus)
 - `reset` — clear cursor state
@@ -1296,7 +1297,7 @@ Frontier (after focus or `back`):
 ```
 @ <label> · c<community> · deg=<N> · <file>:<line> [file_type if not code]
   ↗in(N: confidence-mix)  ↘out(N: confidence-mix)  ◉methods(N)  ◇contains(N)
-  ⊕coc(N)  ←rat(N)  →inh(N)  ⇡parent(N)  ↺(history-depth)
+  ⊕coc(N)  ←rat(N)  →inh(N)  ⇡parent(N)  ◈sib(N)  ↺(history-depth)
 ```
 
 Confidence mix breaks down as `Next ext, Minf@lo-hi` — extracted edges (ground truth from AST) versus inferred edges with their score range. EXTRACTED edges are higher signal. **By default, navigate only shows EXTRACTED edges** — pass `--include-inferred` to widen the result set when you need cross-language or doc-linked breadth.
@@ -1357,6 +1358,21 @@ graphify navigate "@GeometryAnalyzer" --no-ops-hint
 
 # Disable session entirely (no disk write, no id printed)
 graphify navigate "@GeometryAnalyzer" --no-session
+
+# Restrict in/out listings to specific edge relations. Use this to suppress
+# edge-type noise on busy nodes — `--kind=calls` shows only call edges, hiding
+# uses/imports/references. Comma-separate to combine: `--kind=calls,uses`.
+# Counts of kind-excluded edges are surfaced in the listing so you know what
+# was filtered.
+graphify navigate "@MyClass" out --kind=calls
+graphify navigate "@MyClass" in --kind=calls,uses
+
+# Show the first N non-blank source lines under each item in a contains/methods
+# listing. Catches dead stubs (`pass`), redirects (`return other_func()`),
+# decorator-only wrappers, and `raise NotImplementedError` markers without a
+# separate Read — the body preview is anchored at source_location so it's
+# faithful to what's actually there.
+graphify navigate "@scripts/atlas.py" contains --bodies=2
 ```
 
 ### Trust signals to watch for
