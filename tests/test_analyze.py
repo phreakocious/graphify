@@ -386,3 +386,36 @@ def test_report_skips_docstring_pair_thin_community():
     if "## Knowledge Gaps" in report:
         gaps = report.split("## Knowledge Gaps")[-1]
         assert "λ₃/λ₂" not in gaps, "rationale node flagged as isolated"
+
+
+def test_report_thin_community_uses_real_node_count():
+    """A 2-node community of {symbol, file} is shown as `Nodes (1):` in the
+    Communities section (file filtered). The Knowledge Gaps thin-community
+    detector must agree — counting the file too produces inconsistent
+    output where the same community is "1 node" up top and "2-node thin"
+    in the gap list."""
+    from graphify.report import generate
+    G = nx.Graph()
+    # Symbol-and-its-file pair — the dominant 2-node thin shape on AST-only graphs
+    G.add_node("node_rs", label="node.rs", file_type="code",
+               source_file="node.rs", source_location="L1")
+    G.add_node("node_struct", label="Node", file_type="code",
+               source_file="node.rs", source_location="L5")
+    G.add_edge("node_struct", "node_rs", relation="defined_in",
+               confidence="EXTRACTED", source_file="node.rs")
+    # Padding community
+    for i, lbl in enumerate(("X", "Y", "Z", "W")):
+        G.add_node(lbl.lower(), label=lbl, file_type="code", source_file="o.py",
+                   source_location=f"L{i+1}")
+    G.add_edge("x", "y", relation="calls", confidence="EXTRACTED", source_file="o.py")
+    G.add_edge("y", "z", relation="calls", confidence="EXTRACTED", source_file="o.py")
+    G.add_edge("z", "w", relation="calls", confidence="EXTRACTED", source_file="o.py")
+    communities = {0: ["node_struct", "node_rs"], 1: ["x", "y", "z", "w"]}
+    cohesion = {0: 1.0, 1: 1.0}
+    labels = {0: "NodeStuff", 1: "Other"}
+    detection = {"total_files": 2, "total_words": 100, "needs_graph": True, "warning": None}
+    tokens = {"input": 0, "output": 0}
+    report = generate(G, communities, cohesion, labels, [], [], detection, tokens, "./p")
+    if "## Knowledge Gaps" in report:
+        gaps = report.split("## Knowledge Gaps")[-1]
+        assert "Thin community" not in gaps, "{symbol, file} pair flagged as thin community"

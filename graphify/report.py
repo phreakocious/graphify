@@ -150,29 +150,18 @@ def generate(
         and not _is_rationale_node(G, n)
     ]
 
-    def _is_uninteresting_thin(nodes: list[str]) -> bool:
-        """Exclude thin-community shapes that are clustering noise rather
-        than actionable gaps:
-
-          - Singleton communities (1 node) — a community of one isn't a
-            thin community, it's an unclustered node. Reporting it as
-            "needs more connections" doesn't suggest any action; the node
-            either has no semantic edges by nature (file leaves, isolated
-            rationale) or wasn't grouped by Leiden for structural reasons.
-          - 2-node {code + rationale} pairs — canonical docstring shape.
-        """
-        if len(nodes) <= 1:
-            return True
-        if len(nodes) == 2:
-            a_rat = _is_rationale_node(G, nodes[0])
-            b_rat = _is_rationale_node(G, nodes[1])
-            if a_rat ^ b_rat:
-                return True
-        return False
+    def _real_nodes(nodes: list[str]) -> list[str]:
+        # Mirror the filter the Communities section applies for display:
+        # thin-community gap detection has to count what the user sees,
+        # not raw membership. Otherwise a {symbol, file.rs} 2-pair gets
+        # flagged as a 2-node thin community even though Communities
+        # already showed it as a 1-node entry.
+        return [n for n in nodes if not _is_file_node(G, n) and not _is_rationale_node(G, n)]
 
     thin_communities = {
-        cid: nodes for cid, nodes in communities.items()
-        if len(nodes) < 3 and not _is_uninteresting_thin(nodes)
+        cid: real for cid, nodes in communities.items()
+        for real in [_real_nodes(nodes)]
+        if 2 <= len(real) < 3
     }
     gap_count = len(isolated) + len(thin_communities)
 
