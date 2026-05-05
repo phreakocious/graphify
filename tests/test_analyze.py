@@ -277,6 +277,32 @@ def test_suggest_questions_excludes_rationale_from_isolated():
     assert isolated_qs == [], f"rationale nodes flagged as isolated: {isolated_qs}"
 
 
+def test_report_skips_rationale_only_community_in_communities_section():
+    """A community whose only member is a rationale (docstring) node renders
+    as `Nodes (1): "Find metrics where every '+' source..."` — sentence-shaped
+    label, not actionable. Drop it the same way we drop file-stub-only ones."""
+    from graphify.report import generate
+    G = nx.Graph()
+    G.add_node("doc", label="Find metrics where every '+' source...",
+               file_type="rationale", source_file="m.py", source_location="L9")
+    # Padding code-only community
+    for i, lbl in enumerate(("X", "Y", "Z", "W")):
+        G.add_node(lbl.lower(), label=lbl, file_type="code", source_file="o.py",
+                   source_location=f"L{i+1}")
+    G.add_edge("x", "y", relation="calls", confidence="EXTRACTED", source_file="o.py")
+    G.add_edge("y", "z", relation="calls", confidence="EXTRACTED", source_file="o.py")
+    G.add_edge("z", "w", relation="calls", confidence="EXTRACTED", source_file="o.py")
+    communities = {0: ["doc"], 1: ["x", "y", "z", "w"]}
+    cohesion = {0: 1.0, 1: 1.0}
+    labels = {0: "RatOnly", 1: "Other"}
+    detection = {"total_files": 2, "total_words": 100, "needs_graph": True, "warning": None}
+    report = generate(G, communities, cohesion, labels, [], [], detection,
+                      {"input": 0, "output": 0}, "./p")
+    assert "### Community 0" not in report
+    assert "Find metrics" not in report
+    assert "### Community 1" in report
+
+
 def test_report_skips_communities_with_no_real_nodes():
     """A community whose entire membership is file/stub nodes filters down
     to zero displayable members. Don't emit `Nodes (0):` — skip the entry."""

@@ -105,16 +105,18 @@ def generate(
             lines.append(f"- **{h.get('label', h.get('id', ''))}** — {node_labels} [{conf_tag}]")
 
     lines += ["", "## Communities"]
-    from .analyze import _is_file_node as _ifn
+    from .analyze import _is_file_node as _ifn, _is_rationale_node as _irn
     for cid, nodes in communities.items():
         label = community_labels.get(cid, f"Community {cid}")
         score = cohesion_scores.get(cid, 0.0)
-        # Filter method/function stubs from display - they're structural noise
-        real_nodes = [n for n in nodes if not _ifn(G, n)]
-        # If filtering left nothing, the community is just file/stub plumbing
-        # — emitting `Nodes (0):` produces noise the reader can't act on.
-        # Skip the entry; the community count in the header is still
-        # accurate because we report `len(real_nodes)` not `len(nodes)`.
+        # Filter method/function stubs and rationale nodes from display:
+        # both are structural noise (rationale = orphaned docstring sentence,
+        # not an actionable "community member"). Without the rationale check
+        # a community of one orphan docstring renders as `Nodes (1): "Find
+        # metrics where every '+' source..."` — sentence-shape, not signal.
+        real_nodes = [n for n in nodes if not _ifn(G, n) and not _irn(G, n)]
+        # If filtering left nothing, the community is just file/stub/rationale
+        # plumbing — emitting it produces noise the reader can't act on.
         if not real_nodes:
             continue
         display = [G.nodes[n].get("label", n) for n in real_nodes[:8]]
