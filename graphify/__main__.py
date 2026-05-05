@@ -36,6 +36,70 @@ def _refresh_all_version_stamps() -> None:
         if vf.exists():
             vf.write_text(__version__, encoding="utf-8")
 
+# Per-subcommand help blocks. Defined once and reused both by the top-level
+# `graphify --help` and by `graphify <cmd> --help` so subcommand help stays
+# in sync with the global usage screen and a confused agent typing
+# `graphify navigate --help` doesn't have its `--help` parsed as an op.
+_HELP_BLOCKS: dict[str, list[str]] = {
+    "path": [
+        "  path \"A\" \"B\"            shortest path between two nodes in graph.json",
+        "    --graph <path>          path to graph.json (default graphify-out/graph.json)",
+        "    --include-inferred      include LLM-inferred edges (default: AST-extracted only)",
+    ],
+    "explain": [
+        "  explain \"X\"             plain-language explanation of a node and its neighbors",
+        "    --graph <path>          path to graph.json (default graphify-out/graph.json)",
+        "    --include-inferred      include LLM-inferred edges (default: AST-extracted only)",
+        "    --limit N               max neighbors to list (default 20)",
+    ],
+    "changed": [
+        "  changed [ref]           list code files added/modified/removed since graph extract (or vs git ref)",
+        "    --graph <path>          path to graph.json (default graphify-out/graph.json)",
+    ],
+    "navigate": [
+        "  navigate [ops...]       cursor-based graph navigation (LLM-friendly)",
+        "    @<label>                focus on a node by label/id (fuzzy fallback for typos)",
+        "    @<dir/file>             path-qualified file resolution (`@tools/foo.py`)",
+        "    @<dir/file/Symbol>      path-qualified symbol resolution (disambiguates collisions)",
+        "    in | out | methods | contains    list typed pivots",
+        "    callers | callees       sugar for `in --kind=calls` / `out --kind=calls`",
+        "    coc                     co-community siblings (same Leiden cluster)",
+        "    rat | inh | parent      rationale anchors / inherits / structural parent",
+        "    siblings                structural peers (same parent file/class)",
+        "    read | body [N]         dump full body of focused node (N caps lines, default 200; walker bails at natural dedent first)",
+        "    [N] | N                 focus on Nth item from previous listing in the chain",
+        "    back | reset            pop history / clear cursor",
+        "    --session <id>          resume a prior session (id is printed at the bottom of every output)",
+        "    --no-session            disable session entirely (no disk, no id printed)",
+        "    --json                  structured JSON output",
+        "    --include-inferred      include LLM-inferred edges (default: AST-extracted only)",
+        "    --min-confidence X      drop edges below score X (only meaningful with --include-inferred)",
+        "    --kind <rel[,rel,...]>  restrict in/out listings to edges of these relations (e.g. calls,uses)",
+        "    --bodies N              show first N source lines under each contains/methods item",
+        "    --depth N               for in/out, walk N hops via non-structural edges (default 1)",
+        "    --limit N               max items per listing (default 25)",
+        "    --legend                prepend column-key legend",
+        "    --no-ops-hint           omit the ops cheat-sheet line",
+        "    --graph <path>          path to graph.json (default graphify-out/graph.json)",
+        "    Chain ops in one call: graphify navigate @Foo methods 1 in",
+    ],
+}
+
+
+def _print_subcmd_help(cmd: str) -> None:
+    """Print `<cmd> --help`. Falls back to top-level help if cmd is unknown."""
+    block = _HELP_BLOCKS.get(cmd)
+    if not block:
+        # Unknown subcommand → defer to the caller; top-level help screen
+        # already prints every subcommand so we don't synthesize anything here.
+        return
+    print(f"Usage: graphify {cmd} ...")
+    print()
+    for line in block:
+        print(line)
+    print()
+
+
 _SETTINGS_HOOK = {
     "matcher": "Read|Glob|Grep",
     "hooks": [
@@ -1016,17 +1080,31 @@ def main() -> None:
         for skill_dst in {Path.home() / cfg["skill_dst"] for cfg in _PLATFORM_CONFIG.values()}:
             _check_skill_version(skill_dst)
 
+    # `graphify --version` / `-V` — standard CLI convention. Without this,
+    # `--version` falls through to "unknown command".
+    if len(sys.argv) >= 2 and sys.argv[1] in ("--version", "-V"):
+        print(f"graphify {__version__}")
+        return
+
+    # `graphify <cmd> --help` (or `-h`) — print just that subcommand's
+    # block. Without this, e.g. `graphify navigate --help` parses `--help`
+    # as a navigate op and errors. Common subcommands have entries in
+    # `_HELP_BLOCKS`; for the rest we fall through to the top-level help.
+    if len(sys.argv) >= 3 and sys.argv[2] in ("-h", "--help") and sys.argv[1] in _HELP_BLOCKS:
+        _print_subcmd_help(sys.argv[1])
+        return
+
     if len(sys.argv) < 2 or sys.argv[1] in ("-h", "--help"):
         print("Usage: graphify <command>")
         print()
         print("Commands:")
         print("  install [--platform P]  copy skill to platform config dir (claude|windows|codex|opencode|aider|claw|droid|trae|trae-cn|gemini|cursor|antigravity|hermes|kiro)")
-        print("  path \"A\" \"B\"            shortest path between two nodes in graph.json")
-        print("    --graph <path>          path to graph.json (default graphify-out/graph.json)")
-        print("  explain \"X\"             plain-language explanation of a node and its neighbors")
-        print("    --graph <path>          path to graph.json (default graphify-out/graph.json)")
-        print("  changed [ref]           list code files added/modified/removed since graph extract (or vs git ref)")
-        print("    --graph <path>          path to graph.json (default graphify-out/graph.json)")
+        for line in _HELP_BLOCKS["path"]:
+            print(line)
+        for line in _HELP_BLOCKS["explain"]:
+            print(line)
+        for line in _HELP_BLOCKS["changed"]:
+            print(line)
         print("  add <url>               fetch a URL and save it to ./raw, then update the graph")
         print("    --author \"Name\"         tag the author of the content")
         print("    --contributor \"Name\"    tag who added it to the corpus")
@@ -1045,29 +1123,8 @@ def main() -> None:
         print("    --nodes N1 N2 ...       source node labels cited in the answer")
         print("    --memory-dir DIR        memory directory (default: graphify-out/memory)")
         print("  benchmark [graph.json]  measure token reduction vs naive full-corpus approach")
-        print("  navigate [ops...]       cursor-based graph navigation (LLM-friendly)")
-        print("    @<label>                focus on a node by label/id (fuzzy fallback for typos)")
-        print("    in | out | methods | contains    list typed pivots")
-        print("    callers | callees       sugar for `in --kind=calls` / `out --kind=calls`")
-        print("    coc                     co-community siblings (same Leiden cluster)")
-        print("    rat | inh | parent      rationale anchors / inherits / structural parent")
-        print("    siblings                structural peers (same parent file/class)")
-        print("    read | body             dump full body of focused node inline (no separate Read needed)")
-        print("    [N] | N                 focus on Nth item from previous listing in the chain")
-        print("    back | reset            pop history / clear cursor")
-        print("    --session <id>          resume a prior session (id is printed at the bottom of every output)")
-        print("    --no-session            disable session entirely (no disk, no id printed)")
-        print("    --json                  structured JSON output")
-        print("    --include-inferred      include LLM-inferred edges (default: AST-extracted only)")
-        print("    --min-confidence X      drop edges below score X (only meaningful with --include-inferred)")
-        print("    --kind <rel[,rel,...]>  restrict in/out listings to edges of these relations (e.g. calls,uses)")
-        print("    --bodies N              show first N source lines under each contains/methods item")
-        print("    --depth N               for in/out, walk N hops via non-structural edges (default 1)")
-        print("    --limit N               max items per listing (default 25)")
-        print("    --legend                prepend column-key legend")
-        print("    --no-ops-hint           omit the ops cheat-sheet line")
-        print("    --graph <path>          path to graph.json (default graphify-out/graph.json)")
-        print("    Chain ops in one call: graphify navigate @Foo methods 1 in")
+        for line in _HELP_BLOCKS["navigate"]:
+            print(line)
         print("  hook install            install post-commit/post-checkout git hooks (all platforms)")
         print("  hook uninstall          remove git hooks")
         print("  hook status             check if git hooks are installed")
@@ -1396,6 +1453,9 @@ def main() -> None:
         )
         print(f"Saved to {out}")
     elif cmd == "path":
+        if any(a in ("-h", "--help") for a in sys.argv[2:]):
+            _print_subcmd_help("path")
+            return
         if len(sys.argv) < 4:
             print("Usage: graphify path \"<source>\" \"<target>\" [--graph path] [--include-inferred]", file=sys.stderr)
             sys.exit(1)
@@ -1493,6 +1553,9 @@ def main() -> None:
             print(annotation)
 
     elif cmd == "explain":
+        if any(a in ("-h", "--help") for a in sys.argv[2:]):
+            _print_subcmd_help("explain")
+            return
         if len(sys.argv) < 3:
             print("Usage: graphify explain \"<node>\" [--graph path] [--include-inferred] [--limit N]", file=sys.stderr)
             sys.exit(1)
@@ -1585,6 +1648,9 @@ def main() -> None:
             print(f"\nNo EXTRACTED edges. {dropped} INFERRED edges hidden (use --include-inferred).")
 
     elif cmd == "changed":
+        if any(a in ("-h", "--help") for a in sys.argv[2:]):
+            _print_subcmd_help("changed")
+            return
         # Lap-3 wishlist #1: surface nodes added/modified/removed since a
         # reference point (git ref or graph extract). After commits the
         # agent wants to navigate to the diff, not blind-search for new
@@ -1804,6 +1870,11 @@ def main() -> None:
         depth: int = 1
         i = 0
         ops: list[str] = []
+        # `--help` / `-h` mid-args takes precedence over op parsing — without
+        # this the `else: ops.append(a)` branch swallows it as a navigate op.
+        if any(a in ("-h", "--help") for a in args):
+            _print_subcmd_help("navigate")
+            return
         while i < len(args):
             a = args[i]
             if a == "--graph" and i + 1 < len(args):

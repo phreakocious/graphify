@@ -32,6 +32,7 @@ from typing import Any
 import networkx as nx
 
 from graphify.build import build_from_json
+from graphify.analyze import _is_file_node
 
 CURSOR_DIR = ".navigate"
 DEFAULT_GRAPH_PATH = "graphify-out/graph.json"
@@ -783,13 +784,20 @@ def _read_body_preview(source_file: str | None, source_location: str | None,
 
 
 def _read_body_full(source_file: str | None, source_location: str | None,
-                    max_lines: int = 200) -> tuple[list[str], int, bool]:
+                    max_lines: int = 200,
+                    flat: bool = False) -> tuple[list[str], int, bool]:
     """Read the full body at source_location, preserving indentation.
 
     Returns (lines, start_line_no, truncated). Lines include the header.
     Walks until the next dedent past the body's indent baseline, or until
     `max_lines` is reached. Used by the `read` op to fold node-find +
     body-read into a single navigate call (Lap-3 wishlist #2).
+
+    `flat=True` skips the indent-walker logic and returns the next
+    `max_lines` lines verbatim. Used for file nodes — a file has no
+    nested body, so the indent walker bails after the first non-indented
+    line and returns just one line. Flat mode treats `read` as "dump
+    the next N lines from this offset", which is what the agent meant.
     """
     if not source_file or not source_location:
         return [], 0, False
@@ -810,6 +818,12 @@ def _read_body_full(source_file: str | None, source_location: str | None,
     start = max(0, line_no - 1)
     if start >= len(lines):
         return [], 0, False
+    if flat:
+        # File-node mode: dump the next max_lines verbatim. The indent
+        # walker doesn't fit because file nodes have no enclosing body.
+        slab = [ln.rstrip("\n") for ln in lines[start:start + max_lines]]
+        truncated = len(lines) - start > max_lines
+        return slab, line_no, truncated
     header = lines[start].rstrip("\n")
     header_indent = len(header) - len(header.lstrip(" \t"))
     out: list[str] = [header]
@@ -848,7 +862,7 @@ def _render_body_text(data: dict) -> str:
         return f"  read @{label}: no body at {sf}:{ln} (missing source or unparseable location)"
     header = f"  read @{label}  ({sf}:{ln}, {len(body_lines)} lines"
     if truncated:
-        header += " — truncated at 200, focus contained items for the rest"
+        header += f" — truncated at {len(body_lines)}, raise with `read N` or focus contained items"
     header += ")"
     out = [header]
     for i, raw in enumerate(body_lines):
@@ -1741,7 +1755,12 @@ def navigate(ops: list[str] | str, *,
                                    show_history=show_history)
     else:
         idx = label_index(G)
-        for op in ops:
+        # Index-based iteration so ops can consume a following arg
+        # (currently `read N` / `body N` for an explicit line cap).
+        op_i = 0
+        while op_i < len(ops):
+            op = ops[op_i]
+            op_i += 1
             op_str = op.strip()
             if not op_str:
                 continue
@@ -1843,6 +1862,22 @@ def navigate(ops: list[str] | str, *,
                 # Lap-3 wishlist: fold node-find + body-read into one nav call.
                 # The graph already knows file:line; serving the body inline
                 # closes the loop and avoids a separate Read of the same file.
+                #
+                # Optional positional arg: `read N` raises the line cap to N
+                # (default 200). `read 0` or omitted uses the default. The
+                # body walker still bails at the natural dedent first, so
+                # this is a *cap*, not a forced length — useful when the
+                # natural dedent ends too early (e.g. nested closures whose
+                # baseline confuses the indent walker).
+                next_arg = ops[op_i] if op_i < len(ops) else None
+                requested_max = None
+                if next_arg is not None and next_arg.strip().isdigit():
+                    requested_max = int(next_arg.strip())
+                    if requested_max > 0:
+                        op_i += 1  # consume the arg
+                    else:
+                        requested_max = None
+                max_lines = requested_max if requested_max else 200
                 if not cursor.current:
                     last_data = {"type": "error",
                                  "message": "no cursor. focus with @<label> first."}
@@ -1850,7 +1885,13 @@ def navigate(ops: list[str] | str, *,
                     nattrs = G.nodes[cursor.current]
                     sf = nattrs.get("source_file")
                     loc = nattrs.get("source_location")
-                    body, ln, trunc = _read_body_full(sf, loc, max_lines=200)
+                    # File nodes have no enclosing body — flat-dump the
+                    # leading lines instead of letting the indent walker
+                    # bail after the shebang.
+                    is_file = _is_file_node(G, cursor.current)
+                    body, ln, trunc = _read_body_full(sf, loc,
+                                                      max_lines=max_lines,
+                                                      flat=is_file)
                     last_data = {
                         "type": "body",
                         "label": nattrs.get("label", cursor.current),
