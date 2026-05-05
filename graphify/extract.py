@@ -450,8 +450,21 @@ _JS_CONFIG = LanguageConfig(
 _TS_CONFIG = LanguageConfig(
     ts_module="tree_sitter_typescript",
     ts_language_fn="language_typescript",
-    class_types=frozenset({"class_declaration"}),
-    function_types=frozenset({"function_declaration", "method_definition"}),
+    # `interface_declaration` and `type_alias_declaration` count as
+    # class-shape: in TS-heavy codebases the public type surface IS the
+    # API (`TriggerHooks`, `DecodeEngine`, `InjectConfig`). Without
+    # these, `@TriggerHooks` falls through to fuzzy and the agent has
+    # no way to find the canonical type definition through the graph.
+    class_types=frozenset({
+        "class_declaration", "interface_declaration", "type_alias_declaration",
+    }),
+    # `method_signature` registers interface members as method-shaped
+    # children of the interface, so `@DecodeEngine methods` lists the
+    # interface contract — the same shape `@SomeClass methods` already
+    # gives for runtime classes.
+    function_types=frozenset({
+        "function_declaration", "method_definition", "method_signature",
+    }),
     import_types=frozenset({"import_statement"}),
     call_types=frozenset({"call_expression"}),
     call_function_field="function",

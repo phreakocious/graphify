@@ -1010,6 +1010,32 @@ def _render_frontier_text(data: dict, cursor: Cursor, *, show_ops: bool) -> str:
             f"  hint: class-shaped — {p['in']['count']} direct callers vs "
             f"{p['in']['via_methods']} via methods. `methods` then `in` reveals the wider call graph."
         )
+    elif (is_code_file and p['methods']['count'] == 0
+          and p['contains']['count'] > 0):
+        # File-shape: even with in/out nonzero (importers/imports), the
+        # symbol-level call graph lives one hop in via `contains`. Without
+        # this the agent tries `methods` (0), gets nothing, and stalls —
+        # the field report had `@compile-v2.ts methods` returning 0 with
+        # no signpost to `contains` (which had 5).
+        out.append(
+            f"  hint: file — {p['contains']['count']} contained, "
+            f"{p['in']['count']} importer(s); drill: `contains` for the "
+            f"symbols inside, `in` to see who imports."
+        )
+
+    # If any pivot has hidden inferred/low-confidence edges, surface
+    # the flag inline once so the affordance is discovered, not just
+    # discoverable. Without this `+97inf hidden` is a fact you'd have
+    # to know to act on; the hint makes it self-documenting.
+    has_hidden_inf = any(
+        (p.get(k, {}).get("drops") or {}).get("inferred", 0) > 0
+        for k in ("in", "out", "methods", "contains", "coc")
+    )
+    if has_hidden_inf:
+        out.append(
+            "  hint: hidden inferred edges available — "
+            "add `--include-inferred` to widen pivots beyond AST ground truth."
+        )
 
     if data.get("last_listing_size") and data.get("last_pivot"):
         out.append(f"  last: {data['last_pivot']}({data['last_listing_size']}) · pick [N]")
@@ -1548,15 +1574,40 @@ def resolve_focus(G: nx.DiGraph, idx: dict[str, list[str]],
     # the user told us exactly which file.
     if "/" in key:
         prefix, _, basename = key.rpartition("/")
+
+        def _label_matches_basename(label_norm: str, target: str) -> bool:
+            """Match a node label to a path-qualifier basename, tolerating
+            the decoration the AST extractor adds: trailing `()` on
+            functions/methods, leading `.` on bound methods, leading
+            `_` for private. Without this, `kg/compile-v2.ts/compile`
+            never matches the function labeled `compile()` and falls
+            through to fuzzy — which picks the file `compile-v2.ts`
+            on similarity. The whole reason the user typed the path
+            qualifier was to NOT pick the file."""
+            stripped = label_norm.rstrip("()").lstrip(".").lstrip("_")
+            return stripped == target or label_norm == target
+
         path_hits = []
-        for nid in idx.get(basename, []):
-            sf = _norm(G.nodes[nid].get("source_file") or "")
-            # File-shape: source_file matches the full path
-            if sf == key or sf.endswith("/" + key):
+        # Walk every node — the previous `idx.get(basename)`
+        # short-circuit only matched literally-equal labels and
+        # missed the parenthesized function shape that's actually
+        # what the agent meant. ~O(N) per resolver call is fine
+        # for graphs in the 10K-node range.
+        for nid, attrs in G.nodes(data=True):
+            label_norm = _norm(attrs.get("label", nid))
+            sf = _norm(attrs.get("source_file") or "")
+            # File-shape: full path matches source_file AND the label
+            # is the basename (no decoration). `kg/compile-v2.ts` →
+            # node labeled `compile-v2.ts`.
+            if (sf == key or sf.endswith("/" + key)) and label_norm == basename:
                 path_hits.append(nid)
                 continue
-            # Symbol-shape: source_file ends with the path-prefix segment
-            if prefix and (sf == prefix or sf.endswith("/" + prefix)):
+            # Symbol-shape: source_file matches the prefix segment AND
+            # label matches basename (with decoration stripping).
+            # `kg/compile-v2.ts/compile` → node `compile()` in
+            # `kg/compile-v2.ts`.
+            if prefix and (sf == prefix or sf.endswith("/" + prefix)) \
+                    and _label_matches_basename(label_norm, basename):
                 path_hits.append(nid)
         if len(path_hits) == 1:
             return path_hits[0], [], "exact", []
@@ -1785,10 +1836,21 @@ def navigate(ops: list[str] | str, *,
                                            and first.endswith("]")
                                            and first[1:-1].isdigit())
             if is_pick:
-                trace.append(
-                    f"  > resuming queued ops: {' '.join(cursor.queued_ops)}"
-                )
-                ops = list(ops) + list(cursor.queued_ops)
+                queued = list(cursor.queued_ops)
+                # Defensive: if the caller retyped some-or-all of the
+                # queue verbatim (taking the "queued for auto-replay:
+                # 2 in" message as instructions), don't double-fire.
+                # Anything in `ops` after the pick that's already at
+                # the queue's head gets stripped from the queue replay.
+                user_tail = [o.strip() for o in ops[1:]]
+                while user_tail and queued and user_tail[0] == queued[0]:
+                    user_tail.pop(0)
+                    queued.pop(0)
+                if queued:
+                    trace.append(
+                        f"  > resuming queued ops: {' '.join(queued)}"
+                    )
+                ops = list(ops) + queued
             cursor.queued_ops = []
         # Index-based iteration so ops can consume a following arg
         # (currently `read N` / `body N` for an explicit line cap).
@@ -1986,15 +2048,33 @@ def navigate(ops: list[str] | str, *,
                     )
                 break
             if cursor.last_pivot == "@-disambig":
-                # ops.index(op) is wrong with the index-based iteration
-                # because op_i has already advanced past the current op.
-                # Use op_i directly: it now points at the next op.
+                # If the user already supplied the pick inline (`@compile
+                # 2 in` — pick is op_i, the very next op), don't pause:
+                # let the loop continue so the pick fires this turn and
+                # the rest of the chain runs from the resolved cursor.
+                # Pausing in that case both confused the agent and caused
+                # a double-replay when they retyped the queued tail.
+                next_inline = ops[op_i].strip() if op_i < len(ops) else ""
+                is_inline_pick = next_inline.isdigit() or (
+                    next_inline.startswith("[")
+                    and next_inline.endswith("]")
+                    and next_inline[1:-1].isdigit()
+                )
+                if is_inline_pick:
+                    # Don't break — fall through, next loop iter handles
+                    # the pick op. last_pivot stays "@-disambig" until
+                    # the pick handler clears it.
+                    continue
+                # No inline pick → pause. Queue the remaining ops so
+                # the next session call (with just `N`) replays them.
+                # Note: `ops[op_i:]` is the tail AFTER the @-op (the
+                # current iter has already advanced op_i past it).
                 remaining = ops[op_i:]
                 if remaining:
                     cursor.queued_ops = list(remaining)
                     trace.append(
-                        f"  chain paused at `{op_str}` — pick [N] to resume "
-                        f"(queued for auto-replay: {' '.join(remaining)})"
+                        f"  chain paused at `{op_str}` — next call: just `[N]` "
+                        f"(queued ops `{' '.join(remaining)}` will replay automatically)"
                     )
                 break
 

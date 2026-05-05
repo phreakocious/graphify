@@ -53,6 +53,91 @@ def test_path_qualified_no_match_falls_through():
     assert chosen is None or match_type == "fuzzy"
 
 
+def test_path_qualified_symbol_handles_decorated_labels():
+    """Friction 1 (lap-5): the label index is keyed on the literal label
+    (`compile()` with parens), so a path-qualifier query like
+    `kg/compile-v2.ts/compile` (no parens) missed step 1b and fell
+    through to fuzzy, which picked the FILE on similarity instead of
+    the function. The path resolver must strip `()`/`.`/`_` decoration
+    when matching the basename to a label."""
+    G = nx.DiGraph()
+    G.add_node("file", label="compile-v2.ts", file_type="code",
+               source_file="kg/compile-v2.ts", source_location="L1")
+    G.add_node("fn", label="compile()", file_type="code",
+               source_file="kg/compile-v2.ts", source_location="L68")
+    G.add_node("other", label="compile()", file_type="code",
+               source_file="kg/compile.ts", source_location="L53")
+    idx = label_index(G)
+    chosen, _, match_type, _ = resolve_focus(G, idx, "kg/compile-v2.ts/compile")
+    assert chosen == "fn", f"path/file/Symbol picked {chosen!r}, expected fn"
+    assert match_type == "exact"
+    # Without the symbol part, the file resolves
+    chosen, _, _, _ = resolve_focus(G, idx, "kg/compile-v2.ts")
+    assert chosen == "file"
+
+
+def test_inline_pick_completes_chain_without_pause(tmp_path, monkeypatch):
+    """Friction 2 (lap-5): `@compile 2 in` should land on the picked
+    node and run `in` in one call. Prior behavior paused at @compile,
+    queued `[2, in]`, then double-replayed when the user retyped."""
+    import json as _json
+    from graphify.navigate import navigate
+    nodes = [
+        {"id": "c1", "label": "compile()", "file_type": "code",
+         "source_file": "a.ts", "source_location": "L1", "community": 0},
+        {"id": "c2", "label": "compile()", "file_type": "code",
+         "source_file": "b.ts", "source_location": "L1", "community": 0},
+        {"id": "caller", "label": "runIt()", "file_type": "code",
+         "source_file": "b.ts", "source_location": "L20", "community": 0},
+    ]
+    links = [
+        {"source": "caller", "target": "c2", "relation": "calls",
+         "confidence": "EXTRACTED", "source_file": "b.ts"},
+    ]
+    graph_dir = tmp_path / "graphify-out"
+    graph_dir.mkdir()
+    (graph_dir / "graph.json").write_text(_json.dumps(
+        {"nodes": nodes, "links": links}), encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+    out = navigate(["@compile", "2", "in"], session=False, fmt="text")
+    # Pick fired and the chain ran `in` against the resolved node.
+    # The exact ranking of c1 vs c2 depends on degree/file order;
+    # accept either outcome — what matters is that the chain ran
+    # all three ops in one call and didn't pause.
+    assert "picked [2]" in out, f"pick didn't run inline; got:\n{out}"
+    assert "in(" in out, f"in pivot didn't fire; got:\n{out}"
+    # No "chain paused" — the inline pick should resolve cleanly.
+    assert "chain paused" not in out
+
+
+def test_queue_retype_doesnt_double_fire(tmp_path, monkeypatch):
+    """Friction 2 (lap-5) defensive: if the user reads our queue message
+    and retypes the queued ops verbatim along with the pick, the dedupe
+    pass strips the overlap so the chain doesn't run things twice."""
+    import json as _json
+    from graphify.navigate import navigate
+    nodes = [
+        {"id": "c1", "label": "compile()", "file_type": "code",
+         "source_file": "a.ts", "source_location": "L1", "community": 0},
+        {"id": "c2", "label": "compile()", "file_type": "code",
+         "source_file": "b.ts", "source_location": "L1", "community": 0},
+    ]
+    graph_dir = tmp_path / "graphify-out"
+    graph_dir.mkdir()
+    (graph_dir / "graph.json").write_text(_json.dumps(
+        {"nodes": nodes, "links": []}), encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+    # Pause: @compile alone; methods queued
+    navigate(["@compile", "methods"], session="qdedupe", fmt="text")
+    # User retypes "2 methods" — queue had ["methods"], so the second
+    # `methods` should be dedup'd out.
+    out = navigate(["2", "methods"], session="qdedupe", fmt="text")
+    # Only ONE methods op should have fired
+    assert out.count("methods") <= 3, (
+        f"likely double-fire (too many 'methods' refs in output): {out}"
+    )
+
+
 def test_path_qualified_symbol_disambiguates_collision():
     """Symbol-shape path qualifier `dir/file.rs/Symbol` — disambiguates a
     label that collides across many files. Critical for Rust crates / JS
