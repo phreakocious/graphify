@@ -1287,7 +1287,7 @@ Op forms:
 - `inh` — inherits edges
 - `siblings` (or `sib`, `s`) — structural peers under the same parent file/class (disjoint from `coc`, which is the Leiden cluster). Use this for "what else is in this file?" without pivoting through `parent` then `contains`.
 - `callers` / `callees` — sugar for `in --kind=calls` / `out --kind=calls`. Most pivots want call edges; this drops `uses`/`imports`/`references` noise without typing the flag.
-- `read` (or `body`) — dump the focused node's full body inline (capped at 200 lines). Folds *find this node* + *Read its source* into one call, so `navigate "@foo" read` returns the function bytes without a separate Read.
+- `read` (or `body`) — dump the focused node's full body inline (default 200 lines). Folds *find this node* + *Read its source* into one call, so `navigate "@foo" read` returns the function bytes without a separate Read. Pass an explicit cap with `read N` (e.g. `read 30`). On file nodes the indent walker has nothing to walk, so `read` flat-dumps the first N lines verbatim.
 - Single-letter aliases for chained calls: `i`=in, `o`=out, `m`=methods, `p`=parent, `s`=siblings, `r`=rat (no alias for `c` to keep `coc` and `contains` unambiguous).
 - `[N]` — focus on the Nth item from the most recent listing (e.g. `[3]`)
 - `back` — pop history (returns to the previous focus)
@@ -1402,7 +1402,8 @@ The renderer announces non-obvious substitutions so you can verify them, not bli
 - `> also near: foo, bar, baz  (pivot with @<label>)` — non-exact matches surface 3-4 near-miss candidates inline. Use them to pivot without a second call.
 - `> picked [N] <label>` — confirms which item was promoted from the previous listing. After a long chain this saves you guessing at which one was selected.
 - `chain: @X → methods(14) → 6→@.foo() → in(3)` — one-line summary of multi-op chains. `!err` segments mean an op failed; the chain aborts at the first failure rather than silently overwriting the result.
-- `chain aborted at \`X\` — fix and rerun (remaining: ...)` — the chain stopped because an op errored or returned a disambiguation listing. Address the failure (pick from the list, fix the typo, etc.) before chaining further.
+- `chain aborted at \`X\` — fix and rerun (remaining: ...)` — the chain stopped because an op errored. Address the failure (fix the typo, etc.) before chaining further.
+- `chain paused at \`X\` — pick [N] to resume (queued for auto-replay: ...)` — the chain hit a disambiguation listing. The remaining ops are stored on the cursor and will replay automatically when you pick. Just call `navigate --session <id> 3` (no need to retype the chain tail). The queue is dropped if your next op is anything other than a pick.
 
 ### Resuming a session
 

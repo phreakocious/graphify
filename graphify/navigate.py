@@ -123,6 +123,12 @@ class Cursor:
     last_pivot: str | None = None
     graph_path: str = DEFAULT_GRAPH_PATH
     created_at: float = 0.0  # epoch seconds; 0 means never persisted
+    # Ops queued behind a disambig abort. When the next call resolves
+    # the disambig (e.g. caller types `[N]` to pick), these replay
+    # automatically after the pick so the agent doesn't re-type the
+    # rest of the chain. Cleared on `back`/`reset` or if the next call
+    # starts with a non-pick op (treat it as an override).
+    queued_ops: list[str] = field(default_factory=list)
 
     @classmethod
     def load(cls, path: Path) -> "Cursor":
@@ -1755,6 +1761,23 @@ def navigate(ops: list[str] | str, *,
                                    show_history=show_history)
     else:
         idx = label_index(G)
+        # Drain any queue from a prior disambig abort. If the caller's
+        # first op is a pick (`3` / `[3]`), append the queue *after*
+        # their ops so the pick happens first, then the queued tail
+        # replays. If the caller's first op is anything else (a new
+        # focus, a different pivot, `back`, etc.), they've moved on —
+        # drop the queue silently so it can't surprise them downstream.
+        if cursor.queued_ops:
+            first = ops[0].strip() if ops else ""
+            is_pick = first.isdigit() or (first.startswith("[")
+                                           and first.endswith("]")
+                                           and first[1:-1].isdigit())
+            if is_pick:
+                trace.append(
+                    f"  > resuming queued ops: {' '.join(cursor.queued_ops)}"
+                )
+                ops = list(ops) + list(cursor.queued_ops)
+            cursor.queued_ops = []
         # Index-based iteration so ops can consume a following arg
         # (currently `read N` / `body N` for an explicit line cap).
         op_i = 0
@@ -1847,6 +1870,9 @@ def navigate(ops: list[str] | str, *,
                     if cursor.pop():
                         cursor.last_listing = []
                         cursor.last_pivot = None
+                        # User stepped back — any queued ops from a prior
+                        # disambig are no longer on the intended path.
+                        cursor.queued_ops = []
                         last_data = _frontier_data(G, communities, cursor,
                                                    extracted_only=extracted_only,
                                                    min_confidence=min_confidence,
@@ -1940,17 +1966,23 @@ def navigate(ops: list[str] | str, *,
             #   1. error: nothing useful for downstream to build on.
             #   2. @-disambig: a pick is required before pivots make sense.
             if last_data and last_data.get("type") == "error":
-                if len(ops) > 1:
+                remaining = ops[op_i:]
+                if len(ops) > 1 and remaining:
                     trace.append(
                         f"  chain aborted at `{op_str}` — fix and rerun "
-                        f"(remaining: {' '.join(o for o in ops[ops.index(op) + 1:])})"
+                        f"(remaining: {' '.join(remaining)})"
                     )
                 break
             if cursor.last_pivot == "@-disambig":
-                if len(ops) > 1 and op != ops[-1]:
+                # ops.index(op) is wrong with the index-based iteration
+                # because op_i has already advanced past the current op.
+                # Use op_i directly: it now points at the next op.
+                remaining = ops[op_i:]
+                if remaining:
+                    cursor.queued_ops = list(remaining)
                     trace.append(
-                        f"  chain aborted at `{op_str}` — pick [N] then resume "
-                        f"(remaining: {' '.join(o for o in ops[ops.index(op) + 1:])})"
+                        f"  chain paused at `{op_str}` — pick [N] to resume "
+                        f"(queued for auto-replay: {' '.join(remaining)})"
                     )
                 break
 
