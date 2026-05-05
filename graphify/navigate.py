@@ -1395,7 +1395,7 @@ def _render_frontier_text(data: dict, cursor: Cursor, *, show_ops: bool, md: boo
         # show_ops controls whether subsequent frontiers carry the line.
         msg = data.get("message", "no cursor.")
         return (msg + "\n  ops: @<label> to focus · in | out | methods | contains | "
-                "coc | rat | inh | parent | siblings | callers | callees | read")
+                "coc | rat | inh | parent | siblings | callers | callees | read | filter <rgx>")
 
     n = data["current"]
     cid = n.get("community", "?")
@@ -1667,7 +1667,7 @@ def _render_frontier_text(data: dict, cursor: Cursor, *, show_ops: bool, md: boo
         # `parent → contains --bodies` even when sitting on the function they
         # wanted. The discoverability gap defeated the whole closed-loop intent.
         ops_line = ("  ops: in | out | methods | contains | coc | rat | inh | parent | "
-                    "siblings | callers | callees | dependents | dependencies | read")
+                    "siblings | callers | callees | dependents | dependencies | read | filter <rgx>")
         if data.get("show_history"):
             ops_line += " | back | reset"
         ops_line += " | @<label> | [N]"
@@ -1744,7 +1744,19 @@ def _render_listing_text(data: dict, *, show_ops: bool, md: bool = False) -> str
     kinds_tag = ""
     if data.get("kinds"):
         kinds_tag = f" [--kind={','.join(data['kinds'])}]"
-    header = f"  {data['pivot']}{kinds_tag} ({data['total']})"
+    # When the listing was produced by `filter`, surface the from-count
+    # inline as `(M of N)` so the agent immediately sees how many rows
+    # were excluded — same place the unfiltered count would be. When the
+    # regex failed to compile and fell back to substring match, append
+    # `, substring` so the agent knows their pattern wasn't read as a
+    # regex (escaping `.[(` etc would be re-tried).
+    if data.get("filter"):
+        finfo = data["filter"]
+        mode_tag = "" if finfo["mode"] == "regex" else f", {finfo['mode']}"
+        count_str = f"({data['total']} of {finfo['from']}{mode_tag})"
+    else:
+        count_str = f"({data['total']})"
+    header = f"  {data['pivot']}{kinds_tag} {count_str}"
     if data["total"] > data["showing"]:
         sort = data.get("sort") or ""
         if sort:
@@ -3038,6 +3050,64 @@ def navigate(ops: list[str] | str, *,
                     # Non-modifying op: don't disturb last_listing/last_pivot
                     # so a chained `coc summary` then [N] doesn't blow up
                     # any prior listing context.
+            elif op_str in ("filter", "f"):
+                # Narrow `cursor.last_listing` by a label regex. Works after
+                # any listing producer (methods, siblings, in/out, contains,
+                # callers/callees, coc, @-disambig). Renumbers picks 1-based
+                # against the filtered view so `methods filter "_deficit" 2`
+                # picks the second match without arithmetic. Falls back to a
+                # case-insensitive substring match when the pattern fails to
+                # compile as a regex — saves the agent from escaping a stray
+                # `(`/`.` for a quick narrow.
+                next_arg = ops[op_i] if op_i < len(ops) else None
+                pattern = next_arg.strip() if next_arg else ""
+                if not pattern:
+                    last_data = {"type": "error",
+                                 "message": "filter needs a pattern: `filter <regex>`."}
+                elif not cursor.last_listing:
+                    last_data = {"type": "error",
+                                 "message": "no listing to filter. run a pivot first "
+                                            "(methods, siblings, in/out, contains, …)."}
+                else:
+                    op_i += 1  # consume the pattern
+                    try:
+                        rx = re.compile(pattern, re.IGNORECASE)
+                        match_label = lambda s: bool(rx.search(s))  # noqa: E731
+                        mode = "regex"
+                    except re.error:
+                        needle = pattern.lower()
+                        match_label = lambda s: needle in s.lower()  # noqa: E731
+                        mode = "substring"
+                    prior_count = len(cursor.last_listing)
+                    prior_pivot = cursor.last_pivot or "(listing)"
+                    kept_ids = [nid for nid in cursor.last_listing
+                                if match_label(G.nodes[nid].get("label", nid))]
+                    last_data = _listing_data(
+                        G, kept_ids,
+                        f"{prior_pivot} · filter /{pattern}/",
+                        edge_for=None,
+                        total=len(kept_ids),
+                        sort_label=f"label {mode}",
+                        limit=effective_limit,
+                        # Already collapsed at the upstream listing step;
+                        # `cursor.last_listing` only carries representative
+                        # ids, so re-collapsing is a no-op that adds risk.
+                        collapse_dupes=False,
+                        extracted_only=extracted_only,
+                    )
+                    last_data["filter"] = {
+                        "pattern": pattern,
+                        "mode": mode,
+                        "matched": len(kept_ids),
+                        "from": prior_count,
+                    }
+                    cursor.last_listing = [it["id"] for it in last_data["items"]]
+                    cursor.last_pivot = f"{prior_pivot}·filter"
+                    if not kept_ids:
+                        mode_note = "" if mode == "regex" else f" ({mode})"
+                        trace.append(
+                            f"  > filter /{pattern}/{mode_note} matched 0 of {prior_count}"
+                        )
             elif (pkey := PIVOT_KEYS.get(op_str)) is not None:
                 # pivot
                 if not cursor.current:

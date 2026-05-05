@@ -1312,6 +1312,7 @@ Op forms:
 - `dependents` / `dependencies` — transitive callers / callees walked via call edges with default depth 3 (override with `--depth N`). `dependents` answers "what depends on X?", `dependencies` answers "what does X depend on?". Sugar over `callers --depth=3` / `callees --depth=3` with verbs that map onto coupling rather than graph direction.
 - `coc summary` — two-token op that returns the structural shape of the focus's coc community (top hubs, file/symbol/rationale composition, dominant edge mix) instead of enumerating members. Cheap on big communities (`coc(1085)` becomes a one-screen answer).
 - `read` (or `body`) — dump the focused node's full body inline (default 200 lines). Folds *find this node* + *Read its source* into one call, so `navigate "@foo" read` returns the function bytes without a separate Read. Pass an explicit cap with `read N` (e.g. `read 30`). On file nodes the indent walker has nothing to walk, so `read` flat-dumps the first N lines verbatim.
+- `filter <regex>` (or `f <regex>`) — narrow the most recent listing by regex against the row label. Works after any listing producer (`methods`, `siblings`, `in`/`out`, `contains`, `callers`/`callees`, `coc`, `@`-disambig). Renumbers picks 1-based against the filtered view, so `methods filter "_deficit" 2` lands on the second match without arithmetic. Falls back to a case-insensitive substring match when the pattern fails to compile as a regex (the header surfaces `, substring` so you know fallback fired). Use this instead of enumerating a 30-method class with `methods` + visual scan.
 - Single-letter aliases for chained calls: `i`=in, `o`=out, `m`=methods, `p`=parent, `s`=siblings, `r`=rat (no alias for `c` to keep `coc` and `contains` unambiguous).
 - `[N]` — focus on the Nth item from the most recent listing (e.g. `[3]`)
 - `back` — pop history (returns to the previous focus)
@@ -1396,6 +1397,32 @@ graphify navigate "@GeometryAnalyzer" coc --explain-cost
 # When you do commit, raise --limit only as far as you need.
 graphify navigate "@GeometryAnalyzer" coc --limit 50
 ```
+
+### Worked example — narrow a 30-method class with `filter`
+
+A class with 30+ methods (or `coc` of 100+ siblings, or 60 callers in `↗in`)
+is hard to scan. `filter <regex>` narrows the *most recent listing* on label,
+without re-running the pivot:
+
+```bash
+# All methods on a big class, then keep only the *_deficit metrics.
+graphify navigate "@SpirographGeometry" methods filter "_deficit"
+#   methods · filter /_deficit/ (4 of 31)
+#     [ 1] .closure_deficit()              ...
+#     [ 2] .cardinal_deficit()             ...
+#     [ 3] .symmetry_deficit()             ...
+#     [ 4] .closure_deficit_score()        ...
+
+# Pick directly — `[N]` indexes the *filtered* set 1-based.
+graphify navigate "@SpirographGeometry" methods filter "_deficit" 1 read
+
+# Or filter siblings to find Geometry subclasses by naming pattern.
+graphify navigate "@GeometryAnalyzer" siblings filter "^Spiro"
+```
+
+When the pattern fails to compile as a regex (a stray `(`, `[`, etc), the
+header tags `, substring` and the same pattern is matched as a literal
+substring — keeps quick narrows from costing an escaping-debug round trip.
 
 ### Useful flags
 

@@ -1701,3 +1701,130 @@ def test_peek_subcommand_no_session_write(tmp_path, monkeypatch):
     assert not (tmp_path / "graphify-out" / ".navigate").exists(), (
         "peek should not create a .navigate session directory"
     )
+
+
+def _make_class_with_methods(method_labels: list[str]) -> tuple[list[dict], list[dict]]:
+    """Build a class node with N method children, all in the same file."""
+    nodes = [
+        {"id": "f", "label": "a.py", "file_type": "code",
+         "source_file": "a.py", "source_location": "L1"},
+        {"id": "cls", "label": "Foo", "file_type": "code",
+         "source_file": "a.py", "source_location": "L2",
+         "node_kind": "class"},
+    ]
+    links = [
+        {"source": "f", "target": "cls", "relation": "contains",
+         "confidence": "EXTRACTED"},
+    ]
+    for i, lbl in enumerate(method_labels):
+        nid = f"m{i}"
+        nodes.append({
+            "id": nid, "label": lbl,
+            "file_type": "code",
+            "source_file": "a.py",
+            "source_location": f"L{10 + i}",
+            "node_kind": "impl_method",
+        })
+        links.append({
+            "source": "cls", "target": nid, "relation": "method",
+            "confidence": "EXTRACTED",
+        })
+    return nodes, links
+
+
+def test_filter_op_narrows_listing_by_regex(tmp_path, monkeypatch):
+    """Lap-13: `filter <regex>` chain op narrows the most recent listing
+    by regex against the row label. Works after any listing producer
+    (methods, siblings, in/out, contains, …) without needing a per-op
+    --filter flag."""
+    from graphify.navigate import navigate
+    nodes, links = _make_class_with_methods([
+        ".compute_metrics()",
+        ".closure_deficit()",
+        ".peak_frequency()",
+        ".cardinal_deficit()",
+        ".asymmetry_score()",
+    ])
+    _write_graph(tmp_path / "graphify-out", nodes, links)
+    monkeypatch.chdir(tmp_path)
+    out = navigate(["@Foo", "methods", "filter", "_deficit"],
+                   session=False, fmt="text")
+    # Only the two _deficit methods should survive.
+    assert "closure_deficit" in out, f"closure_deficit dropped:\n{out}"
+    assert "cardinal_deficit" in out, f"cardinal_deficit dropped:\n{out}"
+    assert "compute_metrics" not in out, f"compute_metrics leaked:\n{out}"
+    assert "peak_frequency" not in out, f"peak_frequency leaked:\n{out}"
+    # Header surfaces the from-count so the agent sees what was excluded.
+    assert "(2 of 5)" in out, f"filter header missing match-count:\n{out}"
+
+
+def test_filter_op_substring_fallback_on_invalid_regex(tmp_path, monkeypatch):
+    """A pattern that fails to compile as a regex (`(unclosed`) falls back
+    to case-insensitive substring match — saves the agent from escaping
+    special chars for a quick narrow."""
+    from graphify.navigate import navigate
+    nodes, links = _make_class_with_methods([
+        ".foo(unclosed",
+        ".bar()",
+        ".baz()",
+    ])
+    _write_graph(tmp_path / "graphify-out", nodes, links)
+    monkeypatch.chdir(tmp_path)
+    out = navigate(["@Foo", "methods", "filter", "(unclosed"],
+                   session=False, fmt="text")
+    # The literal `(unclosed` is an invalid regex; substring fallback
+    # finds the foo method that contains the literal sequence.
+    assert "foo(unclosed" in out, f"substring fallback failed:\n{out}"
+    # Header surfaces `, substring` so the agent knows the regex didn't
+    # compile and fallback fired — they may want to escape and re-run.
+    assert ", substring" in out, (
+        f"header should flag substring fallback:\n{out}"
+    )
+
+
+def test_filter_op_errors_when_no_prior_listing(tmp_path, monkeypatch):
+    """Calling `filter` without a prior listing op is a useful error,
+    not a silent empty result."""
+    from graphify.navigate import navigate
+    nodes = [
+        {"id": "f", "label": "foo()", "file_type": "code",
+         "source_file": "a.py", "source_location": "L1"},
+    ]
+    _write_graph(tmp_path / "graphify-out", nodes, [])
+    monkeypatch.chdir(tmp_path)
+    out = navigate(["@foo()", "filter", "anything"],
+                   session=False, fmt="text")
+    assert "no listing to filter" in out, (
+        f"filter without prior listing should error clearly:\n{out}"
+    )
+
+
+def test_filter_renumbers_picks_after_narrow(tmp_path, monkeypatch):
+    """After `filter`, `[N]` indexes into the filtered set 1-based.
+    `methods filter _deficit 1` should land on the first matching method,
+    not the first method of the original listing."""
+    from graphify.navigate import navigate
+    nodes, links = _make_class_with_methods([
+        ".alpha()",       # 1 in unfiltered
+        ".beta_deficit()", # would be 2 unfiltered, 1 after filter
+        ".gamma()",       # 3 unfiltered, dropped after filter
+        ".delta_deficit()", # 4 unfiltered, 2 after filter
+    ])
+    _write_graph(tmp_path / "graphify-out", nodes, links)
+    monkeypatch.chdir(tmp_path)
+    # methods → filter _deficit → pick [1] should focus beta_deficit
+    out = navigate(["@Foo", "methods", "filter", "_deficit", "[1]"],
+                   session=False, fmt="text")
+    assert "beta_deficit" in out, (
+        f"pick [1] after filter should land on first match:\n{out}"
+    )
+    # The original alpha (would be [1] without filter) must NOT be the
+    # focused node — verify its label only appears as a non-focus mention
+    # if at all. The frontier card shows the focused label prominently;
+    # check the line starting with "now:" or the focus header.
+    focus_lines = [ln for ln in out.splitlines()
+                   if ln.startswith("now:") or "focus" in ln.lower()]
+    head = "\n".join(focus_lines) if focus_lines else out.splitlines()[0]
+    assert "alpha" not in head, (
+        f"focus should be beta_deficit, not alpha:\n{out}"
+    )
