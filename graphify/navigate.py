@@ -153,6 +153,118 @@ def _short_src(src: str | None, loc: str | None) -> str:
     return short
 
 
+# In-process cache for per-file metadata (mtime, line count, git mtime). The
+# same file appears under many nodes — `_node_summary` is called once per
+# rendered item, but we only want one stat per file per `navigate` call.
+_META_CACHE: dict[str, dict] = {}
+_GIT_LOG_CACHE: dict[str, dict[str, int]] = {}  # repo_root → {file: last_commit_unixtime}
+
+
+def _file_meta(src: str | None) -> dict:
+    """Best-effort per-file metadata: filesystem mtime, line count, git last-commit time.
+
+    Cached per file per process — multiple nodes in the same listing pointing
+    at the same file pay the stat cost once. Returns {} on missing file or
+    permission error so renderers can degrade gracefully.
+    """
+    if not src:
+        return {}
+    if src in _META_CACHE:
+        return _META_CACHE[src]
+    out: dict = {}
+    try:
+        st = Path(src).stat()
+        out["mtime"] = st.st_mtime
+        out["size"] = st.st_size
+    except OSError:
+        _META_CACHE[src] = out
+        return out
+    # Line count is small for typical source — read once, cache. Skip for
+    # very large files (>1MB) to avoid surprises.
+    if out.get("size", 0) <= 1_000_000:
+        try:
+            with open(src, "rb") as f:
+                out["lines"] = sum(1 for _ in f)
+        except OSError:
+            pass
+    # Git last-commit time, if we can find one. Keyed off the repo root.
+    git_t = _git_last_commit_time(src)
+    if git_t is not None:
+        out["git_mtime"] = git_t
+    _META_CACHE[src] = out
+    return out
+
+
+def _git_last_commit_time(src: str) -> int | None:
+    """Last-commit unixtime for `src` in its containing git repo, if any.
+
+    Probes once per repo: a single `git log --format=%at --name-only HEAD`
+    yields a {file: last_commit_unixtime} map for every tracked file. Cheap
+    relative to running `git log -1 -- <file>` per node (which would be N
+    forks for N nodes). Falls back silently if anything goes wrong.
+    """
+    import os as _os
+    import subprocess as _sp
+    abspath = _os.path.abspath(src)
+    cur = _os.path.dirname(abspath)
+    repo_root = None
+    while cur and cur != "/":
+        if _os.path.isdir(_os.path.join(cur, ".git")):
+            repo_root = cur
+            break
+        nxt = _os.path.dirname(cur)
+        if nxt == cur:
+            break
+        cur = nxt
+    if not repo_root:
+        return None
+    if repo_root not in _GIT_LOG_CACHE:
+        _GIT_LOG_CACHE[repo_root] = {}
+        try:
+            # `git log --name-only --format=%at` yields blocks of:
+            #   <unixtime>
+            #   path/one
+            #   path/two
+            # for each commit. We only keep the latest (first) sighting per file.
+            r = _sp.run(
+                ["git", "-C", repo_root, "log", "--name-only", "--format=%at", "HEAD"],
+                capture_output=True, text=True, timeout=5,
+            )
+            if r.returncode == 0:
+                cur_t = 0
+                for line in r.stdout.splitlines():
+                    line = line.strip()
+                    if not line:
+                        continue
+                    if line.isdigit():
+                        cur_t = int(line)
+                        continue
+                    if cur_t and line not in _GIT_LOG_CACHE[repo_root]:
+                        _GIT_LOG_CACHE[repo_root][line] = cur_t
+        except (_sp.TimeoutExpired, FileNotFoundError, OSError):
+            pass
+    rel = _os.path.relpath(abspath, repo_root)
+    return _GIT_LOG_CACHE[repo_root].get(rel)
+
+
+def _humanize_age(epoch: float) -> str:
+    """Compact relative time: 1h, 3d, 2mo, 1y. Empty for unknown."""
+    if not epoch:
+        return ""
+    delta = time.time() - epoch
+    if delta < 0:
+        return ""
+    if delta < 3600:
+        return f"{int(delta // 60)}m"
+    if delta < 86400:
+        return f"{int(delta // 3600)}h"
+    if delta < 86400 * 30:
+        return f"{int(delta // 86400)}d"
+    if delta < 86400 * 365:
+        return f"{int(delta // (86400 * 30))}mo"
+    return f"{int(delta // (86400 * 365))}y"
+
+
 def _bin_confidence(edges: list[dict]) -> str:
     """Compress edge list to '11ext, 3inf@0.4-0.6'."""
     ext = sum(1 for e in edges if e.get("confidence") == "EXTRACTED")
@@ -263,15 +375,46 @@ def _format_hidden(drops: dict[str, int]) -> str:
 
 def _node_summary(G: nx.DiGraph, nid: str) -> dict:
     a = G.nodes[nid]
+    src = a.get("source_file")
+    meta = _file_meta(src) if src else {}
     return {
         "id": nid,
         "label": a.get("label", nid),
         "community": a.get("community"),
         "degree": G.in_degree(nid) + G.out_degree(nid),
-        "source_file": a.get("source_file"),
+        "source_file": src,
         "source_location": a.get("source_location"),
         "file_type": a.get("file_type", ""),
+        # Per-file metadata — saves the agent from running stat/git for the
+        # most common follow-up questions ("how stale is this?", "how big?").
+        "mtime": meta.get("mtime"),
+        "git_mtime": meta.get("git_mtime"),
+        "lines": meta.get("lines"),
+        "size": meta.get("size"),
     }
+
+
+def _meta_tag(item: dict) -> str:
+    """Compact ' · 3d · 482ln' suffix for a node's file metadata.
+
+    Prefers git last-commit time (semantically meaningful "when did this
+    actually change") over fs mtime ("when did I last touch it locally").
+    Line count is added for code files only and only when known. Returns ''
+    if no metadata is available so callers can append unconditionally.
+    """
+    parts: list[str] = []
+    age_src = item.get("git_mtime") or item.get("mtime")
+    if age_src:
+        age = _humanize_age(age_src)
+        if age:
+            tag = age
+            if item.get("git_mtime"):
+                tag = "g" + tag  # `g3d` distinguishes git mtime from local fs mtime
+            parts.append(tag)
+    lines = item.get("lines")
+    if isinstance(lines, int) and lines > 0:
+        parts.append(f"{lines}ln")
+    return (" · " + " · ".join(parts)) if parts else ""
 
 
 def _frontier_data(G: nx.DiGraph, communities: dict[int, list[str]],
@@ -533,7 +676,7 @@ def _render_frontier_text(data: dict, cursor: Cursor, *, show_ops: bool) -> str:
         ftype_tag = f" [{ft}]"
 
     p = data["pivots"]
-    header = f"@ {n['label']}  · c{cid} · deg={n['degree']} · {src}{ftype_tag}"
+    header = f"@ {n['label']}  · c{cid} · deg={n['degree']} · {src}{ftype_tag}{_meta_tag(n)}"
 
     def _glyph(prefix: str, pv: dict, with_conf: bool = False) -> str:
         # Format: glyph(count[: conf-mix][; +Ninf hidden][; +M via methods])
@@ -709,9 +852,21 @@ def _render_listing_text(data: dict, *, show_ops: bool) -> str:
         # singletons isn't useful if they appear only once — they'd still
         # take a row in the table, so just elide the table for them).
         out.append("  files:")
+        # Hoist file metadata (age, line count) onto the table row when present
+        # so it's not repeated under every item that shares that file.
+        per_file_meta: dict[str, dict] = {}
+        for it in items:
+            sf = it.get("source_file") or ""
+            if sf and sf not in per_file_meta:
+                per_file_meta[sf] = {
+                    "git_mtime": it.get("git_mtime"),
+                    "mtime": it.get("mtime"),
+                    "lines": it.get("lines"),
+                }
         for src, letter in file_to_letter.items():
             short = "/".join(Path(src).parts[-2:]) if Path(src).parts else src
-            out.append(f"    [{letter}] {short}")
+            meta_str = _meta_tag(per_file_meta.get(src, {}))
+            out.append(f"    [{letter}] {short}{meta_str}")
 
     # Mark the trust boundary: items are sorted EXTRACTED-first, so the
     # transition from EXTRACTED to non-EXTRACTED is the line below which the
@@ -754,7 +909,9 @@ def _render_listing_text(data: dict, *, show_ops: bool) -> str:
             label = label[:43] + "…"
         cid = item.get("community", -1)
         deg = item.get("degree", 0)
-        out.append(f"    [{i:>2}] {label:<44} c{cid:<3} d={deg:<4} {src_str}{ft_tag}{edge_tag}")
+        # Only show per-item meta when the file-table didn't already absorb it.
+        meta = "" if (use_table and src in file_to_letter) else _meta_tag(item)
+        out.append(f"    [{i:>2}] {label:<44} c{cid:<3} d={deg:<4} {src_str}{ft_tag}{edge_tag}{meta}")
         # Optional body preview: surfaces stub/redirect/decorator-only patterns
         # without an actual Read. Truncate long lines so the preview doesn't
         # blow out the line budget; one signal per line is enough.
