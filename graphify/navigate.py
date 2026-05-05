@@ -61,21 +61,33 @@ def load_graph(graph_path: str | Path) -> tuple[nx.DiGraph, dict[int, list[str]]
         cid = attrs.get("community")
         if cid is not None:
             communities[cid].append(nid)
-    # Auto-name communities by their highest-degree member. Skip rationale
-    # nodes (they're docstrings/comments — labels would be sentence-shaped
-    # rather than identifier-shaped) and cap label length so it stays compact.
+    # Auto-name communities by their highest-degree non-file, non-rationale
+    # member. File nodes accumulate `defined_in` edges from every symbol
+    # they contain plus `imports` edges, which inflates their degree way
+    # past any single semantic node. On the zero-tvm engine cluster a
+    # 31-line shared `types.ts` was beating `buildDecodeEngine` for the
+    # cluster name purely because every symbol in the file linked back
+    # to it. The file isn't the semantic center; it's just the union.
+    #
+    # Prefer code symbols. Fall back to file nodes only when the cluster
+    # has nothing else (rare — usually a community of just a couple of
+    # standalone files).
     community_labels: dict[int, str] = {}
     for cid, members in communities.items():
+        non_rat = [m for m in members
+                   if G.nodes[m].get("file_type") != "rationale"]
+        symbols = [m for m in non_rat if not _is_file_node(G, m)]
+        pick_pool = symbols or non_rat  # fall back to file if no symbols
+        if not pick_pool:
+            continue
         ranked = sorted(
-            (m for m in members
-             if G.nodes[m].get("file_type") != "rationale"),
+            pick_pool,
             key=lambda n: -(G.in_degree(n) + G.out_degree(n)),
         )
-        if not ranked:
-            continue
         raw = G.nodes[ranked[0]].get("label", ranked[0])
-        # Strip whitespace, collapse multi-line, cap length so the label
-        # doesn't blow out frontier/listing line budgets.
+        # Strip whitespace, collapse multi-line, cap label length so the
+        # frontier/listing line budgets aren't blown out by sentence-shaped
+        # labels (a docstring rationale that slipped through, etc.).
         clean = " ".join(str(raw).split())
         if len(clean) > 28:
             clean = clean[:27] + "…"

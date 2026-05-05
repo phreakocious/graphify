@@ -139,6 +139,50 @@ def test_queued_ops_dropped_on_non_pick_followup(tmp_path, monkeypatch):
     assert "resuming queued ops" not in out3
 
 
+def test_community_labels_prefer_symbols_over_files(tmp_path, monkeypatch):
+    """Friction 9: cluster labels pick the head, not the most-meaningful
+    member. File nodes accumulate `defined_in` from every symbol → high
+    degree → label gets `types.ts` instead of `buildDecodeEngine`. Fix:
+    prefer non-file nodes, fall back to file only when no symbols exist."""
+    import json as _json
+    from graphify.navigate import load_graph
+    nodes = [
+        # File node — high in-degree from defined_in edges
+        {"id": "types", "label": "types.ts", "file_type": "code",
+         "source_file": "types.ts", "source_location": "L1", "community": 0},
+        # Code symbol with lower direct degree but that's the semantic center
+        {"id": "engine", "label": "buildDecodeEngine()", "file_type": "code",
+         "source_file": "engine.ts", "source_location": "L10", "community": 0},
+        {"id": "x1", "label": "x1", "file_type": "code",
+         "source_file": "types.ts", "source_location": "L5", "community": 0},
+        {"id": "x2", "label": "x2", "file_type": "code",
+         "source_file": "types.ts", "source_location": "L7", "community": 0},
+        {"id": "x3", "label": "x3", "file_type": "code",
+         "source_file": "types.ts", "source_location": "L9", "community": 0},
+    ]
+    # types.ts has degree 4 (3 defined_in + 1 from engine). Among the
+    # non-file nodes, engine has degree 4 (all xs call it + edge to types),
+    # while x1/x2/x3 have degree 2 each. With the file filter, engine
+    # wins on degree as the semantic center.
+    links = [
+        {"source": "x1", "target": "types", "relation": "defined_in", "confidence": "EXTRACTED"},
+        {"source": "x2", "target": "types", "relation": "defined_in", "confidence": "EXTRACTED"},
+        {"source": "x3", "target": "types", "relation": "defined_in", "confidence": "EXTRACTED"},
+        {"source": "engine", "target": "types", "relation": "uses", "confidence": "EXTRACTED"},
+        {"source": "x1", "target": "engine", "relation": "calls", "confidence": "EXTRACTED"},
+        {"source": "x2", "target": "engine", "relation": "calls", "confidence": "EXTRACTED"},
+        {"source": "x3", "target": "engine", "relation": "calls", "confidence": "EXTRACTED"},
+    ]
+    graph_dir = tmp_path / "graphify-out"
+    graph_dir.mkdir()
+    (graph_dir / "graph.json").write_text(_json.dumps(
+        {"nodes": nodes, "links": links}), encoding="utf-8")
+    G, communities = load_graph(graph_dir / "graph.json")
+    label = G.graph["community_labels"][0]
+    assert "types.ts" not in label, f"file node won label: {label}"
+    assert "buildDecodeEngine" in label, f"expected buildDecodeEngine, got: {label}"
+
+
 def test_resolve_works_on_undirected_graph():
     """`path` and `explain` subcommands load via networkx node_link_graph
     which yields an undirected Graph. _rank_match used to call
