@@ -44,7 +44,13 @@ def _rebuild_code(watch_path: Path, *, follow_symlinks: bool = False) -> bool:
             try:
                 existing = json.loads(existing_graph.read_text(encoding="utf-8"))
                 code_ids = {n["id"] for n in existing.get("nodes", []) if n.get("file_type") == "code"}
-                sem_nodes = [n for n in existing.get("nodes", []) if n.get("file_type") != "code"]
+                # Exclude external-module stubs from the carry-forward: they're
+                # pure derivatives of import edges and get regenerated each
+                # rebuild by build_from_json. Carrying them forward poisons the
+                # graph with stale-shape stubs (e.g. missing source_file added
+                # later), which then trip the validator on every reload.
+                sem_nodes = [n for n in existing.get("nodes", [])
+                             if n.get("file_type") not in ("code", "external")]
                 sem_edges = [e for e in existing.get("links", existing.get("edges", []))
                              if e.get("confidence") in ("INFERRED", "AMBIGUOUS")
                              or (e.get("source") not in code_ids and e.get("target") not in code_ids)]

@@ -64,9 +64,41 @@ def test_imports_to_external_module_creates_stub_node():
     assert "json" in G.nodes
     assert G.nodes["numpy"]["file_type"] == "external"
     assert G.nodes["numpy"]["node_kind"] == "external_module"
+    # Empty source_file/source_location so re-validate on graph.json reload
+    # (navigate.py:65 calls build_from_json again) doesn't warn that these
+    # required fields are missing.
+    assert G.nodes["numpy"]["source_file"] == ""
+    assert G.nodes["numpy"]["source_location"] == ""
     assert G.has_edge("foo_py", "numpy")
     assert G.has_edge("foo_py", "json")
     assert G.edges["foo_py", "numpy"]["relation"] == "imports"
+
+
+def test_external_stub_nodes_pass_revalidation():
+    """Round-trip: build a graph with external stubs, serialize like
+    navigate would (node_link_data), then revalidate. Must produce zero
+    'missing required field' errors. Regression for noisy validator
+    warnings on every navigate call."""
+    import networkx as nx
+    from graphify.validate import validate_extraction
+    ext = {
+        "nodes": [{"id": "foo_py", "label": "foo.py", "file_type": "code",
+                   "source_file": "foo.py", "source_location": "L1"}],
+        "edges": [
+            {"source": "foo_py", "target": "vite", "relation": "imports_from",
+             "confidence": "EXTRACTED", "source_file": "foo.py",
+             "source_location": "L3", "weight": 1.0},
+        ],
+        "input_tokens": 0, "output_tokens": 0,
+    }
+    G = build_from_json(ext, directed=True)
+    serialized = nx.node_link_data(G)
+    if "edges" not in serialized and "links" in serialized:
+        serialized["edges"] = serialized["links"]
+    errors = validate_extraction(serialized)
+    schema_errors = [e for e in errors if "missing required field" in e
+                     or "invalid file_type" in e]
+    assert schema_errors == [], f"unexpected schema errors: {schema_errors}"
 
 
 def test_non_import_edges_to_unknown_target_still_dropped():

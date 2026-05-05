@@ -91,7 +91,12 @@ def build_from_json(extraction: dict, *, directed: bool = False) -> nx.Graph:
                 # Use the raw ID as the label so `numpy` displays as numpy
                 # rather than a normalized stub. file_type=external lets
                 # navigate filter these out of code-only listings.
-                G.add_node(tgt, label=tgt, file_type="external", node_kind="external_module")
+                # source_file/source_location are empty (not a file we
+                # extracted) — required by the schema for downstream
+                # validate calls (e.g. navigate's reload of graph.json).
+                G.add_node(tgt, label=tgt, file_type="external",
+                           node_kind="external_module",
+                           source_file="", source_location="")
                 node_set.add(tgt)
                 norm_to_id[_normalize_id(tgt)] = tgt
             else:
