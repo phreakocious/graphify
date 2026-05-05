@@ -1828,3 +1828,152 @@ def test_filter_renumbers_picks_after_narrow(tmp_path, monkeypatch):
     assert "alpha" not in head, (
         f"focus should be beta_deficit, not alpha:\n{out}"
     )
+
+
+def test_frontier_header_disambiguates_focus_from_community(tmp_path, monkeypatch):
+    """Lap-13 field-report fix: `c3=DecodeEngine` reads like 'Atlas IS
+    DecodeEngine'. Header now uses `c3 hub:DecodeEngine` so the cluster
+    label is unambiguously the hub name, not the focused node."""
+    from graphify.navigate import navigate
+    # All distinct labels, no substring overlap. Atlas is the focus,
+    # DecodeEngine is the auto-hub (highest in-degree in c3).
+    nodes = [
+        {"id": "n_atlas", "label": "Atlas", "file_type": "code",
+         "source_file": "a.py", "source_location": "L1", "community": 3},
+        {"id": "n_engine", "label": "DecodeEngine", "file_type": "code",
+         "source_file": "b.py", "source_location": "L2", "community": 3},
+        {"id": "n_uno", "label": "alpha", "file_type": "code",
+         "source_file": "c.py", "source_location": "L3", "community": 3},
+        {"id": "n_duo", "label": "beta", "file_type": "code",
+         "source_file": "d.py", "source_location": "L4", "community": 3},
+    ]
+    links = [
+        # DecodeEngine wins as hub via highest combined in/out degree.
+        {"source": "n_uno", "target": "n_engine", "relation": "calls",
+         "confidence": "EXTRACTED"},
+        {"source": "n_duo", "target": "n_engine", "relation": "calls",
+         "confidence": "EXTRACTED"},
+        {"source": "n_engine", "target": "n_uno", "relation": "calls",
+         "confidence": "EXTRACTED"},
+    ]
+    _write_graph(tmp_path / "graphify-out", nodes, links)
+    monkeypatch.chdir(tmp_path)
+    out = navigate(["@Atlas"], session=False, fmt="text")
+    # Header line carries the focus + community info.
+    header = next((ln for ln in out.splitlines() if ln.startswith("@ ")), "")
+    assert "hub:" in header, f"header should mark cluster label as `hub:`:\n{out}"
+    assert "=" not in header.split("·")[1], (
+        f"the cluster segment of the header should not use `=`:\n{out}"
+    )
+
+
+def test_disambig_listing_suppresses_files_table(tmp_path, monkeypatch):
+    """Lap-13 field-report fix: on @-disambig listings the `[a-h]` file
+    letters and `[1-N]` pick numbers stack confusingly. Each row shows
+    its path inline; the table is just visual noise on disambig."""
+    from graphify.navigate import navigate
+    # Three same-label nodes across different files — hits the
+    # `len(items) >= 3` condition that would trigger the files-table.
+    nodes = []
+    for i, fp in enumerate(["a.py", "b.py", "c.py"]):
+        nodes.append({
+            "id": f"compile_{i}",
+            "label": "compile",
+            "file_type": "code",
+            "source_file": fp,
+            "source_location": f"L{10+i}",
+        })
+    _write_graph(tmp_path / "graphify-out", nodes, [])
+    monkeypatch.chdir(tmp_path)
+    out = navigate(["@compile"], session=False, fmt="text")
+    # Disambig fired (3 substring matches).
+    assert "ambiguous" in out, f"expected disambig listing:\n{out}"
+    # The files-table opens with `  files:` and lists `[a]` `[b]` etc.
+    # Neither should appear on a disambig listing.
+    assert "files:" not in out, (
+        f"files-table should not render on @-disambig:\n{out}"
+    )
+    # And the `[a]` / `[b]` letter prefixes shouldn't appear as table
+    # entries (they could legitimately appear in path text, but never
+    # as `    [a] <file>` table rows).
+    table_rows = [ln for ln in out.splitlines()
+                  if ln.lstrip().startswith(("[a] ", "[b] ", "[c] "))]
+    assert not table_rows, (
+        f"no `[letter] <file>` table rows on disambig:\n{out}"
+    )
+
+
+def test_one_shot_focus_does_not_persist_cursor(tmp_path, monkeypatch):
+    """Lap-13 field-report fix: a one-shot `@<label>` focus with no chain
+    depth and no explicit --session shouldn't write a cursor file —
+    the printed session id was suppressed in lap-12 but the cursor file
+    was still written and only swept 30 minutes later. Persist gate
+    now mirrors the print gate."""
+    from graphify.navigate import navigate
+    nodes = [
+        {"id": "f", "label": "foo()", "file_type": "code",
+         "source_file": "a.py", "source_location": "L1"},
+    ]
+    _write_graph(tmp_path / "graphify-out", nodes, [])
+    monkeypatch.chdir(tmp_path)
+    out = navigate(["@foo()"], fmt="text")  # default session=True
+    # No `session:` line printed (one-shot focus, no chain)…
+    assert "session:" not in out, (
+        f"one-shot focus shouldn't print session id:\n{out}"
+    )
+    # …and no cursor file written.
+    nav_dir = tmp_path / "graphify-out" / ".navigate"
+    if nav_dir.exists():
+        files = list(nav_dir.glob("*.json"))
+        assert not files, (
+            f"one-shot focus should not write cursor files, got: {files}"
+        )
+
+
+def test_label_index_dedups_same_label_and_nid(tmp_path):
+    """Regression: when a node's id and label normalize to the same key
+    (e.g. id='atlas', label='Atlas'), `label_index` used to append the
+    nid twice — turning `@Atlas` into a spurious disambig. The index
+    now tracks per-key membership."""
+    import networkx as nx
+    from graphify.navigate import label_index
+    G = nx.DiGraph()
+    G.add_node("atlas", label="Atlas")
+    G.add_node("engine", label="DecodeEngine")
+    idx = label_index(G)
+    # `_norm("Atlas")` == `_norm("atlas")` → both keys land on the same
+    # bucket. The bucket should contain "atlas" exactly once.
+    bucket = idx.get("atlas") or []
+    assert bucket.count("atlas") == 1, (
+        f"label_index should dedup same-label/same-nid entries, "
+        f"got {bucket}"
+    )
+
+
+def test_chained_walk_does_persist_cursor(tmp_path, monkeypatch):
+    """Counterpart to the one-shot test: a chain that walks 2 steps
+    (focus → pivot) sets `cursor.history` and SHOULD persist the cursor
+    so the agent can follow up via --session."""
+    from graphify.navigate import navigate
+    nodes = [
+        {"id": "f", "label": "Foo", "file_type": "code",
+         "source_file": "a.py", "source_location": "L1",
+         "node_kind": "class"},
+        {"id": "m", "label": ".bar()", "file_type": "code",
+         "source_file": "a.py", "source_location": "L5",
+         "node_kind": "impl_method"},
+    ]
+    links = [{"source": "f", "target": "m", "relation": "method",
+              "confidence": "EXTRACTED"}]
+    _write_graph(tmp_path / "graphify-out", nodes, links)
+    monkeypatch.chdir(tmp_path)
+    # @Foo → methods → [1] is a 2-step walk: focus (push), then pick (push).
+    out = navigate(["@Foo", "methods", "[1]"], fmt="text")
+    assert "session:" in out, (
+        f"multi-step walk should print session id:\n{out}"
+    )
+    nav_dir = tmp_path / "graphify-out" / ".navigate"
+    files = list(nav_dir.glob("*.json")) if nav_dir.exists() else []
+    assert files, (
+        f"multi-step walk should persist cursor, got nothing in {nav_dir}"
+    )

@@ -127,12 +127,24 @@ def _norm(s: str) -> str:
 
 
 def label_index(G: nx.DiGraph) -> dict[str, list[str]]:
-    """Normalized label/id → list of node ids. Used to resolve `@<label>`."""
+    """Normalized label/id → list of node ids. Used to resolve `@<label>`.
+
+    Both `_norm(label)` and `_norm(nid)` are indexed so an agent can
+    resolve via either form. When they normalize to the same key (a
+    common case: extractor sets `label="Atlas"` and id="atlas"), the
+    same nid would land in the list twice — making `@Atlas` look
+    ambiguous to `resolve_focus`. Track per-key membership to avoid
+    that duplicate; preserve insertion order so callers that depend
+    on it (e.g. tie-breakers) stay deterministic.
+    """
     idx: dict[str, list[str]] = defaultdict(list)
+    seen: dict[str, set[str]] = defaultdict(set)
     for nid, attrs in G.nodes(data=True):
         label = attrs.get("label", nid)
-        idx[_norm(label)].append(nid)
-        idx[_norm(nid)].append(nid)
+        for key in (_norm(label), _norm(nid)):
+            if nid not in seen[key]:
+                seen[key].add(nid)
+                idx[key].append(nid)
     return dict(idx)
 
 
@@ -1400,7 +1412,13 @@ def _render_frontier_text(data: dict, cursor: Cursor, *, show_ops: bool, md: boo
     n = data["current"]
     cid = n.get("community", "?")
     clabel = n.get("community_label")
-    cstr = f"c{cid}={clabel}" if clabel else f"c{cid}"
+    # Lap-13 field-report fix: `c3=DecodeEngine` reads on first glance like
+    # "Atlas IS DecodeEngine" — the equals sign suggests identity. The
+    # cluster label is actually the *hub* of the community Atlas belongs
+    # to, not Atlas itself. Using `hub:` makes the role explicit without
+    # adding length. Listings keep `=` because their surrounding `all in`
+    # / `coc summary` text disambiguates the relationship.
+    cstr = f"c{cid} hub:{clabel}" if clabel else f"c{cid}"
     src = _short_src(n.get("source_file"), n.get("source_location"))
     ftype_tag = ""
     ft = n.get("file_type", "")
@@ -1738,7 +1756,15 @@ def _render_listing_text(data: dict, *, show_ops: bool, md: bool = False) -> str
             if src not in file_to_letter:
                 file_to_letter[src] = _file_letter(len(file_to_letter))
     has_repeat = any(c >= 2 for c in file_use_count.values())
-    use_table = has_repeat and len(items) >= 3
+    # Lap-13 field-report fix: on @-disambig listings the `[a-h]` file
+    # letters and `[1-N]` pick numbers stack confusingly because both
+    # look like indices. The agent picks via [N], not [letter], so the
+    # files-table is just visual noise here. Each row shows its full
+    # path inline anyway. Suppress on disambig regardless of repeat
+    # count.
+    pivot_str = data.get("pivot") or ""
+    is_disambig = pivot_str.endswith("ambiguous")
+    use_table = has_repeat and len(items) >= 3 and not is_disambig
 
     out: list[str] = []
     kinds_tag = ""
@@ -3238,13 +3264,29 @@ def navigate(ops: list[str] | str, *,
     if len(chain_summary) >= 2:
         trace.append(f"  chain: " + " → ".join(chain_summary))
 
-    # Persist cursor under session_id (if session enabled)
-    if persist and session_id is not None:
+    # Persist cursor only when a future call could plausibly resume it —
+    # same gate that decides whether the session id is printed below.
+    # One-shot focus calls with no chain depth and no explicit --session
+    # used to leave the cursor as write-once garbage swept 30 minutes
+    # later. Lap-13 field-report fix: skip the write entirely so
+    # `.navigate/` only accumulates resumable sessions.
+    can_resume = (
+        session_id is not None
+        and (
+            (isinstance(session, str) and bool(session))  # explicit --session
+            or bool(cursor.queued_ops)                    # chain paused, must resume
+            or len(cursor.history) >= 1                   # walked > 1 step
+        )
+    )
+    if persist and can_resume:
         cursor.save(_cursor_path(gpath, session_id))
 
     # Log surfaced source paths so the PreToolUse hook can suppress its
     # "scout cheaper" nudge on files this session just navigated to.
     # Best-effort; failures must not affect the rendered output.
+    # Path tracking still runs on every persist-eligible call — the hook
+    # reads a separate paths log, not the cursor file, so suppressing
+    # the cursor write doesn't disturb hook behaviour.
     if persist:
         _record_session_paths(gpath, _collect_session_paths(last_data, cursor, G))
 
@@ -3287,22 +3329,11 @@ def navigate(ops: list[str] | str, *,
     else:
         parts.append(json.dumps(last_data, default=str))
 
-    # Only print the session id when chaining is plausibly useful:
-    #   1. caller passed --session explicitly (echoing the id confirms),
-    #   2. the chain paused mid-disambig (queued_ops set — the agent MUST
-    #      use --session <id> to resume),
-    #   3. the agent walked enough to want a follow-up (cursor has history).
-    # Default ephemeral one-shots stay quiet — the printed id was the
-    # single most-cited noise item in the lap-6 field report.
-    show_id = (
-        session_id is not None
-        and (
-            (isinstance(session, str) and bool(session))  # explicit --session
-            or bool(cursor.queued_ops)                    # chain paused, must resume
-            or len(cursor.history) >= 1                   # walked > 1 step, may follow up
-        )
-    )
-    if show_id:
+    # Only print the session id when chaining is plausibly useful (same
+    # `can_resume` gate computed above for the cursor write — keeping
+    # the two in lockstep means a printed id always corresponds to a
+    # persisted cursor and vice versa).
+    if can_resume:
         parts.append(f"  session: {session_id}  (resume with --session {session_id})")
 
     return "\n".join(parts)

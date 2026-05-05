@@ -1323,12 +1323,12 @@ Op forms:
 
 Frontier (after focus or `back`):
 ```
-@ <label> · c<cid>=<auto-name> · deg=<N> · <file>:<line> [file_type] · <age> · <lines>ln [· !stale]
+@ <label> · c<cid> hub:<auto-name> · deg=<N> · <file>:<line> [file_type] · <age> · <lines>ln [· !stale]
   ↗in(N: confidence-mix [; +M via methods])  ↘out(N: confidence-mix)  ◉methods(N)  ◇contains(N)
   ⊕coc(N)  ←rat(N)  →inh(N)  ⇡parent(N)  ◈sib(N)  ↺(history-depth)
 ```
 
-- **Community auto-name** (`c5=GeometryAnalyzer`): each community is labeled with its top-degree member so you don't have to look up what a bare integer means.
+- **Community auto-name** (`c5 hub:GeometryAnalyzer`): each community is labeled with its top-degree member so you don't have to look up what a bare integer means. The `hub:` prefix marks the role explicitly — the focused node `<label>` is *in* the cluster; the `hub:` name is the cluster's representative, not the focus.
 - **Per-file metadata** (` · 3d · 482ln`): age = git last-commit time when in a repo (prefixed `g`, e.g. `g3d`), else filesystem mtime; line count for code files <= 1MB. Saves a `stat`/`git log` roundtrip on the most common follow-up questions.
 - **`!stale` marker**: source file mtime > graph.json mtime. The AST extraction may not match the file's current state — `graphify update .` is probably due.
 - **`+M via methods` rollup** on `↗in` for class-shaped nodes: number of unique callers reachable through the class's methods (deduped). Guards against the trust-bug where `↗in(0)` on a class whose methods are called 50 times reads as "nobody uses this".
