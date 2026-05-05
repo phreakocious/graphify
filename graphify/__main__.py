@@ -1046,6 +1046,7 @@ def main() -> None:
         print("  navigate [ops...]       cursor-based graph navigation (LLM-friendly)")
         print("    @<label>                focus on a node by label/id (fuzzy fallback for typos)")
         print("    in | out | methods | contains    list typed pivots")
+        print("    callers | callees       sugar for `in --kind=calls` / `out --kind=calls`")
         print("    coc                     co-community siblings (same Leiden cluster)")
         print("    rat | inh | parent      rationale anchors / inherits / structural parent")
         print("    siblings                structural peers (same parent file/class)")

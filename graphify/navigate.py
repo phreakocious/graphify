@@ -1097,6 +1097,22 @@ def _pivot_data(G: nx.DiGraph, communities: dict[int, list[str]],
         return ("⇡parent", preds, {u: G.edges[u, nid] for u in preds}, "source order",
                 _drop_breakdown(all_p, extracted_only, min_confidence))
 
+    if key in ("callers", "callees"):
+        # Sugar for `in --kind=calls` / `out --kind=calls`. The single most
+        # common edge filter — "who calls this?" / "who does this call?" —
+        # deserves its own short op rather than a flag combination. We
+        # recurse into the underlying in/out pivot with the kind allowlist
+        # so the drop/rank/filter logic stays in one place.
+        base_key = "in" if key == "callers" else "out"
+        _pname, ids, edges, sort_label, drops = _pivot_data(
+            G, communities, cursor, base_key,
+            extracted_only=extracted_only,
+            min_confidence=min_confidence,
+            kinds={"calls"},
+        )
+        glyph = "◀callers" if key == "callers" else "▶callees"
+        return (glyph, ids, edges, sort_label, drops)
+
     if key == "siblings":
         # Structural peers — other nodes that share at least one parent file or
         # class with the current node. Disjoint from `coc` (semantic Leiden
@@ -1274,6 +1290,11 @@ PIVOT_KEYS = {
     "parent": "parent", "p": "parent", "⇡parent": "parent", "⇡": "parent",
     "siblings": "siblings", "sib": "siblings", "s": "siblings",
     "◈sib": "siblings", "◈": "siblings",
+    # Sugar for the most common edge filter (`in/out --kind=calls`). The
+    # arrow glyphs are directional ("◀" = callers come from the left,
+    # "▶" = callees flow to the right).
+    "callers": "callers", "◀callers": "callers", "◀": "callers",
+    "callees": "callees", "▶callees": "callees", "▶": "callees",
 }
 
 CONTROL_KEYS = {
