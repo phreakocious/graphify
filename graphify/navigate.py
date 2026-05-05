@@ -856,7 +856,12 @@ def _pivot_data(G: nx.DiGraph, communities: dict[int, list[str]],
         succs = [v for v in G.successors(nid)
                  if G.edges[nid, v].get("relation") == "method"
                  and _passes_confidence(G.edges[nid, v], extracted_only, min_confidence)]
-        return ("◉methods", succs, {v: G.edges[nid, v] for v in succs}, "source order",
+        # Sort by degree desc so hub methods (the API surface) sort to the top.
+        # Source-order made sense for small classes but loses information once
+        # the class has 20+ methods — the agent ends up scanning for the
+        # high-degree ones anyway.
+        succs.sort(key=lambda x: -(G.in_degree(x) + G.out_degree(x)))
+        return ("◉methods", succs, {v: G.edges[nid, v] for v in succs}, "degree desc",
                 _drop_breakdown(all_m, extracted_only, min_confidence))
 
     if key == "contains":
