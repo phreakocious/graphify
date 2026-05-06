@@ -1,0 +1,7 @@
+{
+  "candidate_id": "baseline_navigator",
+  "parent_id": null,
+  "generation": 0,
+  "proposer_notes": "Phase 1 baseline. Empty overrides — uses graphify navigator's current state on the navigator branch as-is. SKILL.md is a minimal hand-written prior.",
+  "created_at": "2026-05-05"
+}

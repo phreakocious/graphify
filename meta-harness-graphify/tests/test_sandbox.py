@@ -19,6 +19,19 @@ def test_snapshot_repo_produces_clean_dir(tmp_path):
     assert not (out / ".git").exists()
 
 
+def test_snapshot_repo_handles_non_git_dir(tmp_path):
+    # Build a non-git source dir with a python file and a junk pycache.
+    src = tmp_path / "plain_src"
+    src.mkdir()
+    (src / "main.py").write_text("print('hi')\n")
+    (src / "__pycache__").mkdir()
+    (src / "__pycache__" / "junk.pyc").write_text("x")
+    out = tmp_path / "snap"
+    snapshot_repo(src, out)
+    assert (out / "main.py").read_text() == "print('hi')\n"
+    assert not (out / "__pycache__").exists()
+
+
 def test_build_candidate_graphify_source_with_no_overrides(tmp_path):
     overrides = tmp_path / "empty_overrides"
     overrides.mkdir()

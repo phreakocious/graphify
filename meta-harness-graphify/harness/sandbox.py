@@ -8,24 +8,41 @@ from dataclasses import dataclass
 from pathlib import Path
 
 
+def _is_git_repo(path: Path) -> bool:
+    return (path / ".git").exists()
+
+
 def snapshot_repo(repo: Path, dest: Path) -> None:
-    """Snapshot a git repo's HEAD into `dest` using `git archive`. dest must not exist."""
+    """Snapshot `repo` into `dest`. If `repo` is a git repo, uses `git archive HEAD`
+    (only tracked files, no .git). Otherwise, copies the directory tree minus
+    obvious build/cache artifacts. `dest` must not exist."""
     if dest.exists():
         raise FileExistsError(dest)
-    dest.mkdir(parents=True)
-    with tempfile.NamedTemporaryFile(suffix=".tar", delete=False) as tf:
-        tar_path = Path(tf.name)
-    try:
-        subprocess.run(
-            ["git", "archive", "--format=tar", "-o", str(tar_path), "HEAD"],
-            cwd=repo,
-            check=True,
-            capture_output=True,
+    if _is_git_repo(repo):
+        dest.mkdir(parents=True)
+        with tempfile.NamedTemporaryFile(suffix=".tar", delete=False) as tf:
+            tar_path = Path(tf.name)
+        try:
+            subprocess.run(
+                ["git", "archive", "--format=tar", "-o", str(tar_path), "HEAD"],
+                cwd=repo,
+                check=True,
+                capture_output=True,
+            )
+            with tarfile.open(tar_path) as tar:
+                tar.extractall(dest)
+        finally:
+            tar_path.unlink(missing_ok=True)
+    else:
+        shutil.copytree(
+            repo,
+            dest,
+            ignore=shutil.ignore_patterns(
+                ".git", "__pycache__", "*.pyc", "*.egg-info",
+                ".pytest_cache", ".mypy_cache", ".venv", "venv",
+                "build", "dist",
+            ),
         )
-        with tarfile.open(tar_path) as tar:
-            tar.extractall(dest)
-    finally:
-        tar_path.unlink(missing_ok=True)
 
 
 _REQUIRED_TOP_LEVEL = ("pyproject.toml", "LICENSE", "README.md")

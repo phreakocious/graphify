@@ -9,4 +9,3 @@ dist/
 runs/
 candidates/*/overrides/
 !agents/baseline_navigator/overrides/
-tasks/fixture_repo_001/.git/
