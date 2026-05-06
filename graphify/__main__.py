@@ -94,6 +94,7 @@ _HELP_BLOCKS: dict[str, list[str]] = {
         "    --graph <path>          path to graph.json (default graphify-out/graph.json)",
         "    Resolves the same as `peek` (Class.method, path-qualified, fuzzy fallback). Emits two sections — `## Callers` and `## Callees` — each restricted to call edges. Pairs with refactor-planning prompts (\"what calls X and what does X call?\"). Cursor-free; touches no session.",
         "    Use when you'd otherwise run `navigate @sym in` then re-focus and `navigate @sym out --kind=calls` — that's three calls; blast is one.",
+        "    Brace-expand `blast @Class.{m1,m2,m3}` to dump callers+callees for each in one call (mirrors multi-peek). Misses print inline; exit 1 only when every target misses.",
     ],
     "doc": [
         "  doc <symbol>            one-shot signature + docstring/rationale dump — \"what does this metric/method/class mean?\" without pulling the implementation",
@@ -1186,11 +1187,12 @@ def claude_uninstall(project_dir: Path | None = None) -> None:
     _uninstall_claude_hook(project_dir or Path("."))
 
 
-def _expand_brace_multi_peek(target: str) -> list[str]:
+def _expand_brace_multi_target(target: str) -> list[str]:
     """Lap-25: expand `prefix{a,b,c}suffix` → multiple targets.
 
-    Lets `peek @Class.{m1,m2,m3}` collapse three peek calls into one —
-    the V2 trial 1 transcript pattern (peek __init__ then peek
+    Used by `peek` and `blast` to collapse N same-shaped calls into
+    one (`peek @Class.{m1,m2,m3}`, `blast @Class.{m1,m2,m3}`) — the
+    V2 trial 1 transcript pattern (peek __init__ then peek
     add_all_geometries on the same class). Supports a single brace
     group; only triggers when the inner contains a comma so labels
     with literal `{var}` braces pass through unchanged.
@@ -2901,7 +2903,7 @@ def main() -> None:
         # Pattern surfaced in V2 trial 1 transcript (peek __init__ then
         # peek add_all_geometries on GeometryAnalyzer — two separate
         # calls when the agent already had the class).
-        targets = _expand_brace_multi_peek(target)
+        targets = _expand_brace_multi_target(target)
         multi = len(targets) > 1
         if multi:
             print(f"# multi-peek: {len(targets)} targets")
@@ -3172,70 +3174,88 @@ def main() -> None:
             sys.exit(1)
         G, communities = load_graph(gp)
         idx = label_index(G)
-        chosen, candidates, match_type, _alts = resolve_focus(G, idx, target)
-        if not chosen:
-            # Mirror peek's disambig output so the caller can re-issue
-            # blast with a path-qualified target.
-            if candidates:
-                print(f"ambiguous `{target}` ({len(candidates)} matches). "
-                      f"qualify with @<dir>/<file>/<symbol>:", file=sys.stderr)
-                for nid in candidates[:8]:
-                    a = G.nodes[nid]
-                    sf = a.get("source_file", "?")
-                    loc = a.get("source_location", "")
-                    label = a.get("label", nid)
-                    print(f"  {label}  {sf}{':' + loc[1:] if loc.startswith('L') else ''}",
-                          file=sys.stderr)
-                if len(candidates) > 8:
-                    print(f"  +{len(candidates) - 8} more", file=sys.stderr)
-                sys.exit(1)
-            print(f"no node matches `{target}`.", file=sys.stderr)
+        # Lap-25: brace-expand `blast @Class.{m1,m2,m3}` into N blasts.
+        # Same fusion shape as multi-peek — agents asking "who calls
+        # each method of this class" today run N separate blast calls.
+        targets = _expand_brace_multi_target(target)
+        multi = len(targets) > 1
+        if multi:
+            print(f"# multi-blast: {len(targets)} targets")
+        any_ok = False
+        for ti, t in enumerate(targets):
+            if multi:
+                if ti > 0:
+                    print()
+                print(f"# [{ti+1}/{len(targets)}] {t}")
+            chosen, candidates, match_type, _alts = resolve_focus(G, idx, t)
+            if not chosen:
+                # Mirror peek's disambig output so the caller can re-issue
+                # blast with a path-qualified target.
+                if candidates:
+                    print(f"ambiguous `{t}` ({len(candidates)} matches). "
+                          f"qualify with @<dir>/<file>/<symbol>:", file=sys.stderr)
+                    for nid in candidates[:8]:
+                        a = G.nodes[nid]
+                        sf = a.get("source_file", "?")
+                        loc = a.get("source_location", "")
+                        label = a.get("label", nid)
+                        print(f"  {label}  {sf}{':' + loc[1:] if loc.startswith('L') else ''}",
+                              file=sys.stderr)
+                    if len(candidates) > 8:
+                        print(f"  +{len(candidates) - 8} more", file=sys.stderr)
+                else:
+                    print(f"no node matches `{t}`.", file=sys.stderr)
+                if not multi:
+                    sys.exit(1)
+                continue
+            any_ok = True
+            if match_type and match_type != "exact":
+                chosen_label = G.nodes[chosen].get("label", chosen)
+                print(f"# matched `{t}` → {chosen_label} ({match_type})")
+            cursor = Cursor(current=chosen)
+            extracted_only = not include_inferred
+
+            # Two pivot calls share the cursor; their kind={"calls"} filter is
+            # baked into the callers/callees branch of _pivot_data.
+            _, in_ids, in_edges, in_sort, in_drops = _pivot_data(
+                G, communities, cursor, "callers",
+                extracted_only=extracted_only, min_confidence=None,
+            )
+            _, out_ids, out_edges, out_sort, out_drops = _pivot_data(
+                G, communities, cursor, "callees",
+                extracted_only=extracted_only, min_confidence=None,
+            )
+            in_listing = _listing_data(
+                G, in_ids, "callers", in_edges, len(in_ids), in_sort, limit, in_drops,
+                extracted_only=extracted_only,
+            )
+            out_listing = _listing_data(
+                G, out_ids, "callees", out_edges, len(out_ids), out_sort, limit, out_drops,
+                extracted_only=extracted_only,
+            )
+
+            nattrs = G.nodes[chosen]
+            label = nattrs.get("label", chosen)
+            sf = nattrs.get("source_file") or "?"
+            loc = nattrs.get("source_location") or ""
+            loc_str = (":" + loc[1:]) if isinstance(loc, str) and loc.startswith("L") else ""
+            print(f"blast @{label}  {sf}{loc_str}  "
+                  f"({len(in_ids)} caller{'s' if len(in_ids) != 1 else ''}, "
+                  f"{len(out_ids)} callee{'s' if len(out_ids) != 1 else ''})")
+            print()
+            print("## Callers")
+            if in_ids:
+                print(_render_listing_text(in_listing, show_ops=False, md=md))
+            else:
+                print("  (none)")
+            print()
+            print("## Callees")
+            if out_ids:
+                print(_render_listing_text(out_listing, show_ops=False, md=md))
+            else:
+                print("  (none)")
+        if multi and not any_ok:
             sys.exit(1)
-        if match_type and match_type != "exact":
-            chosen_label = G.nodes[chosen].get("label", chosen)
-            print(f"# matched `{target}` → {chosen_label} ({match_type})")
-        cursor = Cursor(current=chosen)
-        extracted_only = not include_inferred
-
-        # Two pivot calls share the cursor; their kind={"calls"} filter is
-        # baked into the callers/callees branch of _pivot_data.
-        _, in_ids, in_edges, in_sort, in_drops = _pivot_data(
-            G, communities, cursor, "callers",
-            extracted_only=extracted_only, min_confidence=None,
-        )
-        _, out_ids, out_edges, out_sort, out_drops = _pivot_data(
-            G, communities, cursor, "callees",
-            extracted_only=extracted_only, min_confidence=None,
-        )
-        in_listing = _listing_data(
-            G, in_ids, "callers", in_edges, len(in_ids), in_sort, limit, in_drops,
-            extracted_only=extracted_only,
-        )
-        out_listing = _listing_data(
-            G, out_ids, "callees", out_edges, len(out_ids), out_sort, limit, out_drops,
-            extracted_only=extracted_only,
-        )
-
-        nattrs = G.nodes[chosen]
-        label = nattrs.get("label", chosen)
-        sf = nattrs.get("source_file") or "?"
-        loc = nattrs.get("source_location") or ""
-        loc_str = (":" + loc[1:]) if isinstance(loc, str) and loc.startswith("L") else ""
-        print(f"blast @{label}  {sf}{loc_str}  "
-              f"({len(in_ids)} caller{'s' if len(in_ids) != 1 else ''}, "
-              f"{len(out_ids)} callee{'s' if len(out_ids) != 1 else ''})")
-        print()
-        print("## Callers")
-        if in_ids:
-            print(_render_listing_text(in_listing, show_ops=False, md=md))
-        else:
-            print("  (none)")
-        print()
-        print("## Callees")
-        if out_ids:
-            print(_render_listing_text(out_listing, show_ops=False, md=md))
-        else:
-            print("  (none)")
 
     elif cmd == "doc":
         # One-shot rationale dump. Field-report wish: "I had to pivot from

@@ -3002,32 +3002,32 @@ def test_peek_class_emits_curated_dump(tmp_path):
     )
 
 
-def test_expand_brace_multi_peek_helper():
+def test_expand_brace_multi_target_helper():
     """Lap-25 helper: `prefix{a,b,c}suffix` → N targets. Pattern is
     a peek shortcut for `peek @Class.{m1,m2,m3}`. Only triggers on
     a balanced brace pair containing a comma."""
-    from graphify.__main__ import _expand_brace_multi_peek
+    from graphify.__main__ import _expand_brace_multi_target
     # Standard class.method expansion.
-    assert _expand_brace_multi_peek("Worker.{run,stop}") == [
+    assert _expand_brace_multi_target("Worker.{run,stop}") == [
         "Worker.run", "Worker.stop",
     ]
     # @ prefix preserved on each.
-    assert _expand_brace_multi_peek("@C.{a,b,c}") == ["@C.a", "@C.b", "@C.c"]
+    assert _expand_brace_multi_target("@C.{a,b,c}") == ["@C.a", "@C.b", "@C.c"]
     # Whitespace inside braces stripped.
-    assert _expand_brace_multi_peek("@C.{a, b , c}") == ["@C.a", "@C.b", "@C.c"]
+    assert _expand_brace_multi_target("@C.{a, b , c}") == ["@C.a", "@C.b", "@C.c"]
     # No braces — passthrough.
-    assert _expand_brace_multi_peek("Worker.run") == ["Worker.run"]
+    assert _expand_brace_multi_target("Worker.run") == ["Worker.run"]
     # No comma in braces — passthrough (preserves labels with literal
     # `{var}` template parts).
-    assert _expand_brace_multi_peek("Worker.{run}") == ["Worker.{run}"]
+    assert _expand_brace_multi_target("Worker.{run}") == ["Worker.{run}"]
     # Unbalanced — passthrough.
-    assert _expand_brace_multi_peek("Worker.{run") == ["Worker.{run"]
+    assert _expand_brace_multi_target("Worker.{run") == ["Worker.{run"]
     # Empty parts (trailing comma) dropped.
-    assert _expand_brace_multi_peek("@C.{a,b,}") == ["@C.a", "@C.b"]
+    assert _expand_brace_multi_target("@C.{a,b,}") == ["@C.a", "@C.b"]
     # Suffix preserved.
-    assert _expand_brace_multi_peek("{a,b}.foo") == ["a.foo", "b.foo"]
+    assert _expand_brace_multi_target("{a,b}.foo") == ["a.foo", "b.foo"]
     # Nested braces — punt, passthrough.
-    assert _expand_brace_multi_peek("{a,{b,c}}") == ["{a,{b,c}}"]
+    assert _expand_brace_multi_target("{a,{b,c}}") == ["{a,{b,c}}"]
 
 
 def test_peek_brace_expands_to_multi_method(tmp_path):
@@ -3143,6 +3143,60 @@ def test_peek_brace_partial_miss_continues(tmp_path):
     assert "no node matches `zqqqzzz_nonexistent`" in res.stderr, (
         f"missing target should print named error:\n{res.stderr}"
     )
+
+
+def test_blast_brace_expands_to_multi_symbol(tmp_path):
+    """Lap-25: `blast @Class.{m1,m2}` runs callers+callees per target
+    in one call. Mirrors multi-peek shape — same `# multi-blast: N`
+    banner + `# [i/N]` section headers per target."""
+    import json as _json, subprocess
+    nodes = [
+        {"id": "cls", "label": "Worker", "file_type": "code",
+         "source_file": "worker.py", "source_location": "L1",
+         "node_kind": "class"},
+        {"id": "qm_run", "label": ".run()", "file_type": "code",
+         "source_file": "worker.py", "source_location": "L2-3",
+         "node_kind": "method"},
+        {"id": "qm_stop", "label": ".stop()", "file_type": "code",
+         "source_file": "worker.py", "source_location": "L5-6",
+         "node_kind": "method"},
+        # External callers — one for run, one for stop.
+        {"id": "caller_a", "label": "start()", "file_type": "code",
+         "source_file": "main.py", "source_location": "L1",
+         "node_kind": "function"},
+        {"id": "caller_b", "label": "shutdown()", "file_type": "code",
+         "source_file": "main.py", "source_location": "L8",
+         "node_kind": "function"},
+    ]
+    links = [
+        {"source": "cls", "target": "qm_run", "relation": "method",
+         "confidence": "EXTRACTED"},
+        {"source": "cls", "target": "qm_stop", "relation": "method",
+         "confidence": "EXTRACTED"},
+        {"source": "caller_a", "target": "qm_run", "relation": "calls",
+         "confidence": "EXTRACTED"},
+        {"source": "caller_b", "target": "qm_stop", "relation": "calls",
+         "confidence": "EXTRACTED"},
+    ]
+    graph_dir = tmp_path / "graphify-out"
+    graph_dir.mkdir()
+    (graph_dir / "graph.json").write_text(_json.dumps(
+        {"directed": True, "multigraph": False, "graph": {},
+         "nodes": nodes, "links": links}), encoding="utf-8")
+    res = subprocess.run(
+        ["graphify", "blast", "Worker.{run,stop}",
+         "--graph", str(graph_dir / "graph.json")],
+        capture_output=True, text=True, cwd=str(tmp_path),
+    )
+    assert res.returncode == 0, f"multi-blast failed:\n{res.stderr}\n{res.stdout}"
+    out = res.stdout
+    assert "multi-blast: 2 targets" in out, f"missing multi-blast banner:\n{out}"
+    assert "[1/2] Worker.run" in out, f"missing [1/2] header:\n{out}"
+    assert "[2/2] Worker.stop" in out, f"missing [2/2] header:\n{out}"
+    # Each target's distinct caller surfaces — proves the per-target
+    # pivot ran rather than echoing the same listing.
+    assert "start()" in out, f"missing run's caller `start()`:\n{out}"
+    assert "shutdown()" in out, f"missing stop's caller `shutdown()`:\n{out}"
 
 
 def test_peek_brace_all_miss_exits_one(tmp_path):
