@@ -109,3 +109,71 @@ Two open questions for lap-24+:
 ## Cost
 
 Combined A/B: 6 rollouts × ~75s × ~$1.40 ≈ $8.50.
+
+## Round 2 — verb-data ships A/B (post-fix)
+
+After committing the harness fix + the lap-24 navigator changes
+(`9422c0d` summarize file:line + Suggested-next footer; `1b016cc`
+shape ×N marker + entry-point promotion past --limit; `9d838f9`
+summarize redirects file targets to shape, not peek/blast), re-ran
+the same session benchmark with `baseline_navigator` and
+`task_recipe_navigator`. Goal: see whether the data-surfacing
+improvements move single-task call/wall counts *with the same
+SKILL.md*. The cleanest comparison is **same candidate, pre-fix vs
+post-fix** rather than V1-vs-V2.
+
+|                     | task_recipe pre-fix | task_recipe post-fix | Δ |
+|---------------------|---------------------|----------------------|---|
+| pass rate           | 2/3 (66%)           | 3/3 (100%)           | +33pp (mostly harness fix) |
+| **calls (mean)**    | **21.3**            | **17.7**             | **−16.9%** |
+| **wall (mean)**     | **114.8s**          | **100.5s**           | **−12.5%** |
+| ttc (mean)          | 53.9k               | 82.7k                | +53.4% (variance — see note) |
+
+The ttc increase is mostly an artifact of failure removal: prior
+trial 2 failed with truncated output (28.9k ttc); removing it from
+the mean lifts the pre-fix baseline to ~66.4k. The genuine ttc delta
+is closer to +24% — not a regression but a real cost. Likely the
+new shape data lets the agent write more thorough SESS*.md files
+(data is there, agent uses it). Pre-fix variance was massive
+(stdev 26,151) because of the failure outlier; post-fix variance
+is tight (stdev 4,311). The post-fix run is more consistent.
+
+Baseline (no SKILL.md framing, post-fix):
+
+|                     | baseline post-fix | task_recipe post-fix | Δ |
+|---------------------|-------------------|----------------------|---|
+| pass rate           | 2/3 (66%)         | 3/3 (100%)           | +33pp |
+| calls               | 18.3              | 17.7                 | −3.3% |
+| wall                | 107.2s            | 100.5s               | −6.2% |
+| ttc                 | 46.3k             | 82.7k                | +78.7% |
+
+Baseline failure was an oracle brittleness issue (SESS1.md missing
+substring `_compute_signal_metrics` — the prompt doesn't actually
+require naming that internal helper, but the oracle does). Same task
+needs the substring list relaxed; tracked separately.
+
+## What this confirms
+
+**Verb-data improvements move calls. Prose-priming doesn't.** Round 1
+prose-prime A/B showed −2.8% calls (within noise). Round 2 verb-data
+A/B (same task, same SKILL.md) shows **−16.9% calls and −12.5% wall**.
+Same compounding direction as lap-22 blast (−47% calls) and lap-23b
+summarize @Class (−31% calls): collapsing follow-up calls into the
+first-call output payload is the load-bearing axis.
+
+The lap-24 ships:
+- `9422c0d` no-arg summarize: file:line on entry points + Suggested-next footer
+- `1b016cc` shape: ×N marker on fns + entry-point promotion past --limit
+- `9d838f9` summarize: file targets redirect to shape (was peek/blast)
+- `7e227de` skill.md: document shape ×N changes
+- `03e374b` (meta-harness): execute tool_use blocks regardless of stop_reason
+
+Round 2 cost: ~$8.40.
+
+## Bottom line
+
+- **Ship**: all four navigator commits + harness fix. Pushed.
+- **Don't ship**: the V2 prose-prime instruction (no measurable benefit).
+- **Theory holds**: graphify's compounding edge comes from one-call
+  data density and verb fusion, not from telling the agent to use it.
+- **Next**: more verb-fusion candidates (lap-25 backlog).
