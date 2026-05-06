@@ -3182,6 +3182,32 @@ def shape_file(G: nx.DiGraph, file_nid: str, *,
                 "source_location": G.nodes[best_nid].get("source_location"),
             }
 
+    # Lap-21: entry-point detection. Count cross-file callers per fn —
+    # the function with the most "called from elsewhere" edges is the
+    # file's API surface. Without this, an agent landing on a 4000-line
+    # `navigate.py` sees the longest fn but not the outward-facing one.
+    # Walks PREDECESSORS (in-edges) since callers point AT callees.
+    # Excludes structural edges (contains/method/inherits/rationale_for)
+    # so methods aren't credited for their parent class's containment.
+    entry_points: list[dict] = []
+    for nid in fns:
+        ext_in = 0
+        for u in G.predecessors(nid):
+            ufile = G.nodes[u].get("source_file") or ""
+            if not ufile or ufile == sf:
+                continue
+            rel = G.edges[u, nid].get("relation") or ""
+            if rel in _STRUCTURAL:
+                continue
+            ext_in += 1
+        if ext_in > 0:
+            entry_points.append({
+                "label": G.nodes[nid].get("label", nid),
+                "ext_in": ext_in,
+                "source_location": G.nodes[nid].get("source_location"),
+            })
+    entry_points.sort(key=lambda x: (-x["ext_in"], x["label"]))
+
     total_lines = len(file_lines) if file_lines else None
     return {
         "type": "shape",
@@ -3194,6 +3220,7 @@ def shape_file(G: nx.DiGraph, file_nid: str, *,
         "rationale": len(rationale),
         "imports": imports,
         "longest_fn": longest_fn,
+        "entry_points": entry_points[:3],
         "total_lines": total_lines,
         # `limit=None` (`--all`) returns the full lists; default 8 keeps the
         # one-screen summary tight. The `+N more` line in the renderer still
@@ -3336,6 +3363,12 @@ def _render_shape_text(data: dict) -> str:
         loc = lf.get("source_location") or ""
         loc_str = (f":{loc[1:]}" if loc.startswith("L") else "")
         parts.append(f"    longest fn: {lf['label']}  {lf['lines']} ln{loc_str}")
+    # Lap-21: entry points = fns called from elsewhere. The agent landing
+    # on a 4000-line file wants the API surface, not the longest fn.
+    eps = data.get("entry_points") or []
+    if eps:
+        bits = [f"{ep['label']} (×{ep['ext_in']})" for ep in eps]
+        parts.append(f"    entry points: {', '.join(bits)}")
 
     return "\n".join(parts)
 

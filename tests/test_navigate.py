@@ -2979,6 +2979,72 @@ def test_shape_file_returns_counts_and_longest_fn(tmp_path, monkeypatch):
     assert data["total_lines"] == 200
 
 
+def test_shape_file_surfaces_entry_points(tmp_path, monkeypatch):
+    """Lap-21: shape lists fns ranked by external in-edges so an agent
+    landing on a multi-thousand-line file sees the API surface, not
+    just the longest fn."""
+    from graphify.navigate import shape_file, _render_shape_text, load_graph
+    sf = str(tmp_path / "engine.py")
+    other_sf = str(tmp_path / "consumer.py")
+    nodes = [
+        {"id": "f", "label": "engine.py", "file_type": "code",
+         "source_file": sf, "source_location": "L1"},
+        {"id": "fn1", "label": "popular()", "file_type": "code",
+         "source_file": sf, "source_location": "L5"},
+        {"id": "fn2", "label": "less_popular()", "file_type": "code",
+         "source_file": sf, "source_location": "L20"},
+        {"id": "fn3", "label": "internal()", "file_type": "code",
+         "source_file": sf, "source_location": "L40"},
+        # External callers from a different file.
+        *[{"id": f"caller{i}", "label": f"caller{i}()", "file_type": "code",
+           "source_file": other_sf, "source_location": f"L{i}"}
+          for i in range(5)],
+        # An internal-only call (same file) — should not count toward
+        # entry-point rank for fn3.
+        {"id": "same_file_caller", "label": "same_file_caller()",
+         "file_type": "code",
+         "source_file": sf, "source_location": "L80"},
+    ]
+    links = [
+        {"source": "f", "target": "fn1", "relation": "contains",
+         "confidence": "EXTRACTED"},
+        {"source": "f", "target": "fn2", "relation": "contains",
+         "confidence": "EXTRACTED"},
+        {"source": "f", "target": "fn3", "relation": "contains",
+         "confidence": "EXTRACTED"},
+        {"source": "f", "target": "same_file_caller",
+         "relation": "contains", "confidence": "EXTRACTED"},
+        # 4 cross-file calls into popular.
+        *[{"source": f"caller{i}", "target": "fn1", "relation": "calls",
+           "confidence": "EXTRACTED"} for i in range(4)],
+        # 1 cross-file call into less_popular.
+        {"source": "caller4", "target": "fn2", "relation": "calls",
+         "confidence": "EXTRACTED"},
+        # 1 internal call into internal — should NOT count.
+        {"source": "same_file_caller", "target": "fn3", "relation": "calls",
+         "confidence": "EXTRACTED"},
+    ]
+    _write_graph(tmp_path / "graphify-out", nodes, links)
+    monkeypatch.chdir(tmp_path)
+    G, _comm = load_graph(tmp_path / "graphify-out" / "graph.json")
+    data = shape_file(G, "f")
+    eps = data.get("entry_points") or []
+    assert eps, f"shape should surface entry points: {data}"
+    labels = [e["label"] for e in eps]
+    assert labels[0] == "popular()", f"highest-ext-in fn should top: {eps}"
+    assert "less_popular()" in labels, f"single-caller fn should appear: {eps}"
+    assert "internal()" not in labels, (
+        f"internal-only fn should not appear (no cross-file callers): {eps}"
+    )
+    rendered = _render_shape_text(data)
+    assert "entry points:" in rendered, (
+        f"renderer should print entry-points line:\n{rendered}"
+    )
+    assert "popular() (×4)" in rendered, (
+        f"entry point should carry ext-in count:\n{rendered}"
+    )
+
+
 def test_shape_file_limit_and_all(tmp_path, monkeypatch):
     """`shape_file(..., limit=N)` truncates class_labels/fn_labels to N;
     `limit=None` returns the full lists. `+N more` is the renderer's job."""
