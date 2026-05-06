@@ -215,6 +215,62 @@ def _recency_bucket(src: str | None) -> int:
     return 3
 
 
+def _rank_files_by_prefix(files: list[str], prefix: str) -> list[tuple[int, float, str]]:
+    """Rank candidate `source_file` paths by how well they match a
+    user-typed prefix. Lap-20: the prefix may itself be partial
+    (`multianti.ts` for `experiments/ref-id-logit-delta-multianti.ts`).
+    Tier-rank so substring-of-filename beats dash-stem prefix beats
+    generic difflib similarity — without this, fuzzy similarity rates
+    `multi-entity.ts` (entirely different file) higher than the
+    long-named substring match.
+
+    Tiers (lower=better):
+      0  exact path match (sf == prefix or endswith /prefix, with stem fallback)
+      1  prefix is substring of basename (e.g. 'multianti.ts' in
+         'ref-id-logit-delta-multianti.ts')
+      2  basename starts with prefix (e.g. 'multi' prefix-of 'multi-entity.ts')
+      3  difflib similarity ≥ 0.6
+      4  no match (filtered out before return)
+    Within a tier, finer score (e.g. similarity ratio) breaks ties;
+    shorter basenames win on equal similarity.
+    """
+    from difflib import SequenceMatcher
+    out: list[tuple[int, float, str]] = []
+    pn = prefix.lower()
+    pn_basename = pn.rsplit("/", 1)[-1]
+    for sf in files:
+        sfn = sf.lower()
+        sf_base = sfn.rsplit("/", 1)[-1]
+        # Tier 0: exact endswith match (with extension elision)
+        if sfn == pn or sfn.endswith("/" + pn):
+            out.append((0, 1.0, sf))
+            continue
+        parts = sfn.split("/")
+        last = parts[-1]
+        stem, dot, _ext = last.partition(".")
+        sf_stem = "/".join(parts[:-1] + [stem]) if dot and len(parts) > 1 else (stem if dot else last)
+        if dot and (sf_stem == pn or sf_stem.endswith("/" + pn)):
+            out.append((0, 1.0, sf))
+            continue
+        # Tier 1: prefix substring of basename
+        if pn_basename and pn_basename in sf_base:
+            # Shorter basename = stronger evidence (less padding).
+            score = len(pn_basename) / max(1, len(sf_base))
+            out.append((1, -score, sf))
+            continue
+        # Tier 2: basename startswith prefix-basename (dash-stem case)
+        if pn_basename and sf_base.startswith(pn_basename):
+            score = len(pn_basename) / max(1, len(sf_base))
+            out.append((2, -score, sf))
+            continue
+        # Tier 3: generic similarity, only if reasonably close
+        ratio = SequenceMatcher(None, pn_basename or pn, sf_base).ratio()
+        if ratio >= 0.6:
+            out.append((3, -ratio, sf))
+    out.sort()
+    return out
+
+
 def _rank_match(G: nx.Graph, key: str, nid: str) -> tuple[int, int, int, int, int, int, int]:
     """Sort key for fuzzy/substring matches. Prefer
     (1) active code over archived (frozen/, legacy/, deprecated/, archive/, archived/),
@@ -374,6 +430,49 @@ def resolve_focus(G: nx.DiGraph, idx: dict[str, list[str]],
         if len(path_hits) > 1:
             path_hits.sort(key=lambda n: _rank_match(G, key, n))
             return None, path_hits, "exact", []
+
+        # 1b'. Symbol-restricted file fuzzy. Lap-20: strict path matching
+        # above requires `source_file` endswith `prefix` (or stem-elided
+        # form). When the agent types a partial filename — `multianti.ts/unit`
+        # for actual file `experiments/ref-id-logit-delta-multianti.ts` —
+        # endswith fails (`-multianti.ts` ≠ `/multianti.ts`). Old fall-through
+        # ran fuzzy on labels globally and matched semantically-unrelated
+        # basenames (e.g. `multi-entity.ts`), since difflib similarity on
+        # the `multi*.ts` shape ignored that the file in question doesn't
+        # contain the symbol the user asked for.
+        #
+        # Restrict candidate files to those whose nodes contain a
+        # label-matching basename. Then rank by how well the file's name
+        # matches `prefix`: substring > dash-stem prefix > generic fuzzy.
+        # If a unique file wins, return its symbol node. Without this,
+        # path-qualified queries fall back to the same global fuzzy that
+        # produced the brittleness in the first place.
+        if prefix:
+            sym_files: dict[str, list[str]] = defaultdict(list)
+            for nid, attrs in G.nodes(data=True):
+                label_norm = _norm(attrs.get("label", nid))
+                if _label_matches_basename(label_norm, basename):
+                    sf = _norm(attrs.get("source_file") or "")
+                    if sf:
+                        sym_files[sf].append(nid)
+            if sym_files:
+                ranked = _rank_files_by_prefix(list(sym_files.keys()), prefix)
+                # Keep only files at the best score tier — substring beats
+                # stem-prefix beats generic fuzzy. If multiple files tie at
+                # the top tier, present them as disambig.
+                if ranked:
+                    top_tier = ranked[0][0]
+                    top_files = [sf for tier, _, sf in ranked if tier == top_tier]
+                    if len(top_files) == 1:
+                        nids = sym_files[top_files[0]]
+                        if len(nids) == 1:
+                            return nids[0], [], "exact", []
+                        nids_sorted = sorted(nids, key=lambda n: _rank_match(G, key, n))
+                        return None, nids_sorted, "exact", []
+                    if len(top_files) > 1:
+                        all_nids = [n for sf in top_files for n in sym_files[sf]]
+                        all_nids.sort(key=lambda n: _rank_match(G, key, n))
+                        return None, all_nids, "exact", []
 
     # 1c. dotted Class.method qualifier. `Runner.__init__`, `Klein.compute()`,
     # or `Cell.bar` should resolve to the method node directly. Today the

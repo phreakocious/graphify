@@ -515,6 +515,87 @@ def test_path_qualified_query_accepts_stem_form():
     assert c == "sym" and mt == "exact", f"bare stem form should hit sym, got {c!r}"
 
 
+def test_path_qualified_partial_filename_resolves_via_symbol_restriction():
+    """Lap-20 bug A: `multianti.ts/unit` should resolve to a node in
+    `experiments/ref-id-logit-delta-multianti.ts` because that's the only
+    file containing a `unit` symbol whose basename contains `multianti.ts`
+    as a substring. Old behavior: strict endswith match failed
+    (`-multianti.ts` ≠ `/multianti.ts`), substring failed (key has `/`),
+    fuzzy on labels was below cutoff → `no node matches`."""
+    G = nx.DiGraph()
+    # Target file: long dash-separated name, contains a `unit` symbol.
+    G.add_node("target", label="unit", file_type="code",
+               source_file="experiments/ref-id-logit-delta-multianti.ts",
+               source_location="L42")
+    # Distractor: dash-stem prefix-of `multi`, no `unit` symbol.
+    G.add_node("entity_file", label="multi-entity.ts", file_type="code",
+               source_file="src/multi-entity.ts", source_location="L1")
+    G.add_node("entity_other", label="something_else", file_type="code",
+               source_file="src/multi-entity.ts", source_location="L20")
+    idx = label_index(G)
+    chosen, candidates, match_type, _ = resolve_focus(G, idx, "multianti.ts/unit")
+    assert chosen == "target", (
+        f"partial filename + symbol should resolve to target; "
+        f"got chosen={chosen!r} candidates={candidates}"
+    )
+    assert match_type == "exact"
+
+
+def test_path_qualified_does_not_fuzzy_match_unrelated_file():
+    """Lap-20 bug B: `multianti.ts/unit` must NOT silently resolve to
+    `multi-entity.ts` just because difflib similarity ranks it close.
+    Symbol-restriction skips files that don't contain the requested symbol;
+    if the only file containing `unit` is unrelated to the typed prefix,
+    return no match rather than a misleading fuzzy hit."""
+    G = nx.DiGraph()
+    # File `multi-entity.ts` exists but has NO `unit` symbol.
+    G.add_node("entity_file", label="multi-entity.ts", file_type="code",
+               source_file="src/multi-entity.ts", source_location="L1")
+    G.add_node("entity_thing", label="EntityThing", file_type="code",
+               source_file="src/multi-entity.ts", source_location="L20")
+    # Some unrelated file with a `unit` symbol — shouldn't be picked
+    # because its filename doesn't substring/stem-match `multianti.ts`.
+    G.add_node("unit_unrelated", label="unit", file_type="code",
+               source_file="totally/different/path.ts", source_location="L1")
+    idx = label_index(G)
+    chosen, candidates, match_type, _ = resolve_focus(G, idx, "multianti.ts/unit")
+    # Either no match or candidates listing — but never silently picks
+    # `multi-entity.ts` (which doesn't have a `unit` symbol at all).
+    assert chosen != "entity_file", (
+        f"must not auto-pick semantically unrelated file; got chosen={chosen!r}"
+    )
+    # If it did match `unit_unrelated`, that's also wrong (the prefix
+    # `multianti.ts` doesn't substring/stem-match `path.ts`).
+    assert chosen != "unit_unrelated", (
+        f"must not pick file whose name doesn't match the typed prefix; "
+        f"got chosen={chosen!r}"
+    )
+
+
+def test_path_qualified_substring_beats_dash_stem_prefix():
+    """Lap-20 ranking: when both a substring-match file and a dash-stem
+    prefix file contain the symbol, prefer the substring match. The user
+    typing `multianti.ts/unit` is more likely targeting the file whose
+    basename literally contains `multianti.ts` than one that merely
+    starts with `multi-`."""
+    G = nx.DiGraph()
+    # Substring match: 'multianti.ts' is a substring of basename.
+    G.add_node("substr_unit", label="unit", file_type="code",
+               source_file="experiments/ref-id-logit-delta-multianti.ts",
+               source_location="L42")
+    # Dash-stem prefix match: basename starts with 'multi-' but doesn't
+    # contain 'multianti.ts' as a substring.
+    G.add_node("stem_unit", label="unit", file_type="code",
+               source_file="src/multi-entity.ts", source_location="L1")
+    idx = label_index(G)
+    chosen, candidates, match_type, _ = resolve_focus(G, idx, "multianti.ts/unit")
+    assert chosen == "substr_unit", (
+        f"substring match should beat dash-stem prefix; "
+        f"got chosen={chosen!r} candidates={candidates}"
+    )
+    assert match_type == "exact"
+
+
 def test_rank_prefers_symbol_over_rationale():
     """Lap-7 B3: `@FOO_BAR` was landing on a `[rationale]` docstring node
     instead of the symbol it documented. _rank_match must rank symbol
