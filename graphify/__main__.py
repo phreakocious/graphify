@@ -2474,7 +2474,40 @@ def main() -> None:
         # — saves a follow-up `locate`/`navigate` to find where the
         # function lives.
         from graphify.navigate import _STRUCTURAL
-        entry_pts: list[tuple[str, int, str, str]] = []
+        # Lap-24 follow-up: count fns + classes per source_file so we
+        # can flag entry points whose source_file looks "data-only"
+        # (no callable surface). Empirical case: zero-tvm corpus has
+        # `report()` ×142 attributed to windowed-stacked.ts:L39 — but
+        # that line is `const TARGET_LAYER = 27`, and 144 other files
+        # carry their own `report()` declarations. The graph resolution
+        # layer phantom-merges all 142 cross-file calls into one node
+        # at the wrong location. Without filtering, the "Suggested
+        # next" footer pointed at a config file with no callable
+        # surface. The structural-count check catches this: if the
+        # entry point's source_file has 0 fns + 0 classes, the symbol
+        # isn't really declared there — phantom merge — and pointing
+        # the agent at it wastes a call.
+        file_struct_count: dict[str, int] = {}
+        for _nid, _attrs in G.nodes(data=True):
+            _kind = _attrs.get("node_kind") or ""
+            _sf = _attrs.get("source_file") or ""
+            if not _sf:
+                continue
+            if _kind in ("function", "method", "impl_method", "iface_method",
+                         "class", "interface", "type_alias"):
+                file_struct_count[_sf] = file_struct_count.get(_sf, 0) + 1
+        # Also count phantom-likely entries (label has many same-named
+        # variants) so a hint can name the dispatch ambiguity.
+        from collections import Counter as _LabelCounter
+        label_variant_count: _LabelCounter = _LabelCounter()
+        for _nid, _attrs in G.nodes(data=True):
+            _lab = _attrs.get("label", "")
+            _kind = _attrs.get("node_kind") or ""
+            if (isinstance(_lab, str) and _lab.endswith("()")
+                    and not _lab.startswith(".")
+                    and _kind in ("function", "method", "impl_method", "iface_method")):
+                label_variant_count[_lab] += 1
+        entry_pts: list[tuple[str, int, str, str, int]] = []
         for nid, attrs in G.nodes(data=True):
             label = attrs.get("label", "")
             if not (isinstance(label, str) and label.endswith("()")):
@@ -2496,7 +2529,8 @@ def main() -> None:
                     continue
                 ext_in += 1
             if ext_in > 0:
-                entry_pts.append((label, ext_in, sf, loc))
+                variants = label_variant_count.get(label, 1)
+                entry_pts.append((label, ext_in, sf, loc, variants))
         entry_pts.sort(key=lambda t: (-t[1], t[0]))
         top_entries = entry_pts[:5]
         # Edge composition.
@@ -2524,7 +2558,7 @@ def main() -> None:
         if top_entries:
             print()
             print("  Entry points (cross-file callers):")
-            for lab, n, sf, loc in top_entries:
+            for lab, n, sf, loc, variants in top_entries:
                 # Render `compare() ×104  src/foo.py:42`. Extract the
                 # start line from the L<a>-<b> source_location format;
                 # fall back to the bare filename when source_location
@@ -2536,7 +2570,23 @@ def main() -> None:
                     except ValueError:
                         line = ""
                 where = f"  {sf}{':' + line if line else ''}" if sf else ""
-                print(f"    {lab:<36} ×{n}{where}")
+                # Lap-24 follow-up: stamp `(N variants)` when many same-
+                # named symbols exist (likely dispatch / phantom-merge
+                # ambiguity). Threshold at >=10 to avoid annotating
+                # every overloaded helper (2-3 variants is common in
+                # large TS/Python codebases — only the extreme cases
+                # signal phantom-merge). Flag `(no callable surface)`
+                # when the symbol's source_file has no fns/classes —
+                # the call count is real but the location points at
+                # the wrong place (resolution funneled cross-file
+                # calls into a same-named node in a data file).
+                annot = ""
+                if variants and variants >= 10:
+                    annot += f" ({variants} variants — likely phantom)"
+                struct = file_struct_count.get(sf, 0)
+                if struct == 0:
+                    annot += " (no callable surface in source_file)"
+                print(f"    {lab:<36} ×{n}{where}{annot}")
         if rel_counts:
             print()
             total_rel = sum(rel_counts.values())
@@ -2554,11 +2604,54 @@ def main() -> None:
         # + top-5 hubs but no clear "go here next" — and has to guess
         # which verb to fire. Single-line suggestion that's
         # copy-pasteable and lands them on a real API surface.
-        if top_entries:
-            top_lab, _n, top_sf, _loc = top_entries[0]
-            if top_sf:
-                print()
-                print(f"  Suggested next: graphify shape {top_sf}    # `{top_lab}` lives here, top-ranked entry point")
+        # Lap-24 follow-up: skip entry points flagged as phantom (no
+        # callable surface in source_file) OR ambiguous (many same-
+        # named variants). Empirical case: zero-tvm `report()` ×142
+        # was attributed to a config file with 0 fns; following the
+        # suggestion landed the agent on a dud. Pick the first entry
+        # whose source_file actually has structure AND whose label is
+        # unambiguous; skip the rest. Fall back to nothing if no
+        # candidate qualifies.
+        suggested_line = None
+        for lab, _n, sf, _loc, variants in top_entries:
+            if not sf:
+                continue
+            # Skip phantom / heavily-ambiguous entries (variants ≥ 10
+            # is the same threshold used for the inline annotation).
+            if variants >= 10:
+                continue
+            if file_struct_count.get(sf, 0) == 0:
+                continue
+            suggested_line = (
+                f"  Suggested next: graphify shape {sf}    "
+                f"# `{lab}` lives here, top-ranked entry point"
+            )
+            break
+        # Fallback when no entry-point qualifies: suggest a top class
+        # hub via summarize @<class>. Empirical case: zero-tvm corpus
+        # has every fn entry-point flagged as phantom/ambiguous, so
+        # all 5 entry suggestions get rejected. Without the fallback
+        # the agent gets no concrete next move and has to reason from
+        # the community list alone. Pick the highest-ranked community
+        # whose hub looks class-shaped (PascalCase, no parens) — for
+        # zero-tvm that's `Point` at c4.
+        if not suggested_line and comm_sizes:
+            for cid, _members in comm_sizes:
+                hub_label = comm_labels.get(cid, "")
+                # Class-shape: starts with uppercase, no parens, no
+                # underscores in non-CamelCase form.
+                if (isinstance(hub_label, str) and hub_label
+                        and hub_label[0:1].isalpha() and hub_label[0].isupper()
+                        and "(" not in hub_label and " " not in hub_label
+                        and any(c.islower() for c in hub_label)):
+                    suggested_line = (
+                        f'  Suggested next: graphify summarize "@{hub_label}"    '
+                        f"# top class hub (community c{cid})"
+                    )
+                    break
+        if suggested_line:
+            print()
+            print(suggested_line)
 
         banner = G.graph.get("_freshness_banner")
         if banner:

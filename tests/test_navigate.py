@@ -2405,6 +2405,178 @@ def test_summarize_emits_overview(tmp_path):
     )
 
 
+def test_summarize_skips_phantom_entry_for_suggested_next(tmp_path):
+    """Lap-24 follow-up: a "phantom" entry is one where many same-named
+    function nodes exist across the corpus (variants >= 10), with one
+    of them absorbing all the cross-file calls via resolution-layer
+    merging. Empirical case from zero-tvm: 145 `report()` functions in
+    145 different experiment files; one node was funneled all 142
+    cross-file callers and located in a config-only source_file.
+
+    The "Suggested next" footer must skip phantom entries and land on
+    a clean unique-named entry. Inline annotation
+    `(N variants — likely phantom)` flags the bad entry visibly."""
+    import json as _json, subprocess
+    nodes = [
+        {"id": "fA", "label": "phantom_file.py", "file_type": "code",
+         "source_file": "phantom_file.py", "source_location": "L1",
+         "node_kind": "file", "community": 0},
+        {"id": "fB", "label": "real_engine.py", "file_type": "code",
+         "source_file": "real_engine.py", "source_location": "L1",
+         "node_kind": "file", "community": 1},
+        {"id": "compile", "label": "compile()", "file_type": "code",
+         "source_file": "real_engine.py", "source_location": "L5",
+         "node_kind": "function", "community": 1},
+        {"id": "fU", "label": "user.py", "file_type": "code",
+         "source_file": "user.py", "source_location": "L1",
+         "node_kind": "file", "community": 2},
+        {"id": "user", "label": "user_fn()", "file_type": "code",
+         "source_file": "user.py", "source_location": "L1",
+         "node_kind": "function", "community": 2},
+    ]
+    # 12 same-named report() nodes — variant count 12 >= 10 threshold.
+    # The first one absorbs all 5 cross-file calls (the phantom).
+    for i in range(12):
+        nodes.append({
+            "id": f"report_{i}", "label": "report()",
+            "file_type": "code",
+            "source_file": "phantom_file.py" if i == 0 else f"variant_{i}.py",
+            "source_location": "L1",
+            "node_kind": "function",
+            "community": 0})
+    # 5 caller files calling report_0 (the phantom).
+    for i in range(5):
+        nodes.append({
+            "id": f"caller_p{i}",
+            "label": f"caller_p{i}.py", "file_type": "code",
+            "source_file": f"caller_p{i}.py", "source_location": "L1",
+            "node_kind": "file", "community": 3})
+        nodes.append({
+            "id": f"cp_fn_{i}",
+            "label": f"cp_fn_{i}()", "file_type": "code",
+            "source_file": f"caller_p{i}.py", "source_location": "L1",
+            "node_kind": "function", "community": 3})
+    links = [
+        {"source": "fA", "target": "report_0", "relation": "contains",
+         "confidence": "EXTRACTED"},
+        {"source": "fB", "target": "compile", "relation": "contains",
+         "confidence": "EXTRACTED"},
+        {"source": "fU", "target": "user", "relation": "contains",
+         "confidence": "EXTRACTED"},
+    ]
+    for i in range(5):
+        links.append({"source": f"caller_p{i}", "target": f"cp_fn_{i}",
+                      "relation": "contains", "confidence": "EXTRACTED"})
+        # All 5 cross-file callers → phantom (report_0).
+        links.append({"source": f"cp_fn_{i}", "target": "report_0",
+                      "relation": "calls", "confidence": "EXTRACTED"})
+    # 1 cross-file call → compile().
+    links.append({"source": "user", "target": "compile",
+                  "relation": "calls", "confidence": "EXTRACTED"})
+    graph_dir = tmp_path / "graphify-out"
+    graph_dir.mkdir()
+    (graph_dir / "graph.json").write_text(_json.dumps(
+        {"directed": True, "multigraph": False,
+         "graph": {}, "nodes": nodes, "links": links}), encoding="utf-8")
+    res = subprocess.run(
+        ["graphify", "summarize",
+         "--graph", str(graph_dir / "graph.json")],
+        capture_output=True, text=True, cwd=str(tmp_path),
+    )
+    assert res.returncode == 0, f"summarize failed:\n{res.stderr}"
+    out = res.stdout
+    # report() shows up as a phantom entry — annotated, not silenced.
+    assert "report()" in out, f"phantom entry should still list:\n{out}"
+    assert "12 variants" in out and "phantom" in out, (
+        f"phantom should be flagged with variant count:\n{out}"
+    )
+    # The "Suggested next" footer skips the phantom and lands on the
+    # legitimate compile() entry.
+    assert "Suggested next:" in out, f"footer missing:\n{out}"
+    suggested_block = out.split("Suggested next:")[1]
+    assert "real_engine.py" in suggested_block, (
+        f"footer should skip phantom and pick compile() instead:\n{out}"
+    )
+    assert "phantom_file.py" not in suggested_block, (
+        f"footer should NOT point at the phantom file:\n{out}"
+    )
+
+
+def test_summarize_falls_back_to_class_hub_when_no_clean_entry(tmp_path):
+    """Lap-24 follow-up: when EVERY entry point is phantom or
+    ambiguous, fall back to suggesting `summarize @<top-class-hub>`.
+    Ensures the agent always gets a concrete next move when the
+    repo has any class-shaped community."""
+    import json as _json, subprocess
+    # The only entry point with cross-file callers is `process()`, but
+    # 12 same-named variants exist across the corpus — phantom flag
+    # fires and the suggested-next loop skips it. No other entries
+    # qualify, so the class-hub fallback should kick in and suggest
+    # `summarize @Widget`.
+    nodes = [
+        {"id": "fB", "label": "widget.py", "file_type": "code",
+         "source_file": "widget.py", "source_location": "L1",
+         "node_kind": "file", "community": 1},
+        {"id": "klass", "label": "Widget", "file_type": "code",
+         "source_file": "widget.py", "source_location": "L5",
+         "node_kind": "class", "community": 1},
+        # Bulk up Widget's community so it ranks high.
+        *[{"id": f"w{i}", "label": f"helper_{i}", "file_type": "code",
+           "source_file": "widget.py", "source_location": f"L{20+i}",
+           "node_kind": "function", "community": 1}
+          for i in range(10)],
+        {"id": "fU", "label": "user.py", "file_type": "code",
+         "source_file": "user.py", "source_location": "L1",
+         "node_kind": "file", "community": 2},
+        {"id": "user", "label": "user_fn()", "file_type": "code",
+         "source_file": "user.py", "source_location": "L1",
+         "node_kind": "function", "community": 2},
+    ]
+    # 12 same-named process() nodes — all phantom-flagged.
+    for i in range(12):
+        nodes.append({
+            "id": f"process_{i}", "label": "process()",
+            "file_type": "code",
+            "source_file": f"data_{i}.py", "source_location": "L1",
+            "node_kind": "function", "community": 0})
+    links = [
+        {"source": "fB", "target": "klass", "relation": "contains",
+         "confidence": "EXTRACTED"},
+        {"source": "fU", "target": "user", "relation": "contains",
+         "confidence": "EXTRACTED"},
+        # user calls process_0 → ext_in for that node.
+        {"source": "user", "target": "process_0", "relation": "calls",
+         "confidence": "EXTRACTED"},
+    ]
+    for i in range(10):
+        links.append({"source": "fB", "target": f"w{i}",
+                      "relation": "contains", "confidence": "EXTRACTED"})
+    graph_dir = tmp_path / "graphify-out"
+    graph_dir.mkdir()
+    (graph_dir / "graph.json").write_text(_json.dumps(
+        {"directed": True, "multigraph": False,
+         "graph": {"community_labels": {"1": "Widget", "0": "process()",
+                                         "2": "user_fn()"}},
+         "nodes": nodes, "links": links}), encoding="utf-8")
+    res = subprocess.run(
+        ["graphify", "summarize",
+         "--graph", str(graph_dir / "graph.json")],
+        capture_output=True, text=True, cwd=str(tmp_path),
+    )
+    assert res.returncode == 0, f"summarize failed:\n{res.stderr}"
+    out = res.stdout
+    assert "Suggested next:" in out, f"footer missing:\n{out}"
+    # Falls back to summarize @Widget rather than shape on the
+    # phantom data file.
+    assert 'summarize "@Widget"' in out, (
+        f"footer should fall back to top class hub when entries are phantom:\n{out}"
+    )
+    suggested_block = out.split("Suggested next:")[1]
+    assert "data_" not in suggested_block, (
+        f"footer should not point at the phantom data file:\n{out}"
+    )
+
+
 def test_summarize_no_entry_points_skips_suggested_next(tmp_path):
     """Lap-24 redesign: when the graph has zero cross-file callers the
     "Suggested next" footer should be silent. Otherwise we'd point the
