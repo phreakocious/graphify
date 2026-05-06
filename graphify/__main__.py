@@ -55,6 +55,8 @@ _HELP_BLOCKS: dict[str, list[str]] = {
     ],
     "changed": [
         "  changed [ref]           list code files added/modified/removed since graph extract (or vs git ref)",
+        "    --since-commit <ref>    diff vs a known git baseline (e.g. `--since-commit ae96912` or branch name); same as the positional [ref] but discoverable",
+        "    --since <ref>           shorter alias for --since-commit",
         "    --graph <path>          path to graph.json (default graphify-out/graph.json)",
     ],
     "peek": [
@@ -2102,6 +2104,16 @@ def main() -> None:
             a = args[i]
             if a == "--graph" and i + 1 < len(args):
                 graph_path = args[i + 1]; i += 2
+            elif a.startswith("--graph="):
+                graph_path = a.split("=", 1)[1]; i += 1
+            elif a in ("--since-commit", "--since") and i + 1 < len(args):
+                # Lap-21 polish: discoverable named flag for the positional
+                # ref. The positional is still supported for back-compat.
+                ref = args[i + 1]; i += 2
+            elif a.startswith("--since-commit="):
+                ref = a.split("=", 1)[1]; i += 1
+            elif a.startswith("--since="):
+                ref = a.split("=", 1)[1]; i += 1
             elif a.startswith("--"):
                 i += 1
             else:

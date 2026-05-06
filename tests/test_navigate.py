@@ -2236,6 +2236,67 @@ def test_frontier_header_disambiguates_focus_from_community(tmp_path, monkeypatc
     )
 
 
+def test_changed_since_commit_flag(tmp_path):
+    """Lap-21 polish: `graphify changed --since-commit <ref>` is the
+    discoverable form of the positional `changed <ref>` alias. Both
+    should produce the same `vs <ref>` output prefix and route through
+    the git-diff path rather than the mtime path."""
+    import json as _json, subprocess
+    # Real git repo so `git diff <ref>` resolves.
+    subprocess.run(["git", "init", "-q", "-b", "main"], cwd=str(tmp_path),
+                    check=True)
+    subprocess.run(["git", "config", "user.email", "t@t"], cwd=str(tmp_path),
+                    check=True)
+    subprocess.run(["git", "config", "user.name", "t"], cwd=str(tmp_path),
+                    check=True)
+    (tmp_path / "a.py").write_text("def f():\n    return 1\n")
+    subprocess.run(["git", "add", "."], cwd=str(tmp_path), check=True)
+    subprocess.run(["git", "commit", "-q", "-m", "init"], cwd=str(tmp_path),
+                    check=True)
+    sha_res = subprocess.run(["git", "rev-parse", "HEAD"], cwd=str(tmp_path),
+                              capture_output=True, text=True, check=True)
+    sha = sha_res.stdout.strip()
+    # Modify the file post-commit.
+    (tmp_path / "a.py").write_text("def f():\n    return 2\n")
+    # Minimal graph.json so changed has somewhere to compare.
+    nodes = [{"id": "fn", "label": "f()", "file_type": "code",
+              "source_file": "a.py", "source_location": "L1"}]
+    graph_dir = tmp_path / "graphify-out"
+    graph_dir.mkdir()
+    (graph_dir / "graph.json").write_text(_json.dumps(
+        {"directed": True, "multigraph": False,
+         "graph": {}, "nodes": nodes, "links": []}), encoding="utf-8")
+
+    # Both the positional ref and --since-commit should resolve to the
+    # same git-diff path.
+    pos = subprocess.run(
+        ["graphify", "changed", sha,
+         "--graph", str(graph_dir / "graph.json")],
+        capture_output=True, text=True, cwd=str(tmp_path),
+    )
+    flag = subprocess.run(
+        ["graphify", "changed", "--since-commit", sha,
+         "--graph", str(graph_dir / "graph.json")],
+        capture_output=True, text=True, cwd=str(tmp_path),
+    )
+    short = subprocess.run(
+        ["graphify", "changed", "--since", sha,
+         "--graph", str(graph_dir / "graph.json")],
+        capture_output=True, text=True, cwd=str(tmp_path),
+    )
+    assert pos.returncode == 0, f"positional failed:\n{pos.stderr}"
+    assert flag.returncode == 0, f"--since-commit failed:\n{flag.stderr}"
+    assert short.returncode == 0, f"--since failed:\n{short.stderr}"
+    assert pos.stdout == flag.stdout == short.stdout, (
+        f"all three forms should produce identical output;\n"
+        f"pos:\n{pos.stdout}\nflag:\n{flag.stdout}\nshort:\n{short.stdout}"
+    )
+    # And the output should use the `vs <ref>` label, not the mtime label.
+    assert f"vs {sha}" in flag.stdout, (
+        f"output should reference the git ref:\n{flag.stdout}"
+    )
+
+
 def test_navigate_node_kind_filter_on_substring_disambig(tmp_path, monkeypatch):
     """Lap-21 polish: `@compile` substring listing returned 37 rows
     where the top 3 (the actual functions) were what the user wanted.
