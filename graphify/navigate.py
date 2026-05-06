@@ -3261,8 +3261,13 @@ def _file_top_docstring(sf: str, *, max_lines: int = _SHAPE_DOCSTRING_LINES) -> 
             if line:
                 out.append(line)
             return out[:max_lines]
-        if rest.strip():
-            out.append(rest.strip().lstrip("*").strip())
+        # Guard: `/**` (JSDoc opener) leaves rest = "*" which strips to
+        # empty. Without this, the docstring rendered with a leading
+        # blank `>` line. Only append when there's real content on the
+        # opener line (e.g. `/* one-line comment` would have content).
+        opener_content = rest.strip().lstrip("*").strip()
+        if opener_content:
+            out.append(opener_content)
         i += 1
         while i < len(head) and len(out) < max_lines:
             s = head[i].strip()

@@ -3939,6 +3939,47 @@ def test_shape_file_surfaces_top_of_file_docstring(tmp_path, monkeypatch):
     assert not any("def bar" in d for d in docstring2), docstring2
 
 
+def test_shape_file_jsdoc_block_no_empty_leading_line(tmp_path, monkeypatch):
+    """Lap-24 follow-up bugfix: a JSDoc-style `/**` opener was leaving
+    an empty leading line in the docstring (rendered as a bare `> `
+    with nothing after it). The opener line `/**` strips to `*` then
+    to `""`; the extractor was appending the empty string. Only
+    real content should land in the docstring list."""
+    from graphify.navigate import shape_file, _render_shape_text, load_graph
+    sf = tmp_path / "doc.ts"
+    sf.write_text(
+        "/**\n"
+        " * WINDOWED + STACKED OVERRIDES (Exp 70)\n"
+        " *\n"
+        " * Builds on Exp 69's finding to tackle pipeline issues.\n"
+        " */\n"
+        "\n"
+        "export const config = {}\n"
+    )
+    nodes = [
+        {"id": "f", "label": "doc.ts", "file_type": "code",
+         "source_file": str(sf), "source_location": "L1",
+         "node_kind": "file"},
+    ]
+    links = []
+    _write_graph(tmp_path / "graphify-out", nodes, links)
+    monkeypatch.chdir(tmp_path)
+    G, _comm = load_graph(tmp_path / "graphify-out" / "graph.json")
+    data = shape_file(G, "f")
+    docstring = data.get("docstring") or []
+    assert docstring, f"JSDoc block should be captured: {data}"
+    # First captured line is real content, not empty.
+    assert docstring[0] == "WINDOWED + STACKED OVERRIDES (Exp 70)", (
+        f"first docstring line should be content, not empty:\n{docstring}"
+    )
+    rendered = _render_shape_text(data)
+    # No bare `>` lines (`>` immediately followed by newline or
+    # whitespace-only).
+    for line in rendered.split("\n"):
+        if line.strip() == ">":
+            assert False, f"empty `>` line in render:\n{rendered}"
+
+
 def test_shape_file_no_docstring_when_file_starts_with_code(tmp_path, monkeypatch):
     """No leading docstring/comment → empty docstring list, no `>`
     line in rendered output. Avoids inventing fake context for files
