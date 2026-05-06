@@ -1708,10 +1708,15 @@ def main() -> None:
             print(f"error: graph file not found: {gp}", file=sys.stderr)
             sys.exit(1)
         _raw = json.loads(gp.read_text(encoding="utf-8"))
-        try:
-            G = json_graph.node_link_graph(_raw, edges="links")
-        except TypeError:
-            G = json_graph.node_link_graph(_raw)
+        # Lap-21: use build_from_json so we get a DiGraph with edge
+        # directions restored from `_src`/`_tgt`. Plain
+        # `json_graph.node_link_graph` returns an undirected Graph
+        # (graph.json carries `directed: False` even though the data is
+        # directionally tagged), which broke `resolve_focus`'s lap-20c
+        # dotted Class.method walk via `G.successors` — undirected
+        # Graphs don't have that method.
+        from graphify.build import build_from_json
+        G = build_from_json(_raw, directed=True)
         # Filter the graph to EXTRACTED edges by default — INFERRED edges
         # produce string-match shortcuts (path through a docstring fragment
         # rather than a real call) that mislead more than they help.

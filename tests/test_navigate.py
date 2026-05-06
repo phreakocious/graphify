@@ -2236,6 +2236,51 @@ def test_frontier_header_disambiguates_focus_from_community(tmp_path, monkeypatc
     )
 
 
+def test_path_loads_digraph_so_dotted_class_method_resolves(tmp_path):
+    """Lap-21 regression: `graphify path` was loading via
+    `json_graph.node_link_graph` which respects the `directed` field on
+    the JSON. Production graph.json carries `directed: False` even
+    though the data is directionally tagged via _src/_tgt; resolve_focus's
+    lap-20c dotted-Class.method walk crashed with `'Graph' has no
+    attribute 'successors'`. Fix: load via build_from_json(directed=True)."""
+    import json as _json, subprocess
+    nodes = [
+        {"id": "cls", "label": "Cursor", "file_type": "code",
+         "source_file": "a.py", "source_location": "L1",
+         "node_kind": "class"},
+        {"id": "m", "label": ".pop()", "file_type": "code",
+         "source_file": "a.py", "source_location": "L5",
+         "node_kind": "method"},
+        {"id": "fn", "label": "user()", "file_type": "code",
+         "source_file": "b.py", "source_location": "L1",
+         "node_kind": "function"},
+    ]
+    links = [
+        {"source": "cls", "target": "m", "relation": "method",
+         "confidence": "EXTRACTED"},
+        {"source": "fn", "target": "m", "relation": "calls",
+         "confidence": "EXTRACTED"},
+    ]
+    graph_dir = tmp_path / "graphify-out"
+    graph_dir.mkdir()
+    # Production graph.json has `directed: False` because export uses
+    # nx.Graph. The path command must rebuild as DiGraph regardless.
+    (graph_dir / "graph.json").write_text(_json.dumps(
+        {"directed": False, "multigraph": False,
+         "graph": {}, "nodes": nodes, "links": links}), encoding="utf-8")
+    res = subprocess.run(
+        ["graphify", "path", "user()", "Cursor.pop",
+         "--graph", str(graph_dir / "graph.json")],
+        capture_output=True, text=True, cwd=str(tmp_path),
+    )
+    assert res.returncode == 0, (
+        f"path crashed (likely AttributeError on .successors):\n"
+        f"stdout:\n{res.stdout}\nstderr:\n{res.stderr}"
+    )
+    out = res.stdout + res.stderr
+    assert "Shortest path" in out, f"path should resolve:\n{out}"
+
+
 def test_listing_header_surfaces_transitive_depth_tag(tmp_path, monkeypatch):
     """Lap-21: `out --depth=3` lands on a transitive walk via
     `_transitive_walk`, but the listing header used to look identical
