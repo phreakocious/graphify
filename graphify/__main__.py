@@ -1851,6 +1851,18 @@ def main() -> None:
             annotation = "  (co-located only — these nodes share a parent file but have no semantic call/use edge between them)"
         elif hops >= 2 and all(r in ("contains", "method") for r in relations):
             annotation = "  (structural-only path: contains/method — no direct call edge between endpoints)"
+        # Lap-20 field-report fix: a path consisting entirely of file-level
+        # `imports`/`imports_from` edges is graph-connected but not a call
+        # chain. Default `--edges reach` keeps these in (some users do want
+        # the file-graph view), but the rendered output reads as a 7-hop
+        # call path. Cheap hint: tell the agent the path is purely
+        # file-imports and `--edges calls` would constrain to the runtime
+        # call graph. NOT a default change — the existing default stays.
+        if (hops >= 2 and edge_mode != "calls"
+                and all(r in ("imports", "imports_from") for r in relations)):
+            annotation = ("  hint: try --edges calls — current path is all "
+                          "file-level imports, may not represent semantic "
+                          "call flow")
         print(f"Shortest path ({hops} hops):\n  " + " ".join(segments))
         if annotation:
             print(annotation)

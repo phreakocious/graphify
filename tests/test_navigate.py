@@ -3084,3 +3084,82 @@ def test_search_truncation_absolute_threshold_fires(tmp_path, monkeypatch):
         f"banner should name visible/grand-total ratio:\n{out}"
     )
 
+
+
+def test_path_all_imports_emits_calls_hint(tmp_path):
+    """Lap-20 field-report fix #4: when `path` returns a chain entirely of
+    `imports`/`imports_from` edges, append a `--edges calls` hint. The
+    chain is graph-connected but reads misleadingly as a call path; the
+    hint redirects without changing the default."""
+    import json as _json, subprocess
+    nodes = [
+        {"id": "fA", "label": "A.ts", "file_type": "code",
+         "source_file": "A.ts", "source_location": "L1"},
+        {"id": "fB", "label": "B.ts", "file_type": "code",
+         "source_file": "B.ts", "source_location": "L1"},
+        {"id": "fC", "label": "C.ts", "file_type": "code",
+         "source_file": "C.ts", "source_location": "L1"},
+    ]
+    # All-imports chain: A imports B imports C. Reach default keeps these.
+    links = [
+        {"source": "fA", "target": "fB", "relation": "imports",
+         "confidence": "EXTRACTED"},
+        {"source": "fB", "target": "fC", "relation": "imports_from",
+         "confidence": "EXTRACTED"},
+    ]
+    graph_dir = tmp_path / "graphify-out"
+    graph_dir.mkdir()
+    (graph_dir / "graph.json").write_text(_json.dumps(
+        {"directed": True, "multigraph": False,
+         "graph": {}, "nodes": nodes, "links": links}), encoding="utf-8")
+    res = subprocess.run(
+        ["graphify", "path", "A.ts", "C.ts",
+         "--graph", str(graph_dir / "graph.json")],
+        capture_output=True, text=True, cwd=str(tmp_path),
+    )
+    out = res.stdout + res.stderr
+    assert "Shortest path" in out, f"path should resolve:\n{out}"
+    assert "--edges calls" in out, (
+        f"all-imports path should hint at --edges calls:\n{out}"
+    )
+    assert "all file-level imports" in out, (
+        f"hint should name the cause:\n{out}"
+    )
+
+
+def test_path_mixed_relations_no_imports_hint(tmp_path):
+    """Sanity: a path with at least one non-imports edge (e.g. a `contains`
+    or `calls`) must NOT trigger the --edges-calls hint. The hint is
+    specifically for the all-imports degenerate case."""
+    import json as _json, subprocess
+    nodes = [
+        {"id": "fA", "label": "A.ts", "file_type": "code",
+         "source_file": "A.ts", "source_location": "L1"},
+        {"id": "fB", "label": "B.ts", "file_type": "code",
+         "source_file": "B.ts", "source_location": "L1"},
+        {"id": "sB", "label": "useB()", "file_type": "code",
+         "source_file": "B.ts", "source_location": "L5"},
+    ]
+    # A imports B; B contains useB(). path A.ts → useB() routes
+    # through `imports` then `contains`.
+    links = [
+        {"source": "fA", "target": "fB", "relation": "imports",
+         "confidence": "EXTRACTED"},
+        {"source": "fB", "target": "sB", "relation": "contains",
+         "confidence": "EXTRACTED"},
+    ]
+    graph_dir = tmp_path / "graphify-out"
+    graph_dir.mkdir()
+    (graph_dir / "graph.json").write_text(_json.dumps(
+        {"directed": True, "multigraph": False,
+         "graph": {}, "nodes": nodes, "links": links}), encoding="utf-8")
+    res = subprocess.run(
+        ["graphify", "path", "A.ts", "useB()",
+         "--graph", str(graph_dir / "graph.json")],
+        capture_output=True, text=True, cwd=str(tmp_path),
+    )
+    out = res.stdout + res.stderr
+    assert "Shortest path" in out, f"path should resolve:\n{out}"
+    assert "--edges calls" not in out or "current path is all" not in out, (
+        f"mixed-relation path should NOT trigger imports-only hint:\n{out}"
+    )
