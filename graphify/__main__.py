@@ -60,9 +60,14 @@ _HELP_BLOCKS: dict[str, list[str]] = {
         "    --graph <path>          path to graph.json (default graphify-out/graph.json)",
     ],
     "summarize": [
-        "  summarize               one-call architectural overview: top communities (by hub), entry points (cross-file callers), edge mix, language counts, freshness",
+        "  summarize @<Class>      one-call class summary — signature + method list + used-by (cross-file callers) + inheritance (parent + siblings + children). Targets the body-heavy class-comprehension failure mode where agents fall back to read_file because no graphify verb fuses class info.",
+        "    --methods N             max methods listed (default 30; +N more tail if truncated)",
+        "    --callers N             max cross-file callers listed (default 8)",
+        "    --md                    render labels as `[label](file:line)` markdown links",
         "    --graph <path>          path to graph.json (default graphify-out/graph.json)",
-        "    Cheap primer for an agent landing fresh on a repo. Reuses data already on the graph — no re-extraction.",
+        "    Resolves the same as `peek`/`blast` (Class.method, path-qualified, fuzzy fallback). Errors if target isn't a class/interface; suggests `peek` or `blast` for other shapes.",
+        "  summarize               (no target) repo-wide architectural overview: top communities, cross-file entry points, edge mix, language counts, freshness. Mostly useful for first-contact orientation.",
+        "    --graph <path>          path to graph.json (default graphify-out/graph.json)",
     ],
     "peek": [
         "  peek <symbol>           one-shot body read — resolve, dump body, touch no cursor/session/history",
@@ -2160,12 +2165,23 @@ def main() -> None:
         # points, edge composition, language mix, freshness. The agent
         # lands with a primer instead of having to run shape on a guess
         # first.
+        # Lap-23 (meta-harness task_004/005 cluster-B fix): when a target
+        # symbol is passed (`summarize @<Class>`), switch modes — fuse
+        # signature + method list + cross-file callers + inheritance into
+        # one call. Targets the bimodal failure mode where agents fall
+        # back to `read_file` on huge files because no graphify verb
+        # gave them class-level context. Same blast-pattern logic: a
+        # common task (class summary) collapsed from N calls to 1.
         if any(a in ("-h", "--help") for a in sys.argv[2:]):
             _print_subcmd_help("summarize")
             return
-        from graphify.navigate import DEFAULT_GRAPH_PATH, load_graph
+        from graphify.navigate import DEFAULT_GRAPH_PATH, load_graph, _read_body_full
         from collections import Counter as _Counter
         graph_path = DEFAULT_GRAPH_PATH
+        target: str | None = None
+        method_limit = 30
+        caller_limit = 8
+        md = False
         args = sys.argv[2:]
         i = 0
         while i < len(args):
@@ -2174,6 +2190,18 @@ def main() -> None:
                 graph_path = args[i + 1]; i += 2
             elif a.startswith("--graph="):
                 graph_path = a.split("=", 1)[1]; i += 1
+            elif a == "--methods" and i + 1 < len(args):
+                method_limit = max(0, int(args[i + 1])); i += 2
+            elif a.startswith("--methods="):
+                method_limit = max(0, int(a.split("=", 1)[1])); i += 1
+            elif a == "--callers" and i + 1 < len(args):
+                caller_limit = max(0, int(args[i + 1])); i += 2
+            elif a.startswith("--callers="):
+                caller_limit = max(0, int(a.split("=", 1)[1])); i += 1
+            elif a == "--md":
+                md = True; i += 1
+            elif target is None and not a.startswith("--"):
+                target = a; i += 1
             else:
                 i += 1
         gp = Path(graph_path)
@@ -2182,6 +2210,224 @@ def main() -> None:
                   file=sys.stderr)
             sys.exit(1)
         G, communities = load_graph(gp)
+
+        # Class-summary mode: target arg → fused class context. Mirrors
+        # peek/blast disambig output so the caller can re-issue with a
+        # path-qualified target.
+        if target:
+            from graphify.resolve import label_index, resolve_focus
+            idx = label_index(G)
+            chosen, candidates, match_type, _alts = resolve_focus(G, idx, target)
+            if not chosen:
+                if candidates:
+                    print(f"ambiguous `{target}` ({len(candidates)} matches). "
+                          f"qualify with @<dir>/<file>/<symbol>:", file=sys.stderr)
+                    for nid in candidates[:8]:
+                        a_attrs = G.nodes[nid]
+                        sf_a = a_attrs.get("source_file", "?")
+                        loc_a = a_attrs.get("source_location", "")
+                        label_a = a_attrs.get("label", nid)
+                        print(f"  {label_a}  {sf_a}{':' + loc_a[1:] if loc_a.startswith('L') else ''}",
+                              file=sys.stderr)
+                    if len(candidates) > 8:
+                        print(f"  +{len(candidates) - 8} more", file=sys.stderr)
+                    sys.exit(1)
+                print(f"no node matches `{target}`.", file=sys.stderr)
+                sys.exit(1)
+            if match_type and match_type != "exact":
+                chosen_label = G.nodes[chosen].get("label", chosen)
+                print(f"# matched `{target}` → {chosen_label} ({match_type})")
+            nattrs = G.nodes[chosen]
+            node_kind = nattrs.get("node_kind") or ""
+            if node_kind not in ("class", "interface"):
+                label = nattrs.get("label", chosen)
+                # Lap-23: name the right verb for the target's actual shape.
+                # An agent who typed `summarize @foo` for a function should
+                # be redirected to peek/blast instead of getting a generic
+                # error.
+                hint = "peek" if node_kind in ("function", "method", "impl_method",
+                                               "iface_method") else "peek or blast"
+                print(f"@{label} is a {node_kind or 'symbol'}, not a class. "
+                      f"Try `graphify {hint} \"@{label}\"` instead.",
+                      file=sys.stderr)
+                sys.exit(1)
+
+            label = nattrs.get("label", chosen)
+            sf = nattrs.get("source_file") or "?"
+            loc = nattrs.get("source_location") or ""
+            loc_short = loc[1:] if isinstance(loc, str) and loc.startswith("L") else ""
+
+            # Walk the class's methods. Same pattern as peek-class: succ
+            # edges with relation method/contains, function-shaped nodes,
+            # sorted by start line so output reads top-to-bottom.
+            method_ids: list[str] = []
+            for v in G.successors(chosen):
+                rel = G.edges[chosen, v].get("relation") or ""
+                if rel not in ("method", "contains"):
+                    continue
+                v_kind = G.nodes[v].get("node_kind") or ""
+                v_label = G.nodes[v].get("label", "")
+                if v_kind in ("class", "interface", "type_alias"):
+                    continue
+                if not (v_label.endswith("()") or v_kind in
+                        ("method", "impl_method", "iface_method", "function")):
+                    continue
+                method_ids.append(v)
+
+            def _start_line(nid: str) -> int:
+                vloc = G.nodes[nid].get("source_location") or ""
+                if vloc.startswith("L"):
+                    try:
+                        return int(vloc[1:].split("-", 1)[0].split(":", 1)[0])
+                    except ValueError:
+                        return 1 << 30
+                return 1 << 30
+            method_ids.sort(key=_start_line)
+
+            # Cross-file callers: predecessors via call edges where the
+            # source file differs. This matches `blast`'s callers semantics
+            # but we don't pull out edges (callees) — for a class node
+            # callees are the methods themselves, already listed above.
+            from graphify.navigate import _STRUCTURAL
+            caller_rows: list[tuple[str, str, str, int]] = []
+            seen_callers: set[str] = set()
+            for u in G.predecessors(chosen):
+                rel = G.edges[u, chosen].get("relation") or ""
+                if rel in _STRUCTURAL:
+                    continue
+                u_attrs = G.nodes[u]
+                u_sf = u_attrs.get("source_file") or ""
+                if not u_sf or u_sf == sf:
+                    continue
+                u_label = u_attrs.get("label", u)
+                if u_label in seen_callers:
+                    continue
+                seen_callers.add(u_label)
+                u_loc = u_attrs.get("source_location") or ""
+                u_line = 0
+                if u_loc.startswith("L"):
+                    try:
+                        u_line = int(u_loc[1:].split("-", 1)[0].split(":", 1)[0])
+                    except ValueError:
+                        pass
+                caller_rows.append((u_label, u_sf, u_loc, u_line))
+            caller_rows.sort(key=lambda r: r[1])
+
+            # Inheritance: succ edges with relation==inherits → parent(s).
+            # pred edges with relation==inherits → children. Siblings = other
+            # children of the same parent (excluding self), capped.
+            parent_ids = [v for v in G.successors(chosen)
+                          if G.edges[chosen, v].get("relation") == "inherits"]
+            child_ids = [u for u in G.predecessors(chosen)
+                         if G.edges[u, chosen].get("relation") == "inherits"]
+            sibling_labels: list[str] = []
+            for pid in parent_ids:
+                for u in G.predecessors(pid):
+                    if u == chosen:
+                        continue
+                    if G.edges[u, pid].get("relation") != "inherits":
+                        continue
+                    s_label = G.nodes[u].get("label", u)
+                    if s_label not in sibling_labels:
+                        sibling_labels.append(s_label)
+
+            # Header line: dense one-shot summary stat row.
+            kind_word = "class" if node_kind == "class" else "interface"
+            parent_str = ""
+            if parent_ids:
+                p_labels = ", ".join(G.nodes[p].get("label", p) for p in parent_ids[:3])
+                parent_str = f" · inherits {p_labels}"
+            child_str = ""
+            if child_ids:
+                child_str = f" · {len(child_ids)} subclass{'es' if len(child_ids) != 1 else ''}"
+            print(f"summarize {kind_word} @{label}  {sf}{':' + loc_short if loc_short else ''}  "
+                  f"({len(method_ids)} method{'s' if len(method_ids) != 1 else ''} · "
+                  f"{len(caller_rows)} caller{'s' if len(caller_rows) != 1 else ''}"
+                  f"{parent_str}{child_str})")
+            print()
+
+            # Class signature line — first line of class body.
+            class_head, _ln, _trunc = _read_body_full(sf, loc, max_lines=1, flat=True)
+            if class_head:
+                print("## Signature")
+                print(f"  {class_head[0].rstrip()}")
+                print()
+
+            # Methods: signature line only (no body — that's what peek
+            # is for). Each row: label + line range. Sorted in source order.
+            print(f"## Methods ({len(method_ids)})")
+            if method_ids:
+                shown = method_ids[:method_limit] if method_limit > 0 else method_ids
+                for mid in shown:
+                    m = G.nodes[mid]
+                    m_label = m.get("label", mid) or mid
+                    m_loc = m.get("source_location") or ""
+                    m_loc_short = m_loc[1:] if m_loc.startswith("L") else ""
+                    disp = m_label.lstrip(".") if m_label.startswith(".") else m_label
+                    if md and m_loc_short:
+                        m_sf = m.get("source_file") or sf
+                        print(f"  - [{disp}]({m_sf}:{m_loc_short})")
+                    elif m_loc_short:
+                        print(f"  - {disp}  L{m_loc_short}")
+                    else:
+                        print(f"  - {disp}")
+                more = len(method_ids) - len(shown)
+                if more > 0:
+                    print(f"  +{more} more — `peek @{label}` for method bodies, "
+                          f"or `summarize @{label} --methods 0` for the full list")
+            else:
+                print("  (none)")
+            print()
+
+            # Used by: cross-file callers, capped. Pre-answers "where is
+            # this class instantiated?"
+            print(f"## Used by ({len(caller_rows)} cross-file caller{'s' if len(caller_rows) != 1 else ''})")
+            if caller_rows:
+                shown_callers = caller_rows[:caller_limit] if caller_limit > 0 else caller_rows
+                for u_label, u_sf, u_loc, _u_line in shown_callers:
+                    u_loc_short = u_loc[1:] if u_loc.startswith("L") else ""
+                    if md and u_loc_short:
+                        print(f"  - [{u_label}]({u_sf}:{u_loc_short})")
+                    elif u_loc_short:
+                        print(f"  - {u_label}  {u_sf}:{u_loc_short}")
+                    else:
+                        print(f"  - {u_label}  {u_sf}")
+                more_c = len(caller_rows) - len(shown_callers)
+                if more_c > 0:
+                    print(f"  +{more_c} more — `blast @{label}` for the full list")
+            else:
+                print("  (none — use `--include-inferred` if dynamic dispatch is suspected)")
+
+            # Inheritance: parent, children count, siblings (capped).
+            # Skip the section entirely if there's nothing to say — agents
+            # don't need a "no inheritance" line for non-OO trees.
+            if parent_ids or child_ids or sibling_labels:
+                print()
+                print("## Inheritance")
+                if parent_ids:
+                    for pid in parent_ids:
+                        p_attrs = G.nodes[pid]
+                        p_label = p_attrs.get("label", pid)
+                        p_sf = p_attrs.get("source_file") or "?"
+                        p_loc = p_attrs.get("source_location") or ""
+                        p_loc_short = p_loc[1:] if p_loc.startswith("L") else ""
+                        if p_loc_short:
+                            print(f"  parent:   {p_label}  {p_sf}:{p_loc_short}")
+                        else:
+                            print(f"  parent:   {p_label}  {p_sf}")
+                if sibling_labels:
+                    sib_show = sibling_labels[:8]
+                    sib_str = ", ".join(sib_show)
+                    sib_more = len(sibling_labels) - len(sib_show)
+                    suffix = f" (+{sib_more} more)" if sib_more > 0 else ""
+                    print(f"  siblings: {sib_str}{suffix}")
+                if child_ids:
+                    child_labels = [G.nodes[c].get("label", c) for c in child_ids[:8]]
+                    cstr = ", ".join(child_labels)
+                    cmore = len(child_ids) - len(child_labels)
+                    suffix = f" (+{cmore} more)" if cmore > 0 else ""
+                    print(f"  children: {cstr}{suffix}")
+            return
 
         # Top-line stats.
         n_nodes = G.number_of_nodes()

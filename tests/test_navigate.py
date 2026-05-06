@@ -4712,3 +4712,244 @@ def test_navigate_unique_prefix_suppresses_warning_at_similar_degree(tmp_path):
         f"unique prefix should suppress 'also near' even at similar "
         f"degree:\n{out}"
     )
+
+
+def test_summarize_class_emits_sig_methods_callers_inheritance(tmp_path, monkeypatch):
+    """Lap-23 (meta-harness task_004/005 cluster-B fix): `graphify summarize
+    @<Class>` is the one-shot class summary — fuses class signature,
+    method list, cross-file callers (used-by), and inheritance into a
+    single call. Targets the bimodal failure mode where agents fall back
+    to read_file because no graphify verb gave them class-level context."""
+    import subprocess
+    nodes = [
+        {"id": "f1", "label": "lib.py", "file_type": "code",
+         "source_file": "lib.py", "source_location": "L1",
+         "node_kind": "file"},
+        {"id": "f2", "label": "user.py", "file_type": "code",
+         "source_file": "user.py", "source_location": "L1",
+         "node_kind": "file"},
+        {"id": "parent", "label": "BaseShape", "file_type": "code",
+         "source_file": "lib.py", "source_location": "L1-9",
+         "node_kind": "class"},
+        {"id": "klass", "label": "KleinBottle", "file_type": "code",
+         "source_file": "lib.py", "source_location": "L10-40",
+         "node_kind": "class"},
+        {"id": "sib", "label": "Torus", "file_type": "code",
+         "source_file": "lib.py", "source_location": "L42-60",
+         "node_kind": "class"},
+        {"id": "child", "label": "WeirdKlein", "file_type": "code",
+         "source_file": "lib.py", "source_location": "L62-70",
+         "node_kind": "class"},
+        {"id": "m1", "label": ".__init__()", "file_type": "code",
+         "source_file": "lib.py", "source_location": "L11-14",
+         "node_kind": "method"},
+        {"id": "m2", "label": ".embed()", "file_type": "code",
+         "source_file": "lib.py", "source_location": "L16-22",
+         "node_kind": "method"},
+        {"id": "m3", "label": ".compute_metrics()", "file_type": "code",
+         "source_file": "lib.py", "source_location": "L24-38",
+         "node_kind": "method"},
+        {"id": "caller", "label": "make_klein()", "file_type": "code",
+         "source_file": "user.py", "source_location": "L5-8",
+         "node_kind": "function"},
+    ]
+    links = [
+        # Structural: file contains classes; classes contain methods.
+        {"source": "f1", "target": "parent", "relation": "contains",
+         "confidence": "EXTRACTED"},
+        {"source": "f1", "target": "klass", "relation": "contains",
+         "confidence": "EXTRACTED"},
+        {"source": "f1", "target": "sib", "relation": "contains",
+         "confidence": "EXTRACTED"},
+        {"source": "f1", "target": "child", "relation": "contains",
+         "confidence": "EXTRACTED"},
+        {"source": "f2", "target": "caller", "relation": "contains",
+         "confidence": "EXTRACTED"},
+        {"source": "klass", "target": "m1", "relation": "method",
+         "confidence": "EXTRACTED"},
+        {"source": "klass", "target": "m2", "relation": "method",
+         "confidence": "EXTRACTED"},
+        {"source": "klass", "target": "m3", "relation": "method",
+         "confidence": "EXTRACTED"},
+        # Inheritance: KleinBottle extends BaseShape; Torus too (sibling);
+        # WeirdKlein extends KleinBottle (child).
+        {"source": "klass", "target": "parent", "relation": "inherits",
+         "confidence": "EXTRACTED"},
+        {"source": "sib", "target": "parent", "relation": "inherits",
+         "confidence": "EXTRACTED"},
+        {"source": "child", "target": "klass", "relation": "inherits",
+         "confidence": "EXTRACTED"},
+        # Cross-file caller instantiates the class.
+        {"source": "caller", "target": "klass", "relation": "calls",
+         "confidence": "EXTRACTED"},
+    ]
+    _write_graph(tmp_path / "graphify-out", nodes, links)
+    # Write actual source so the Signature section can read the class header.
+    (tmp_path / "lib.py").write_text(
+        "class BaseShape:\n    pass\n\n\n"  # L1-9 (with blank lines)
+        "\n\n\n\n\n"
+        "class KleinBottle(BaseShape):\n"  # L10
+        "    def __init__(self):\n        self.x = 0\n        return\n\n"  # L11-14
+        "    def embed(self):\n        pass\n        pass\n        pass\n"
+        "        pass\n        pass\n        pass\n\n"  # L16-22
+        "    def compute_metrics(self):\n        return {}\n",  # L24-38
+        encoding="utf-8",
+    )
+    (tmp_path / "user.py").write_text(
+        "from lib import KleinBottle\n\n\n\n\n"
+        "def make_klein():\n    return KleinBottle()\n",
+        encoding="utf-8",
+    )
+    monkeypatch.chdir(tmp_path)
+    res = subprocess.run(
+        ["python", "-m", "graphify", "summarize", "KleinBottle"],
+        capture_output=True, text=True, cwd=str(tmp_path), timeout=15,
+    )
+    assert res.returncode == 0, f"summarize failed: stderr={res.stderr}"
+    out = res.stdout
+    # Header announces class + counts + inheritance.
+    assert "summarize class @KleinBottle" in out, (
+        f"header missing class name:\n{out}"
+    )
+    assert "3 methods" in out, f"method count missing:\n{out}"
+    assert "1 caller" in out, f"caller count missing:\n{out}"
+    assert "BaseShape" in out, f"parent inheritance missing from header:\n{out}"
+    assert "1 subclass" in out, f"child count missing:\n{out}"
+    # Four labeled sections in source order.
+    sig_idx = out.find("## Signature")
+    methods_idx = out.find("## Methods")
+    used_idx = out.find("## Used by")
+    inh_idx = out.find("## Inheritance")
+    assert 0 <= sig_idx < methods_idx < used_idx < inh_idx, (
+        f"expected sections in order Signature, Methods, Used by, "
+        f"Inheritance:\n{out}"
+    )
+    # Signature block contains the class declaration line from source.
+    sig_block = out[sig_idx:methods_idx]
+    assert "class KleinBottle" in sig_block, (
+        f"Signature block should contain the class declaration line:\n{sig_block}"
+    )
+    # Methods listed in source order (start-line ascending).
+    methods_block = out[methods_idx:used_idx]
+    init_pos = methods_block.find("__init__")
+    embed_pos = methods_block.find("embed")
+    metrics_pos = methods_block.find("compute_metrics")
+    assert 0 <= init_pos < embed_pos < metrics_pos, (
+        f"methods should be sorted by source line:\n{methods_block}"
+    )
+    # Used-by names the cross-file caller with file:line.
+    used_block = out[used_idx:inh_idx]
+    assert "make_klein" in used_block and "user.py" in used_block, (
+        f"used-by should name cross-file caller with location:\n{used_block}"
+    )
+    # Inheritance section names parent, sibling, and child.
+    inh_block = out[inh_idx:]
+    assert "BaseShape" in inh_block, f"parent missing in Inheritance:\n{inh_block}"
+    assert "Torus" in inh_block, f"sibling missing:\n{inh_block}"
+    assert "WeirdKlein" in inh_block, f"child missing:\n{inh_block}"
+
+
+def test_summarize_class_handles_no_callers_no_inheritance(tmp_path, monkeypatch):
+    """A standalone class with no cross-file callers and no inheritance
+    should still emit the class header + methods, but skip the
+    Inheritance section entirely (don't waste tokens on a 'no parents'
+    line)."""
+    import subprocess
+    nodes = [
+        {"id": "f", "label": "lib.py", "file_type": "code",
+         "source_file": "lib.py", "source_location": "L1",
+         "node_kind": "file"},
+        {"id": "klass", "label": "Solo", "file_type": "code",
+         "source_file": "lib.py", "source_location": "L5-15",
+         "node_kind": "class"},
+        {"id": "m", "label": ".do_thing()", "file_type": "code",
+         "source_file": "lib.py", "source_location": "L7-12",
+         "node_kind": "method"},
+    ]
+    links = [
+        {"source": "f", "target": "klass", "relation": "contains",
+         "confidence": "EXTRACTED"},
+        {"source": "klass", "target": "m", "relation": "method",
+         "confidence": "EXTRACTED"},
+    ]
+    _write_graph(tmp_path / "graphify-out", nodes, links)
+    monkeypatch.chdir(tmp_path)
+    res = subprocess.run(
+        ["python", "-m", "graphify", "summarize", "Solo"],
+        capture_output=True, text=True, cwd=str(tmp_path), timeout=15,
+    )
+    assert res.returncode == 0, f"summarize failed: stderr={res.stderr}"
+    out = res.stdout
+    assert "summarize class @Solo" in out
+    # Inheritance section should be omitted when there's nothing to say.
+    assert "## Inheritance" not in out, (
+        f"empty Inheritance section should be skipped to save tokens:\n{out}"
+    )
+    # Used-by emits "(none)" so the agent doesn't wonder if the section
+    # was dropped.
+    assert "## Used by" in out and "(none" in out, (
+        f"Used by section should appear with (none) marker:\n{out}"
+    )
+
+
+def test_summarize_rejects_function_target_with_redirect(tmp_path, monkeypatch):
+    """Class summary is class-shaped; aiming `summarize` at a function
+    should fail loudly and name the right verb (peek/blast) so the agent
+    doesn't guess."""
+    import subprocess
+    nodes = [
+        {"id": "f", "label": "lib.py", "file_type": "code",
+         "source_file": "lib.py", "source_location": "L1",
+         "node_kind": "file"},
+        {"id": "fn", "label": "do_work()", "file_type": "code",
+         "source_file": "lib.py", "source_location": "L5-10",
+         "node_kind": "function"},
+    ]
+    links = [
+        {"source": "f", "target": "fn", "relation": "contains",
+         "confidence": "EXTRACTED"},
+    ]
+    _write_graph(tmp_path / "graphify-out", nodes, links)
+    monkeypatch.chdir(tmp_path)
+    res = subprocess.run(
+        ["python", "-m", "graphify", "summarize", "do_work"],
+        capture_output=True, text=True, cwd=str(tmp_path), timeout=15,
+    )
+    assert res.returncode == 1, "should exit non-zero on wrong target shape"
+    err = res.stderr
+    assert "not a class" in err, f"error should name the shape mismatch:\n{err}"
+    assert "peek" in err, f"error should redirect to peek:\n{err}"
+
+
+def test_summarize_no_target_keeps_repo_overview(tmp_path, monkeypatch):
+    """Regression check: bare `graphify summarize` still emits the
+    repo-wide architectural overview (top communities, edge mix, etc.).
+    Lap-23 added @<Class> mode but must not break the no-arg path."""
+    import subprocess
+    nodes = [
+        {"id": "f", "label": "lib.py", "file_type": "code",
+         "source_file": "lib.py", "source_location": "L1",
+         "node_kind": "file"},
+        {"id": "fn", "label": "do_work()", "file_type": "code",
+         "source_file": "lib.py", "source_location": "L5-10",
+         "node_kind": "function"},
+    ]
+    links = [
+        {"source": "f", "target": "fn", "relation": "contains",
+         "confidence": "EXTRACTED"},
+    ]
+    _write_graph(tmp_path / "graphify-out", nodes, links)
+    monkeypatch.chdir(tmp_path)
+    res = subprocess.run(
+        ["python", "-m", "graphify", "summarize"],
+        capture_output=True, text=True, cwd=str(tmp_path), timeout=15,
+    )
+    assert res.returncode == 0, f"summarize (no arg) failed: stderr={res.stderr}"
+    out = res.stdout
+    # Markers from the existing repo-overview path.
+    assert "graphify summarize:" in out, (
+        f"no-arg summarize should emit repo overview header:\n{out}"
+    )
+    assert "nodes" in out and "edges" in out and "communities" in out, (
+        f"no-arg summarize should emit top-line stats:\n{out}"
+    )
