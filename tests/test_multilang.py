@@ -224,6 +224,164 @@ def test_ts_closure_factory_intra_call_attributes_correctly():
     )
 
 
+def test_ts_object_literal_method_shorthand_extracted(tmp_path):
+    """Lap-20 issue #2: `const X: T = { run() {} }` keeps experiment logic
+    in object methods. Without this, the `run` method is invisible and
+    only the `config` const node surfaces."""
+    src = tmp_path / "experiment.ts"
+    src.write_text("""
+interface ExperimentConfig {
+  run(engine: any): void;
+}
+const config: ExperimentConfig = {
+  async run(engine, tokenizer, onResult) {
+    return 1;
+  },
+};
+""")
+    r = extract_js(src)
+    by_label = {n["label"]: n for n in r["nodes"]}
+    assert "config.run()" in by_label, (
+        f"object-literal method not extracted; got: {sorted(by_label)}"
+    )
+    config_id = by_label["config"]["id"]
+    run_id = by_label["config.run()"]["id"]
+    method_pairs = {(e["source"], e["target"])
+                    for e in r["edges"] if e["relation"] == "method"}
+    assert (config_id, run_id) in method_pairs, (
+        f"missing method edge config -> config.run; edges: {r['edges']}"
+    )
+
+
+def test_ts_object_literal_method_colon_form_extracted(tmp_path):
+    """`name: function() {}` colon form must extract too — older codebases
+    and TS users avoiding the shorthand pattern often write it this way."""
+    src = tmp_path / "colonform.ts"
+    src.write_text("""
+const handlers = {
+  onLoad: function(evt) { return evt; },
+  onError: function(err) { return err; },
+};
+""")
+    r = extract_js(src)
+    by_label = {n["label"]: n for n in r["nodes"]}
+    assert "handlers.onLoad()" in by_label, sorted(by_label)
+    assert "handlers.onError()" in by_label, sorted(by_label)
+
+
+def test_ts_object_literal_arrow_form_extracted(tmp_path):
+    """Arrow-function values inside object literals — third common shape."""
+    src = tmp_path / "arrowform.ts"
+    src.write_text("""
+const utils = {
+  add: (a, b) => a + b,
+  mul: (a, b) => { return a * b; },
+};
+""")
+    r = extract_js(src)
+    by_label = {n["label"]: n for n in r["nodes"]}
+    assert "utils.add()" in by_label, sorted(by_label)
+    assert "utils.mul()" in by_label, sorted(by_label)
+
+
+def test_ts_object_literal_as_const_extracted(tmp_path):
+    """`{ run() {} } as const` — the object lives inside an `as_expression`
+    wrapper. Must unwrap before walking methods."""
+    src = tmp_path / "asconst.ts"
+    src.write_text("""
+const config = {
+  run() { return 1; },
+} as const;
+""")
+    r = extract_js(src)
+    by_label = {n["label"]: n for n in r["nodes"]}
+    assert "config.run()" in by_label, sorted(by_label)
+
+
+def test_ts_object_literal_method_calls_resolve(tmp_path):
+    """The object-method body should be walked for calls. Verifies
+    function_bodies registration so call-edges resolve to imported/local
+    helpers like normal function bodies."""
+    src = tmp_path / "callsfromobj.ts"
+    src.write_text("""
+function helper(x: number): number { return x * 2; }
+const config = {
+  async run(engine) {
+    return helper(1);
+  },
+};
+""")
+    r = extract_js(src)
+    by_label = {n["label"]: n["id"] for n in r["nodes"]}
+    call_edges = {(e["source"], e["target"])
+                  for e in r["edges"] if e["relation"] == "calls"}
+    assert (by_label["config.run()"], by_label["helper()"]) in call_edges, (
+        f"call from object-method body not resolved; got: {call_edges}"
+    )
+
+
+def test_ts_function_source_location_carries_end_line(tmp_path):
+    """Lap-20 issue #1: function nodes need an explicit closing-brace line
+    in `source_location: L<start>-<end>` so `shape`'s longest-fn calc can
+    report the actual body length, not next-sibling-start approximation."""
+    src = tmp_path / "endline.ts"
+    src.write_text("""function alpha() {
+  return 1;
+}
+
+function beta() {
+  return 2;
+}
+""")
+    r = extract_js(src)
+    by_label = {n["label"]: n for n in r["nodes"]}
+    alpha_loc = by_label["alpha()"]["source_location"]
+    assert alpha_loc.startswith("L1-"), f"alpha loc lacks end-line: {alpha_loc}"
+    # alpha runs L1..L3 inclusive (3 lines)
+    start_str, end_str = alpha_loc[1:].split("-", 1)
+    assert int(end_str) - int(start_str) + 1 == 3, alpha_loc
+
+
+def test_ts_shape_longest_fn_uses_end_line_not_next_sibling(tmp_path):
+    """The procedural-script bug: trailing module-level `const` and
+    statements after the last fn should NOT inflate the last fn's
+    reported length."""
+    from graphify.build import build
+    from graphify.navigate import shape_file
+    src = tmp_path / "proc.ts"
+    src.write_text("""function alpha() {
+  return 1;
+}
+
+function unit() {
+  // 3-line body
+  return 1;
+}
+
+const config = {
+  enabled: true,
+  threshold: 0.5,
+  retries: 3,
+};
+
+console.log("trailing");
+console.log("more");
+const final = config.enabled;
+""")
+    r = extract_js(src)
+    G = build([r], directed=True)
+    file_nid = next(n for n, d in G.nodes(data=True)
+                    if d.get("label") == "proc.ts")
+    s = shape_file(G, file_nid)
+    longest = s["longest_fn"]
+    # `unit()` body is 4 lines (L5-L8). Without the fix, next-sibling ran
+    # to EOF (~17 lines).
+    assert longest is not None
+    assert longest["lines"] <= 5, (
+        f"longest_fn over-counts trailing statements: {longest}"
+    )
+
+
 # ── Go ────────────────────────────────────────────────────────────────────────
 
 def test_go_finds_struct():

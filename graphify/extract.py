@@ -479,6 +479,9 @@ def _js_extra_walk(node, source: bytes, file_nid: str, stem: str, str_path: str,
        - arrow functions / function expressions (existing behaviour)
        - module-level const literals (object/array/string/call/new/etc.) — TS codebases
          use these for configs, route maps, DI tokens, enum-like unions.
+       - object-literal method properties: `const X = { run() {}, helper: function() {} }`
+         — research/experiment/config files keep the actual logic in object methods that
+         would otherwise be invisible to the graph.
     Returns True if handled."""
     if node.type == "lexical_declaration":
         for child in node.children:
@@ -489,8 +492,9 @@ def _js_extra_walk(node, source: bytes, file_nid: str, stem: str, str_path: str,
                     if name_node:
                         func_name = _read_text(name_node, source)
                         line = child.start_point[0] + 1
+                        end_line = child.end_point[0] + 1
                         func_nid = _make_id(stem, func_name)
-                        add_node_fn(func_nid, f"{func_name}()", line)
+                        add_node_fn(func_nid, f"{func_name}()", line, end_line=end_line)
                         add_edge_fn(file_nid, func_nid, "contains", line)
                         body = value.child_by_field_name("body")
                         if body:
@@ -507,8 +511,108 @@ def _js_extra_walk(node, source: bytes, file_nid: str, stem: str, str_path: str,
                         const_nid = _make_id(stem, const_name)
                         add_node_fn(const_nid, const_name, line)
                         add_edge_fn(file_nid, const_nid, "contains", line)
+
+                        # Object-literal method properties — the experiment/
+                        # config pattern. `const X: T = { run() {}, helper:
+                        # function() {} }` keeps the actual logic in methods
+                        # that the function-types pass never sees because
+                        # they live inside an `object` node, not a
+                        # `class_body`. Walk the object (unwrap `as_expression`
+                        # / `as const` first) and emit each method as a
+                        # method-edged child of the const.
+                        obj_node = value
+                        if obj_node.type == "as_expression":
+                            for sub in obj_node.children:
+                                if sub.type == "object":
+                                    obj_node = sub
+                                    break
+                        if obj_node.type == "object":
+                            _emit_object_methods(
+                                obj_node, source, stem, const_nid,
+                                function_bodies, add_node_fn, add_edge_fn,
+                            )
         return True
     return False
+
+
+def _emit_object_methods(obj_node, source: bytes, stem: str, owner_nid: str,
+                          function_bodies: list,
+                          add_node_fn, add_edge_fn) -> None:
+    """Extract method properties from an object literal as graph nodes.
+
+    Handles two shapes:
+      - `method_definition`: `async run() {}` / `run() {}` shorthand
+      - `pair` with `function_expression` / `arrow_function` value:
+        `helper: function() {}` / `arrow: () => {}` colon form
+
+    Method nodes are method-edged children of `owner_nid` and labelled
+    `<owner>.<method>()` so search by either binding or method name finds
+    them. Bodies are appended to `function_bodies` so the call-graph pass
+    walks them like any other function body.
+    """
+    owner_label_short = owner_nid.split("_")[-1] if owner_nid else ""
+    for member in obj_node.children:
+        mt = member.type
+        if mt == "method_definition":
+            name_node = member.child_by_field_name("name")
+            if not name_node:
+                # Fallback: look for the first property_identifier child
+                for c in member.children:
+                    if c.type == "property_identifier":
+                        name_node = c
+                        break
+            if not name_node:
+                continue
+            method_name = _read_text(name_node, source)
+            if not method_name:
+                continue
+            line = member.start_point[0] + 1
+            end_line = member.end_point[0] + 1
+            method_nid = _make_id(owner_nid, method_name)
+            label = f"{owner_label_short}.{method_name}()" if owner_label_short else f"{method_name}()"
+            add_node_fn(method_nid, label, line, end_line=end_line)
+            add_edge_fn(owner_nid, method_nid, "method", line)
+            body = member.child_by_field_name("body")
+            if body is None:
+                for c in member.children:
+                    if c.type == "statement_block":
+                        body = c
+                        break
+            if body is not None:
+                function_bodies.append((method_nid, body))
+        elif mt == "pair":
+            # `name: function() {...}` or `name: () => {...}`
+            key_node = member.child_by_field_name("key")
+            val_node = member.child_by_field_name("value")
+            if key_node is None or val_node is None:
+                # Fallback by child position when fields aren't set
+                named = [c for c in member.children if c.is_named]
+                if len(named) >= 2:
+                    key_node = key_node or named[0]
+                    val_node = val_node or named[-1]
+            if key_node is None or val_node is None:
+                continue
+            if val_node.type not in ("function_expression", "arrow_function"):
+                continue
+            if key_node.type not in ("property_identifier", "string", "computed_property_name"):
+                continue
+            method_name = _read_text(key_node, source).strip('"\'`')
+            if not method_name:
+                continue
+            line = member.start_point[0] + 1
+            end_line = member.end_point[0] + 1
+            method_nid = _make_id(owner_nid, method_name)
+            label = f"{owner_label_short}.{method_name}()" if owner_label_short else f"{method_name}()"
+            add_node_fn(method_nid, label, line, end_line=end_line)
+            add_edge_fn(owner_nid, method_nid, "method", line)
+            body = val_node.child_by_field_name("body")
+            if body is None:
+                for c in val_node.children:
+                    if c.type == "statement_block":
+                        body = c
+                        break
+            if body is not None:
+                function_bodies.append((method_nid, body))
 
 
 # ── C# extra walk for namespace declarations ──────────────────────────────────
@@ -851,15 +955,29 @@ def _extract_generic(path: Path, config: LanguageConfig) -> dict:
     # without threading a parent_kind variable through every walk arm.
     nid_to_kind: dict[str, str] = {}
 
-    def add_node(nid: str, label: str, line: int, kind: str | None = None) -> None:
+    def add_node(nid: str, label: str, line: int, kind: str | None = None,
+                 end_line: int | None = None) -> None:
         if nid not in seen_ids:
             seen_ids.add(nid)
+            # `source_location` carries an end-line (`L<start>-<end>`) when
+            # the caller supplies one. Function-shaped extractors pass
+            # `node.end_point[0] + 1` so `shape`'s longest-fn calc uses the
+            # actual closing-brace line instead of next-sibling-start —
+            # otherwise the LAST top-level fn in a file absorbs trailing
+            # module-level statements and reports inflated lengths.
+            # Emit `L<start>-<end>` even when start == end (single-line fn)
+            # so `shape_file` has an explicit end-marker and never falls
+            # through to next-sibling for these nodes.
+            if end_line is not None and end_line >= line:
+                loc = f"L{line}-{end_line}"
+            else:
+                loc = f"L{line}"
             attrs: dict = {
                 "id": nid,
                 "label": label,
                 "file_type": "code",
                 "source_file": str_path,
-                "source_location": f"L{line}",
+                "source_location": loc,
             }
             # `node_kind` distinguishes class vs interface vs type-alias vs
             # iface-method vs impl-method. The disambig listing reads this
@@ -1138,6 +1256,7 @@ def _extract_generic(path: Path, config: LanguageConfig) -> dict:
                 return
 
             line = node.start_point[0] + 1
+            end_line = node.end_point[0] + 1
             if parent_class_nid:
                 # Method shape depends on parent kind: interface members
                 # are signatures (no body), class methods are impls.
@@ -1154,11 +1273,12 @@ def _extract_generic(path: Path, config: LanguageConfig) -> dict:
                 else:
                     method_kind = None
                 func_nid = _make_id(parent_class_nid, func_name)
-                add_node(func_nid, f".{func_name}()", line, kind=method_kind)
+                add_node(func_nid, f".{func_name}()", line,
+                         kind=method_kind, end_line=end_line)
                 add_edge(parent_class_nid, func_nid, "method", line)
             else:
                 func_nid = _make_id(stem, func_name)
-                add_node(func_nid, f"{func_name}()", line)
+                add_node(func_nid, f"{func_name}()", line, end_line=end_line)
                 add_edge(file_nid, func_nid, "contains", line)
 
             body = _find_body(node, config)

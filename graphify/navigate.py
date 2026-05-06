@@ -2880,23 +2880,38 @@ def shape_file(G: nx.DiGraph, file_nid: str, *,
 
     fn_spans: dict[str, int] = {}
     if file_lines:
-        starts: list[tuple[int, str]] = []
+        # Two-tier span resolution. When the extractor stamped a precise
+        # end-line via `L<start>-<end>` (TS extractor for functions/methods),
+        # use that — the actual closing brace, not next-sibling-start.
+        # Otherwise fall back to next-sibling-start as an approximation.
+        # Without this, the LAST top-level fn in a procedural file absorbs
+        # all trailing module-level statements (`const config = {...}`,
+        # `console.log(...)`, etc.) and reports inflated lengths.
+        starts: list[tuple[int, str, int | None]] = []
         for nid, attrs in children:
             loc = attrs.get("source_location") or ""
             if not loc.startswith("L"):
                 continue
             try:
-                start = int(loc[1:].split("-", 1)[0].split(":", 1)[0])
+                rest = loc[1:].split(":", 1)[0]
+                if "-" in rest:
+                    start_str, end_str = rest.split("-", 1)
+                    start = int(start_str)
+                    explicit_end: int | None = int(end_str)
+                else:
+                    start = int(rest)
+                    explicit_end = None
             except ValueError:
                 continue
-            starts.append((start, nid))
+            starts.append((start, nid, explicit_end))
         starts.sort(key=lambda x: x[0])
-        # Each child's span runs from its start to the next sibling's
-        # start (or end of file). Approximation — nested decls would
-        # bleed into the parent's span — but for top-level decls in a
-        # file this is accurate to within ~2 lines.
-        for idx, (start, nid) in enumerate(starts):
-            end = starts[idx + 1][0] - 1 if idx + 1 < len(starts) else len(file_lines)
+        for idx, (start, nid, explicit_end) in enumerate(starts):
+            if explicit_end is not None:
+                end = explicit_end
+            elif idx + 1 < len(starts):
+                end = starts[idx + 1][0] - 1
+            else:
+                end = len(file_lines)
             fn_spans[nid] = max(1, end - start + 1)
 
     longest_fn: dict | None = None
