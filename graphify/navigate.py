@@ -1990,8 +1990,21 @@ def _render_listing_text(data: dict, *, show_ops: bool, md: bool = False) -> str
     else:
         count_str = f"({data['total']})"
     header = f"  {data['pivot']}{kinds_tag} {count_str}"
+    sort = data.get("sort") or ""
+    # Lap-21: surface a `[depth≤N]` annotation when the listing was
+    # produced by a transitive walk. Without this, `out --depth=3 -k calls`
+    # returning 2 rows looks identical to the depth=1 case — the agent
+    # can't tell whether the walk fanned out or just dead-ended at hop 1.
+    depth_tag = ""
+    if sort.startswith("transitive (depth"):
+        try:
+            depth_marker = sort.split("(", 1)[1].split(")", 1)[0]
+            depth_tag = f" [{depth_marker}]"
+        except Exception:
+            depth_tag = ""
+    if depth_tag:
+        header += depth_tag
     if data["total"] > data["showing"]:
-        sort = data.get("sort") or ""
         if sort:
             header += f" — top {data['showing']} by {sort}"
         else:

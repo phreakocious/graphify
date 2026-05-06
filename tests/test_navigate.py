@@ -2236,6 +2236,52 @@ def test_frontier_header_disambiguates_focus_from_community(tmp_path, monkeypatc
     )
 
 
+def test_listing_header_surfaces_transitive_depth_tag(tmp_path, monkeypatch):
+    """Lap-21: `out --depth=3` lands on a transitive walk via
+    `_transitive_walk`, but the listing header used to look identical
+    to the depth=1 case. Surface `[depth≤N]` annotation on the pivot
+    header so the agent knows the walk fanned out."""
+    from graphify.navigate import navigate
+    nodes = [
+        {"id": "a", "label": "a()", "file_type": "code",
+         "source_file": "x.py", "source_location": "L1"},
+        {"id": "b", "label": "b()", "file_type": "code",
+         "source_file": "x.py", "source_location": "L5"},
+        {"id": "c", "label": "c()", "file_type": "code",
+         "source_file": "x.py", "source_location": "L10"},
+    ]
+    links = [
+        {"source": "a", "target": "b", "relation": "calls",
+         "confidence": "EXTRACTED"},
+        {"source": "b", "target": "c", "relation": "calls",
+         "confidence": "EXTRACTED"},
+    ]
+    _write_graph(tmp_path / "graphify-out", nodes, links)
+    monkeypatch.chdir(tmp_path)
+
+    # Default depth: no tag.
+    out_default = navigate(["@a", "out"], session=False, fmt="text",
+                            kinds={"calls"}, depth=1)
+    pivot_line = next((ln for ln in out_default.splitlines()
+                        if "↘out" in ln), "")
+    assert "[depth" not in pivot_line, (
+        f"depth=1 should not show depth tag:\n{out_default}"
+    )
+
+    # depth=3: tag present.
+    out_walk = navigate(["@a", "out"], session=False, fmt="text",
+                         kinds={"calls"}, depth=3)
+    pivot_line2 = next((ln for ln in out_walk.splitlines()
+                         if "↘out" in ln), "")
+    assert "[depth" in pivot_line2, (
+        f"depth>1 should show depth tag:\n{out_walk}"
+    )
+    # Walk also surfaces the additional callee.
+    assert "c()" in out_walk, (
+        f"depth=3 walk should reach c() through b():\n{out_walk}"
+    )
+
+
 def test_chain_summary_drops_redundant_resolution_arrow(tmp_path, monkeypatch):
     """Lap-21 polish: chain trace `@Cursor→@Cursor → methods(3)` repeats
     itself when the input matches the resolved label. Drop the
