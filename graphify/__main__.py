@@ -332,7 +332,8 @@ This project has a graphify knowledge graph at `graphify-out/graph.json`. Use it
 Before any of these moves, scout the graph first — it's 50–500x cheaper than the alternative:
 
 - **About to `Read` a source-code file you don't already know.** Run `graphify shape "<file>"` for a one-screen summary, or `graphify navigate "@<symbol>"` for the affordance frame. The frontier shows you whether the file is a leaf, hub, or router, and what shape of context you actually need.
-- **About to chain `Grep` / `Glob` calls to trace a call graph or find who-uses-X.** That's literally what `graphify navigate` `in`/`out`/`path` are for. For literal-string lookups across all bodies, `graphify search "<pattern>"` returns hits attributed to nodes (label, file:line, community, degree).
+- **About to chain `Grep` / `Glob` calls to trace a call graph or find who-uses-X.** That's literally what `graphify navigate` `in`/`out`/`path` are for.
+- **About to grep for a string in source code.** Reach for `graphify search "<pattern>"` over `grep -n` when (a) you don't already know the containing symbol, or (b) you want to see parallel definitions across the repo. Search returns hits with symbol attribution (label, file:line, container, community) and ±1 line of context, repo-wide by default. Use raw `grep` for non-source files (markdown, JSON, configs) and right after recent edits when the graph is stale.
 - **About to read a single function to remind yourself what it does.** `graphify peek "<symbol>"` is a one-shot body dump — no cursor, no session.
 - **About to implement, change, or debug something in unfamiliar territory.** Map the blast radius first: focus the entry point, run `in --depth=2 --kind=calls` to see callers two hops out, decide what's actually load-bearing.
 - **You don't know where to start.** `graphify navigate "@<best-guess-label>"` is a free probe — a hit returns a frontier, a miss returns real names you can grab onto.
@@ -398,7 +399,8 @@ This project has a graphify knowledge graph at `graphify-out/graph.json`. Use it
 Before any of these moves, scout the graph first — it's 50–500x cheaper:
 
 - **About to read a source-code file you don't already know.** `graphify shape "<file>"` for a one-screen summary, or `graphify navigate "@<symbol>"` for the affordance frame.
-- **About to chain greps to trace a call graph or find who-uses-X.** That's what `graphify navigate` `in`/`out`/`path` are for. For literal strings: `graphify search "<pattern>"`.
+- **About to chain greps to trace a call graph or find who-uses-X.** That's what `graphify navigate` `in`/`out`/`path` are for.
+- **About to grep for a string in source code.** `graphify search "<pattern>"` when you don't already know the containing symbol, or you want to see parallel defs across the repo. Hits come with symbol attribution (label, file:line, container) and ±1 line of context, repo-wide by default. Raw `grep` for non-source files / right after edits when the graph is stale.
 - **About to read one function.** `graphify peek "<symbol>"` is a one-shot body dump.
 - **About to implement, change, or debug in unfamiliar territory.** Map the blast radius first: focus the entry point, `in --depth=2 --kind=calls`.
 - **You don't know where to start.** `graphify navigate "@<best-guess-label>"` is a free probe.
@@ -448,7 +450,8 @@ This project has a graphify knowledge graph at `graphify-out/graph.json`. Use it
 Before any of these moves, scout the graph first — it's 50–500x cheaper:
 
 - **About to read a source-code file you don't already know.** `graphify shape "<file>"` for a one-screen summary, or `graphify navigate "@<symbol>"` for the affordance frame.
-- **About to chain greps to trace a call graph or find who-uses-X.** `graphify navigate` `in`/`out`/`path` for symbols, `graphify search "<pattern>"` for literal strings.
+- **About to chain greps to trace a call graph or find who-uses-X.** `graphify navigate` `in`/`out`/`path`.
+- **About to grep for a string in source code.** `graphify search "<pattern>"` when you don't already know the containing symbol, or you want parallel defs across the repo. Hits come with symbol attribution (label, file:line, container) and ±1 line of context, repo-wide by default. Raw `grep` for non-source files / right after edits when the graph is stale.
 - **About to read one function.** `graphify peek "<symbol>"` is a one-shot body dump.
 - **About to implement, change, or debug in unfamiliar territory.** Map the blast radius: focus + `in --depth=2 --kind=calls`.
 - **You don't know where to start.** `graphify navigate "@<best-guess-label>"` is a free probe.
