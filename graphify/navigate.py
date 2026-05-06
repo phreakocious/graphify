@@ -3199,6 +3199,7 @@ def shape_file(G: nx.DiGraph, file_nid: str, *,
         file_lines = None
 
     fn_spans: dict[str, int] = {}
+    fn_ranges: dict[str, tuple[int, int]] = {}
     if file_lines:
         # Two-tier span resolution. When the extractor stamped a precise
         # end-line via `L<start>-<end>` (TS extractor for functions/methods),
@@ -3233,6 +3234,7 @@ def shape_file(G: nx.DiGraph, file_nid: str, *,
             else:
                 end = len(file_lines)
             fn_spans[nid] = max(1, end - start + 1)
+            fn_ranges[nid] = (start, end)
 
     longest_fn: dict | None = None
     if fns and fn_spans:
@@ -3291,6 +3293,17 @@ def shape_file(G: nx.DiGraph, file_nid: str, *,
         # surfaces what was truncated, per the omission-counts rule.
         "class_labels": [G.nodes[n].get("label", n) for n in classes][:limit] if limit else [G.nodes[n].get("label", n) for n in classes],
         "fn_labels": [G.nodes[n].get("label", n) for n in fns][:limit] if limit else [G.nodes[n].get("label", n) for n in fns],
+        # Lap-21 #3 (sub-agent head-to-head): include precise line ranges
+        # so an agent who needs `Read --offset --limit` doesn't burn a
+        # navigate call to recover them. Mirrors fn_labels' truncation.
+        "fn_entries": [
+            {
+                "label": G.nodes[n].get("label", n),
+                "start_line": fn_ranges.get(n, (None, None))[0],
+                "end_line": fn_ranges.get(n, (None, None))[1],
+            }
+            for n in (fns[:limit] if limit else fns)
+        ],
     }
 
 
@@ -3418,7 +3431,27 @@ def _render_shape_text(data: dict) -> str:
         more = data["classes"] - len(data["class_labels"])
         sfx = f" +{more} more" if more > 0 else ""
         parts.append(f"    classes: {', '.join(data['class_labels'])}{sfx}")
-    if data.get("fn_labels"):
+    # Lap-21 #3: prefer fn_entries (label + start/end) over fn_labels so
+    # the listing carries the actual line range each fn occupies. Saves
+    # an agent who needs `Read --offset --limit <range>` from a separate
+    # navigate call to recover the range. Falls back to fn_labels when
+    # the extractor didn't supply line info (Python pre-explicit-end).
+    fn_entries = data.get("fn_entries") or []
+    if fn_entries:
+        more = data["fns"] - len(fn_entries)
+        sfx = f" +{more} more" if more > 0 else ""
+        bits = []
+        for ent in fn_entries:
+            lab = ent.get("label", "")
+            s, e = ent.get("start_line"), ent.get("end_line")
+            if s is not None and e is not None and e != s:
+                bits.append(f"{lab} L{s}-{e}")
+            elif s is not None:
+                bits.append(f"{lab} L{s}")
+            else:
+                bits.append(lab)
+        parts.append(f"    fns: {', '.join(bits)}{sfx}")
+    elif data.get("fn_labels"):
         more = data["fns"] - len(data["fn_labels"])
         sfx = f" +{more} more" if more > 0 else ""
         parts.append(f"    fns: {', '.join(data['fn_labels'])}{sfx}")

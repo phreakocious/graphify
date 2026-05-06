@@ -3167,6 +3167,48 @@ def test_shape_file_returns_counts_and_longest_fn(tmp_path, monkeypatch):
     assert data["total_lines"] == 200
 
 
+def test_shape_file_surfaces_fn_line_ranges(tmp_path, monkeypatch):
+    """Lap-21 #3 (sub-agent head-to-head): shape's `fns:` line lists
+    `f1(), f2()` (names only), forcing agents that fall back to
+    Read --offset/--limit to do an extra navigate call to recover the
+    range. Surface `name L<start>-<end>` per fn so the range is
+    available in the same shape call."""
+    from graphify.navigate import shape_file, _render_shape_text, load_graph
+    sf = str(tmp_path / "lib.py")
+    nodes = [
+        {"id": "f", "label": "lib.py", "file_type": "code",
+         "source_file": sf, "source_location": "L1"},
+        {"id": "fn1", "label": "alpha()", "file_type": "code",
+         "source_file": sf, "source_location": "L10-25",
+         "node_kind": "function"},
+        {"id": "fn2", "label": "beta()", "file_type": "code",
+         "source_file": sf, "source_location": "L30-50",
+         "node_kind": "function"},
+    ]
+    links = [
+        {"source": "f", "target": "fn1", "relation": "contains",
+         "confidence": "EXTRACTED"},
+        {"source": "f", "target": "fn2", "relation": "contains",
+         "confidence": "EXTRACTED"},
+    ]
+    _write_graph(tmp_path / "graphify-out", nodes, links)
+    (tmp_path / "lib.py").write_text("# line\n" * 100)
+    monkeypatch.chdir(tmp_path)
+    G, _comm = load_graph(tmp_path / "graphify-out" / "graph.json")
+    data = shape_file(G, "f")
+    entries = data.get("fn_entries") or []
+    assert len(entries) == 2, entries
+    by_label = {e["label"]: e for e in entries}
+    assert by_label["alpha()"]["start_line"] == 10
+    assert by_label["alpha()"]["end_line"] == 25
+    assert by_label["beta()"]["start_line"] == 30
+    rendered = _render_shape_text(data)
+    assert "alpha() L10-25" in rendered, (
+        f"shape should surface line ranges:\n{rendered}"
+    )
+    assert "beta() L30-50" in rendered, rendered
+
+
 def test_shape_file_surfaces_entry_points(tmp_path, monkeypatch):
     """Lap-21: shape lists fns ranked by external in-edges so an agent
     landing on a multi-thousand-line file sees the API surface, not
