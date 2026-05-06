@@ -297,6 +297,10 @@ def to_json(G: nx.Graph, communities: dict[int, list[str]], output_path: str) ->
         if "_src" in link and "_tgt" in link:
             link["source"] = link["_src"]
             link["target"] = link["_tgt"]
+        # Strip the internal direction-restoration keys so they don't leak into
+        # the published graph.json — they're build-time scaffolding (#563).
+        link.pop("_src", None)
+        link.pop("_tgt", None)
         if "confidence_score" not in link:
             conf = link.get("confidence", "EXTRACTED")
             link["confidence_score"] = _CONFIDENCE_SCORE_DEFAULTS.get(conf, 1.0)
