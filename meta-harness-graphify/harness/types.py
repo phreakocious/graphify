@@ -52,6 +52,14 @@ class RolloutResult:
     n_api_calls: int
     tool_calls: list[ToolCall]
     transcript_path: Path
+    # Free-form feedback collected from the agent after the main rollout
+    # ends, in a separate no-tools API call. Captures friction reports
+    # the agent has the context to articulate but the metrics don't
+    # surface (confusing output, missing flags, redundant calls, etc.).
+    # Empty when feedback collection is disabled.
+    agent_feedback: str = ""
+    feedback_tokens_input: int = 0
+    feedback_tokens_output: int = 0
 
     @property
     def passed(self) -> bool:
@@ -59,4 +67,6 @@ class RolloutResult:
 
     @property
     def tokens_to_completion(self) -> int:
+        # Excludes feedback-turn tokens — those are diagnostic, not
+        # part of the agent's task-solving cost.
         return self.tokens_input + self.tokens_output + self.tokens_cache_write

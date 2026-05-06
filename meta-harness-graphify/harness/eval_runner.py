@@ -41,6 +41,53 @@ class RunnerConfig:
     model: str = "claude-opus-4-7"
     max_iterations: int = 50
     log_dir: Path = Path("runs")
+    # When True, the rollout makes one extra API call after the main loop
+    # ends to ask the agent for a short friction report (excluded from
+    # tokens_to_completion). Disable for ablation/ benchmark runs where
+    # comparability matters more than feedback density.
+    collect_feedback: bool = True
+
+
+FEEDBACK_PROMPT = (
+    "Before we wrap up, I'm collecting friction reports from agents to improve the "
+    "graphify tool. In 1-5 SHORT bullets, name SPECIFIC moments from this task "
+    "where:\n"
+    "- graphify output was confusing, surprising, or missing context\n"
+    "- a flag or verb you wished existed (or one whose default bit you)\n"
+    "- you ran multiple calls when one should have sufficed\n"
+    "- you fell back to read_file/grep when graphify should have worked\n"
+    "Be specific — quote the actual command or output if useful. Skip what worked "
+    "smoothly; we already see the wins in the metrics. If everything was clean, "
+    "just say 'no friction'."
+)
+
+
+def _collect_agent_feedback(
+    client: Anthropic,
+    system_blocks: list,
+    messages: list,
+    model: str,
+) -> tuple[str, int, int]:
+    """Make one extra API call to gather friction feedback. No tools available
+    on this turn — text-only response. Returns (text, tokens_input, tokens_output)."""
+    feedback_messages = messages + [{"role": "user", "content": FEEDBACK_PROMPT}]
+    resp = _create_with_overload_retry(
+        client,
+        model=model,
+        max_tokens=800,
+        system=system_blocks,
+        messages=feedback_messages,
+    )
+    text = "".join(
+        getattr(c, "text", "") for c in resp.content
+        if getattr(c, "type", None) == "text"
+    )
+    usage = resp.usage
+    return (
+        text.strip(),
+        getattr(usage, "input_tokens", 0) or 0,
+        getattr(usage, "output_tokens", 0) or 0,
+    )
 
 
 SYSTEM_PROMPT_PREFIX = """You are an automated coding agent. You will be given a coding task to solve in a working repository. Use the available tools to read code, run commands, edit files, and verify your work. When you believe the task is complete, say so explicitly in your final message and stop calling tools.
@@ -192,6 +239,20 @@ def run_rollout(
             else:
                 final_text = f"[max_iterations={config.max_iterations} reached]"
 
+            # Collect agent friction feedback in a separate API call before
+            # the oracle runs. Excluded from tokens_to_completion. Skipped
+            # if collection is disabled, if the rollout already errored
+            # mid-loop, or if there are no messages at all.
+            agent_feedback = ""
+            feedback_in = feedback_out = 0
+            if config.collect_feedback and messages and not final_text.startswith("["):
+                try:
+                    agent_feedback, feedback_in, feedback_out = _collect_agent_feedback(
+                        client, system_blocks, messages, config.model,
+                    )
+                except Exception as e:
+                    agent_feedback = f"[feedback collection failed: {type(e).__name__}: {e}]"
+
             # Inject the sandbox python into pytest_passes if not already specified.
             oracle_args_with_venv = dict(task.oracle_args)
             if task.oracle_kind == "pytest_passes" and "python_exe" not in oracle_args_with_venv:
@@ -203,6 +264,8 @@ def run_rollout(
             )
         except Exception as e:
             oracle_result = OracleResult(passed=False, detail=f"rollout error: {type(e).__name__}: {e}")
+            agent_feedback = ""
+            feedback_in = feedback_out = 0
         wall = time.monotonic() - start
 
         result = RolloutResult(
@@ -218,6 +281,9 @@ def run_rollout(
             n_api_calls=n_api_calls,
             tool_calls=tool_calls,
             transcript_path=transcript_path,
+            agent_feedback=agent_feedback,
+            feedback_tokens_input=feedback_in,
+            feedback_tokens_output=feedback_out,
         )
         (log_root / "metrics.json").write_text(json.dumps({
             "candidate_id": result.candidate_id,
@@ -234,6 +300,9 @@ def run_rollout(
             "n_tool_calls": len(result.tool_calls),
             "oracle_detail": result.oracle.detail[:1500],
             "final_assistant_text": _truncate(final_text, 2000),
+            "agent_feedback": result.agent_feedback,
+            "feedback_tokens_input": result.feedback_tokens_input,
+            "feedback_tokens_output": result.feedback_tokens_output,
         }, indent=2))
         return result
     finally:
