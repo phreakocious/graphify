@@ -59,6 +59,11 @@ _HELP_BLOCKS: dict[str, list[str]] = {
         "    --since <ref>           shorter alias for --since-commit",
         "    --graph <path>          path to graph.json (default graphify-out/graph.json)",
     ],
+    "summarize": [
+        "  summarize               one-call architectural overview: top communities (by hub), entry points (cross-file callers), edge mix, language counts, freshness",
+        "    --graph <path>          path to graph.json (default graphify-out/graph.json)",
+        "    Cheap primer for an agent landing fresh on a repo. Reuses data already on the graph — no re-extraction.",
+    ],
     "peek": [
         "  peek <symbol>           one-shot body read — resolve, dump body, touch no cursor/session/history",
         "    --lines N               max lines of body to dump (default 200; walker bails at natural dedent first)",
@@ -1204,10 +1209,13 @@ def main() -> None:
         # per-flag docs. Lead with the 80% paths so an agent who only
         # reads the first screen of help can already do useful work.
         print("Common workflows:")
+        print("  Orient on a repo       graphify summarize")
         print("  Orient on a file       graphify shape <file>")
         print("  Read a function body   graphify peek <symbol>")
+        print("  Read a class           graphify peek <Class>   (curated: header + per-method sig + body)")
         print("  Find callers of X      graphify navigate \"@X\" in")
         print("  Map a class            graphify navigate \"@Class\" methods --bodies 3")
+        print("  Find dead methods      graphify navigate \"@Class\" dead-ends")
         print("  Find a string          graphify search \"<regex>\"")
         print("  Where does X reach Y?  graphify path \"X\" \"Y\" --edges calls")
         print("  Stale graph?           graphify changed   (then `graphify update .`)")
@@ -1219,6 +1227,8 @@ def main() -> None:
         for line in _HELP_BLOCKS["explain"]:
             print(line)
         for line in _HELP_BLOCKS["changed"]:
+            print(line)
+        for line in _HELP_BLOCKS["summarize"]:
             print(line)
         for line in _HELP_BLOCKS["peek"]:
             print(line)
@@ -2114,6 +2124,119 @@ def main() -> None:
                 print(f"  ... and {len(neighbors_filtered) - covered} more")
         elif dropped > 0:
             print(f"\nNo EXTRACTED edges. {dropped} INFERRED edges hidden (use --include-inferred).")
+
+    elif cmd == "summarize":
+        # Lap-21 (Gemini #3): synthesize a one-call architectural overview
+        # from data the graph already carries — community hubs, entry
+        # points, edge composition, language mix, freshness. The agent
+        # lands with a primer instead of having to run shape on a guess
+        # first.
+        if any(a in ("-h", "--help") for a in sys.argv[2:]):
+            _print_subcmd_help("summarize")
+            return
+        from graphify.navigate import DEFAULT_GRAPH_PATH, load_graph
+        from collections import Counter as _Counter
+        graph_path = DEFAULT_GRAPH_PATH
+        args = sys.argv[2:]
+        i = 0
+        while i < len(args):
+            a = args[i]
+            if a == "--graph" and i + 1 < len(args):
+                graph_path = args[i + 1]; i += 2
+            elif a.startswith("--graph="):
+                graph_path = a.split("=", 1)[1]; i += 1
+            else:
+                i += 1
+        gp = Path(graph_path)
+        if not gp.exists():
+            print(f"error: graph not found at {gp}. run `graphify update <path>` first.",
+                  file=sys.stderr)
+            sys.exit(1)
+        G, communities = load_graph(gp)
+
+        # Top-line stats.
+        n_nodes = G.number_of_nodes()
+        n_edges = G.number_of_edges()
+        n_communities = len(communities)
+        unique_files = {a.get("source_file") for _, a in G.nodes(data=True)
+                        if a.get("source_file")}
+        n_files = len(unique_files)
+
+        # Top communities by member count, label = hub.
+        comm_labels = G.graph.get("community_labels") or {}
+        comm_sizes = sorted(communities.items(),
+                             key=lambda kv: -len(kv[1]))[:5]
+        # Cross-file entry points: top fns by non-structural in-edges
+        # from a different source_file. Skip method-shape labels
+        # (`.foo()`) — those are member calls (`.get`, `.append`,
+        # `.set`, `.items`) that swamp real entry-point ranking; the
+        # entry point of a class is the class itself, not its methods.
+        from graphify.navigate import _STRUCTURAL
+        entry_pts: list[tuple[str, int, str]] = []
+        for nid, attrs in G.nodes(data=True):
+            label = attrs.get("label", "")
+            if not (isinstance(label, str) and label.endswith("()")):
+                continue
+            if label.startswith("."):
+                continue
+            # Require an actual source location — primitives bound to
+            # globals (`str`, `dict`) leak in as nodes without source.
+            if not attrs.get("source_file"):
+                continue
+            sf = attrs.get("source_file") or ""
+            ext_in = 0
+            for u in G.predecessors(nid):
+                ufile = G.nodes[u].get("source_file") or ""
+                if not ufile or ufile == sf:
+                    continue
+                if G.edges[u, nid].get("relation") in _STRUCTURAL:
+                    continue
+                ext_in += 1
+            if ext_in > 0:
+                entry_pts.append((label, ext_in, sf))
+        entry_pts.sort(key=lambda t: (-t[1], t[0]))
+        top_entries = entry_pts[:5]
+        # Edge composition.
+        rel_counts: _Counter = _Counter()
+        for _, _, d in G.edges(data=True):
+            rel_counts[d.get("relation") or "<unset>"] += 1
+        # Language mix by extension.
+        ext_counts: _Counter = _Counter()
+        for sf in unique_files:
+            if not sf:
+                continue
+            from pathlib import Path as _Path
+            ext = _Path(sf).suffix.lower() or "<no-ext>"
+            ext_counts[ext] += 1
+
+        print(f"  graphify summarize: {gp}")
+        print(f"  {n_nodes} nodes · {n_edges} edges · {n_communities} communities · "
+              f"{n_files} files")
+        if comm_sizes:
+            print()
+            print("  Top communities (by hub):")
+            for cid, members in comm_sizes:
+                hub_label = comm_labels.get(cid, "?")
+                print(f"    c{cid:<3} {hub_label:<32} {len(members)} members")
+        if top_entries:
+            print()
+            print("  Entry points (cross-file callers):")
+            for lab, n, _sf in top_entries:
+                print(f"    {lab:<36} ×{n}")
+        if rel_counts:
+            print()
+            total_rel = sum(rel_counts.values())
+            top_rels = rel_counts.most_common(5)
+            mix = " · ".join(f"{r} {c*100//total_rel}%" for r, c in top_rels)
+            print(f"  Edge mix: {mix}")
+        if ext_counts:
+            top_exts = ext_counts.most_common(5)
+            mix = " · ".join(f"{ext} ({c})" for ext, c in top_exts)
+            print(f"  Languages: {mix}")
+        banner = G.graph.get("_freshness_banner")
+        if banner:
+            print()
+            print(f"  {banner.strip()}")
 
     elif cmd == "changed":
         if any(a in ("-h", "--help") for a in sys.argv[2:]):

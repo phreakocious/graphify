@@ -2236,6 +2236,60 @@ def test_frontier_header_disambiguates_focus_from_community(tmp_path, monkeypatc
     )
 
 
+def test_summarize_emits_overview(tmp_path):
+    """Lap-21 (Gemini #3): `graphify summarize` synthesizes a one-call
+    architectural overview from data already on the graph: top
+    communities (by hub), cross-file entry points, edge mix, language
+    counts. No re-extraction; reuses the loaded graph."""
+    import json as _json, subprocess
+    nodes = [
+        {"id": "fA", "label": "engine.py", "file_type": "code",
+         "source_file": "engine.py", "source_location": "L1",
+         "node_kind": "file", "community": 0},
+        {"id": "fn", "label": "compile()", "file_type": "code",
+         "source_file": "engine.py", "source_location": "L5",
+         "node_kind": "function", "community": 0},
+        {"id": "fU", "label": "user.py", "file_type": "code",
+         "source_file": "user.py", "source_location": "L1",
+         "node_kind": "file", "community": 1},
+        {"id": "user", "label": "user_fn()", "file_type": "code",
+         "source_file": "user.py", "source_location": "L1",
+         "node_kind": "function", "community": 1},
+    ]
+    links = [
+        {"source": "fA", "target": "fn", "relation": "contains",
+         "confidence": "EXTRACTED"},
+        {"source": "fU", "target": "user", "relation": "contains",
+         "confidence": "EXTRACTED"},
+        # Cross-file call → entry-point ranking.
+        {"source": "user", "target": "fn", "relation": "calls",
+         "confidence": "EXTRACTED"},
+    ]
+    graph_dir = tmp_path / "graphify-out"
+    graph_dir.mkdir()
+    (graph_dir / "graph.json").write_text(_json.dumps(
+        {"directed": True, "multigraph": False,
+         "graph": {}, "nodes": nodes, "links": links}), encoding="utf-8")
+    res = subprocess.run(
+        ["graphify", "summarize",
+         "--graph", str(graph_dir / "graph.json")],
+        capture_output=True, text=True, cwd=str(tmp_path),
+    )
+    assert res.returncode == 0, f"summarize failed:\n{res.stderr}"
+    out = res.stdout
+    # Top-line stats.
+    assert "4 nodes" in out, f"missing node count:\n{out}"
+    assert "2 files" in out, f"missing file count:\n{out}"
+    # Entry points show the cross-file callee.
+    assert "compile()" in out and "×1" in out, (
+        f"entry-points should surface compile():\n{out}"
+    )
+    # Edge mix surfaces relations.
+    assert "calls" in out, f"edge mix missing:\n{out}"
+    # Language count.
+    assert ".py" in out, f"language mix missing:\n{out}"
+
+
 def test_dead_ends_pivot_lists_uncalled_methods(tmp_path, monkeypatch):
     """Lap-21 (Gemini #2): `@<focus> dead-ends` lists contained
     function/method children with 0 non-structural in-edges. Surfaces
