@@ -8,6 +8,9 @@ from pathlib import Path
 from anthropic import Anthropic, APIStatusError
 
 from harness.oracles import run_oracle
+from harness.sandbox import Sandbox, snapshot_repo
+from harness.tools import TOOL_DEFINITIONS, TOOL_DISPATCH, ToolContext
+from harness.types import Candidate, OracleResult, RolloutResult, Task, ToolCall
 
 
 def _create_with_overload_retry(client: Anthropic, *, max_extra_retries: int = 4,
@@ -31,9 +34,6 @@ def _create_with_overload_retry(client: Anthropic, *, max_extra_retries: int = 4
                 time.sleep(extra_sleep_s)
     assert last_exc is not None
     raise last_exc
-from harness.sandbox import Sandbox, snapshot_repo
-from harness.tools import TOOL_DEFINITIONS, TOOL_DISPATCH, ToolContext
-from harness.types import Candidate, OracleResult, RolloutResult, Task, ToolCall
 
 
 @dataclass
@@ -72,6 +72,10 @@ def run_rollout(
     log_root = config.log_dir / rollout_id
     log_root.mkdir(parents=True, exist_ok=True)
     transcript_path = log_root / "transcript.jsonl"
+    # Clear stale transcript if a prior run wrote to this dir; otherwise
+    # the .open("a") below appends two runs into one file and downstream
+    # analysis double-counts tool calls.
+    transcript_path.unlink(missing_ok=True)
     sandbox_root = log_root / "sandbox"
 
     target_snap = log_root / "target_repo_snapshot"
