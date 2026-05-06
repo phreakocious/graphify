@@ -3417,12 +3417,12 @@ def test_load_graph_no_banner_when_fresh(tmp_path, capsys):
 
 
 def test_navigate_dominant_match_suppresses_loud_warning(tmp_path):
-    """Lap-20d (TS-Claude #2): when the chosen match's degree dominates
-    the top alternative by ≥2x, suppress the `⚠ ambiguous:` glyph and
-    the "also near" line. The current behavior fires the warning on
-    every prefix-with-fuzzy-near case (e.g. `analyzePanel()` deg=12 vs
-    fuzzy near `analyzeFoo()` deg=2), training agents to ignore the
-    warning entirely — which defeats its purpose for true ambiguity."""
+    """Lap-21 #3 (extended from lap-20d): when match_type=="prefix" with
+    a single chosen, alternatives are fuzzy near-misses by construction.
+    Suppress the `⚠ ambiguous:` glyph and the "also near" line. Lap-20d
+    used a degree-dominance heuristic; lap-21 generalized to "prefix
+    branch always suppresses" because alternatives there are never
+    plausible same-kind matches."""
     import json as _json, subprocess
     nodes = [
         # Dominant target: prefix match with high degree.
@@ -3453,8 +3453,70 @@ def test_navigate_dominant_match_suppresses_loud_warning(tmp_path):
     out = res.stdout + res.stderr
     assert "analyzePanel()" in out, f"should match the dominant target:\n{out}"
     assert "⚠ ambiguous" not in out, (
-        f"dominant prefix match should not emit ⚠ ambiguous:\n{out}"
+        f"unique prefix match should not emit ⚠ ambiguous:\n{out}"
     )
     assert "also near:" not in out, (
-        f"dominant match should suppress 'also near' line:\n{out}"
+        f"unique prefix match should suppress 'also near' line:\n{out}"
+    )
+
+
+def test_navigate_unique_prefix_suppresses_warning_at_similar_degree(tmp_path):
+    """Lap-21 #3: TS-Claude reported `@buildDecodeEngine` (deg=46)
+    emitting `⚠ ambiguous:` with "also near: DecodeEngine, buildOurEngine,
+    DecodedEdge" — none of which start with `buildDecodeEngine`. The
+    lap-20d degree-dominance heuristic missed this because DecodeEngine
+    (a class) had comparable degree. Fix: in the prefix branch the
+    resolver guarantees alternatives are non-prefix fuzzies, so always
+    suppress regardless of degree."""
+    import json as _json, subprocess
+    nodes = [
+        # Chosen: unique full-token prefix match.
+        {"id": "build_fn", "label": "buildDecodeEngine()", "file_type": "code",
+         "source_file": "src/build.ts", "source_location": "L1"},
+        # Many neighbors → high degree to mirror the field report.
+        *[{"id": f"caller{i}", "label": f"caller{i}()", "file_type": "code",
+           "source_file": f"src/caller{i}.ts", "source_location": "L1"}
+          for i in range(20)],
+        # Alternative with similar (high) degree but NOT a prefix match.
+        {"id": "decode_class", "label": "DecodeEngine", "file_type": "code",
+         "source_file": "src/decode.ts", "source_location": "L1",
+         "node_kind": "class"},
+        *[{"id": f"engcaller{i}", "label": f"engcaller{i}()",
+           "file_type": "code",
+           "source_file": f"src/engcaller{i}.ts", "source_location": "L1"}
+          for i in range(18)],
+        # Other fuzzy near-misses.
+        {"id": "build_our", "label": "buildOurEngine()", "file_type": "code",
+         "source_file": "src/our.ts", "source_location": "L1"},
+        {"id": "decoded_edge", "label": "DecodedEdge", "file_type": "code",
+         "source_file": "src/edge.ts", "source_location": "L1",
+         "node_kind": "class"},
+    ]
+    links = (
+        [{"source": f"caller{i}", "target": "build_fn",
+          "relation": "calls", "confidence": "EXTRACTED"}
+         for i in range(20)]
+        + [{"source": f"engcaller{i}", "target": "decode_class",
+            "relation": "calls", "confidence": "EXTRACTED"}
+           for i in range(18)]
+    )
+    graph_dir = tmp_path / "graphify-out"
+    graph_dir.mkdir()
+    (graph_dir / "graph.json").write_text(_json.dumps(
+        {"directed": True, "multigraph": False,
+         "graph": {}, "nodes": nodes, "links": links}), encoding="utf-8")
+    res = subprocess.run(
+        ["graphify", "navigate", "@buildDecodeEngine",
+         "--graph", str(graph_dir / "graph.json")],
+        capture_output=True, text=True, cwd=str(tmp_path),
+    )
+    out = res.stdout + res.stderr
+    assert "buildDecodeEngine()" in out, f"should pick the prefix match:\n{out}"
+    assert "⚠ ambiguous" not in out, (
+        f"unique prefix should suppress warning even when alt has similar "
+        f"degree:\n{out}"
+    )
+    assert "also near:" not in out, (
+        f"unique prefix should suppress 'also near' even at similar "
+        f"degree:\n{out}"
     )

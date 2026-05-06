@@ -3447,27 +3447,18 @@ def navigate(ops: list[str] | str, *,
                 if chosen:
                     if match_type and match_type != "exact":
                         chosen_label = G.nodes[chosen].get("label", chosen)
-                        # Loud prefix when there are plausible alternatives:
-                        # silent-wrong-pick is the real failure mode the agent
-                        # field-reporter flagged. `prefix`+alternates and any
-                        # `fuzzy`/`substring` hit get the warning glyph; a
-                        # clean prefix with no alternates stays quiet.
-                        # Lap-20d (TS-Claude #2): when chosen's degree
-                        # dominates the top alternative by ≥2x, the
-                        # alternatives are noise (close-label fuzzies, not
-                        # contenders). Drop the loud glyph AND the "also
-                        # near" line. Today the warning fires on every
-                        # prefix match because get_close_matches is
-                        # liberal; agents learn to filter "⚠ ambiguous"
-                        # and miss the real ones.
-                        chosen_deg = G.in_degree(chosen) + G.out_degree(chosen)
-                        top_alt_deg = max(
-                            (G.in_degree(a) + G.out_degree(a)
-                             for a in alternatives),
-                            default=0,
-                        )
-                        dominant = chosen_deg >= 2 * top_alt_deg + 1 and chosen_deg >= 3
-                        suppress_alts = dominant and match_type == "prefix"
+                        # Lap-21 #3: when match_type=="prefix" with a single
+                        # chosen, the alternatives are by construction
+                        # fuzzy near-misses (the resolver only enters this
+                        # branch when len(prefix_hits)==1, so any other
+                        # prefix-shaped label would have made it 2+ and
+                        # routed elsewhere). `get_close_matches` returns
+                        # similarity-ranked labels regardless of prefix
+                        # shape, so they're always noise here. Suppress
+                        # the glyph and "also near" line. Substring/fuzzy
+                        # remain loud — those branches DO have plausible
+                        # ambiguity.
+                        suppress_alts = match_type == "prefix"
                         loud = ((bool(alternatives) and not suppress_alts)
                                 or match_type in ("substring", "fuzzy"))
                         glyph = "⚠ ambiguous:" if loud else ""
