@@ -204,18 +204,19 @@ def run_rollout(
 
                 messages.append({"role": "assistant", "content": [c.model_dump() for c in resp.content]})
 
-                if resp.stop_reason == "end_turn":
-                    final_text = "".join(getattr(c, "text", "") for c in resp.content if getattr(c, "type", None) == "text")
-                    break
-
-                if resp.stop_reason != "tool_use":
-                    final_text = f"[unexpected stop_reason: {resp.stop_reason}]"
-                    break
-
+                # Lap-24 harness fix: execute tool_use blocks even when the
+                # model returned end_turn (or any other stop_reason). Empirical
+                # case from session-benchmark seed_task_006 V1 trial 2: the
+                # model emitted "Now let me write all three files." + 3 valid
+                # write_file blocks with stop_reason=end_turn, and the harness
+                # silently dropped the writes — oracle then failed because
+                # the side-effect files never landed. Always honor any
+                # tool_use blocks the model emitted; respect end_turn /
+                # unexpected stop_reason by terminating AFTER the side
+                # effects run, not before.
+                tool_use_blocks = [b for b in resp.content if getattr(b, "type", None) == "tool_use"]
                 tool_results = []
-                for block in resp.content:
-                    if getattr(block, "type", None) != "tool_use":
-                        continue
+                for block in tool_use_blocks:
                     tool_name = block.name
                     args = dict(block.input) if block.input else {}
                     t0 = time.monotonic()
@@ -235,7 +236,16 @@ def run_rollout(
                         "tool_use_id": block.id,
                         "content": str(result_str),
                     })
-                messages.append({"role": "user", "content": tool_results})
+                if tool_results:
+                    messages.append({"role": "user", "content": tool_results})
+
+                if resp.stop_reason == "end_turn":
+                    final_text = "".join(getattr(c, "text", "") for c in resp.content if getattr(c, "type", None) == "text")
+                    break
+
+                if resp.stop_reason != "tool_use":
+                    final_text = f"[unexpected stop_reason: {resp.stop_reason}]"
+                    break
             else:
                 final_text = f"[max_iterations={config.max_iterations} reached]"
 
