@@ -55,6 +55,15 @@ def build_from_json(extraction: dict, *, directed: bool = False) -> nx.Graph:
     for node in extraction.get("nodes", []):
         G.add_node(node["id"], **{k: v for k, v in node.items() if k != "id"})
     node_set = set(G.nodes())
+    # Identify rationale nodes once so the edge loop can drop LLM-emitted
+    # `uses`/`calls`/etc. edges that originate at a docstring node — those
+    # invert the rationale relationship (the docstring is *for* the symbol,
+    # not a user *of* it) and inflate target degree with phantom traffic.
+    # AST emits `target --rationale_for--> rationale` (correct direction);
+    # LLM extractors frequently emit `rationale --uses--> target` instead.
+    # See PR #576 follow-up note.
+    rationale_ids = {nid for nid, attrs in G.nodes(data=True)
+                     if attrs.get("file_type") == "rationale"}
     # Normalized ID map: lets edges survive when the LLM generates IDs with
     # slightly different casing or punctuation than the AST extractor.
     # e.g. "Session_ValidateToken" maps to "session_validatetoken".
@@ -65,12 +74,21 @@ def build_from_json(extraction: dict, *, directed: bool = False) -> nx.Graph:
     # answerable. Internal-only edges (`calls`, `uses`, …) still drop on
     # missing targets — those would be genuine extraction bugs.
     IMPORT_RELATIONS = {"imports", "imports_from"}
+    rationale_edges_dropped = 0
     for edge in extraction.get("edges", []):
         if "source" not in edge and "from" in edge:
             edge["source"] = edge["from"]
         if "target" not in edge and "to" in edge:
             edge["target"] = edge["to"]
         if "source" not in edge or "target" not in edge:
+            continue
+        # Drop LLM-emitted edges where the source is a rationale node and the
+        # relation isn't the canonical `rationale_for`. These flip the docstring
+        # relationship and pile phantom degree onto the target. The AST path
+        # always emits the correct direction; only LLM extractors get this wrong.
+        if (edge["source"] in rationale_ids
+                and edge.get("relation") != "rationale_for"):
+            rationale_edges_dropped += 1
             continue
         # Direction restoration: undirected nx.Graph serialization can swap
         # source/target. `_src`/`_tgt` attributes (set on add_edge below) are
@@ -110,6 +128,11 @@ def build_from_json(extraction: dict, *, directed: bool = False) -> nx.Graph:
     hyperedges = extraction.get("hyperedges", [])
     if hyperedges:
         G.graph["hyperedges"] = hyperedges
+    if rationale_edges_dropped:
+        # One-line note (counted, never silent) — the omission-counts rule.
+        print(f"[graphify] Dropped {rationale_edges_dropped} rationale-source "
+              f"edges with non-rationale_for relations (LLM direction-inversion).",
+              file=sys.stderr)
     _backfill_node_kind(G)
     return G
 
