@@ -1,0 +1,7 @@
+{
+  "candidate_id": "baseline_navigator_blast",
+  "parent_id": "baseline_navigator",
+  "generation": 1,
+  "proposer_notes": "Lap-22: clone of baseline_navigator + one cheat-sheet row for `graphify blast \"<symbol>\"`. Tests whether the new one-shot blast-radius verb (shipped on navigator commit a470ac4) reduces TTC on cross-file refactor tasks like seed_task_003. Empty overrides — uses navigator graphify as-is.",
+  "created_at": "2026-05-06"
+}
