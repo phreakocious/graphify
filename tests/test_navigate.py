@@ -2236,6 +2236,70 @@ def test_frontier_header_disambiguates_focus_from_community(tmp_path, monkeypatc
     )
 
 
+def test_listing_hides_external_nodes_by_default(tmp_path, monkeypatch):
+    """Lap-21 #5: external_module nodes (`numpy`, `kg_compile_v2_compile`)
+    are stubs from unresolved imports. They should be hidden from
+    listings in default/AST mode and surfaced via --include-inferred,
+    with the hidden-count called out."""
+    import json as _json, subprocess
+    nodes = [
+        {"id": "fn", "label": "compute()", "file_type": "code",
+         "source_file": "src/a.ts", "source_location": "L1",
+         "node_kind": "function"},
+        {"id": "real_helper", "label": "renderEngine()", "file_type": "code",
+         "source_file": "src/b.ts", "source_location": "L1",
+         "node_kind": "function"},
+        # External stubs — what TS-Claude saw in zero-tvm.
+        {"id": "ext1", "label": "kg_compile_v2_compile",
+         "file_type": "external", "node_kind": "external_module",
+         "source_file": "", "source_location": ""},
+        {"id": "ext2", "label": "zero_tvm_engine_core_triggerhooks",
+         "file_type": "external", "node_kind": "external_module",
+         "source_file": "", "source_location": ""},
+    ]
+    links = [
+        {"source": "fn", "target": "real_helper", "relation": "calls",
+         "confidence": "EXTRACTED"},
+        {"source": "fn", "target": "ext1", "relation": "imports_from",
+         "confidence": "EXTRACTED"},
+        {"source": "fn", "target": "ext2", "relation": "imports_from",
+         "confidence": "EXTRACTED"},
+    ]
+    graph_dir = tmp_path / "graphify-out"
+    graph_dir.mkdir()
+    (graph_dir / "graph.json").write_text(_json.dumps(
+        {"directed": True, "multigraph": False,
+         "graph": {}, "nodes": nodes, "links": links}), encoding="utf-8")
+
+    res = subprocess.run(
+        ["graphify", "navigate", "@compute", "out",
+         "--graph", str(graph_dir / "graph.json")],
+        capture_output=True, text=True, cwd=str(tmp_path),
+    )
+    out = res.stdout + res.stderr
+    assert "renderEngine()" in out, f"real symbol should appear:\n{out}"
+    assert "kg_compile_v2_compile" not in out, (
+        f"external stub should be hidden by default:\n{out}"
+    )
+    assert "zero_tvm_engine_core_triggerhooks" not in out, (
+        f"external stub should be hidden by default:\n{out}"
+    )
+    assert "external" in out and "hidden" in out, (
+        f"hidden-count should be surfaced:\n{out}"
+    )
+
+    # --include-inferred should reveal them.
+    res2 = subprocess.run(
+        ["graphify", "navigate", "@compute", "out", "--include-inferred",
+         "--graph", str(graph_dir / "graph.json")],
+        capture_output=True, text=True, cwd=str(tmp_path),
+    )
+    out2 = res2.stdout + res2.stderr
+    assert "kg_compile_v2_compile" in out2, (
+        f"--include-inferred should surface externals:\n{out2}"
+    )
+
+
 def test_transitive_noop_notice_on_file_with_direct_out(tmp_path, monkeypatch):
     """Lap-21 #6: --transitive silently no-ops when the file already has
     direct out-edges. Surface a notice so the agent knows the flag did

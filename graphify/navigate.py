@@ -908,6 +908,27 @@ def _listing_data(G: nx.DiGraph, ids: list[str], pivot_name: str,
 
     `collapse_dupes=False` opts out (CLI: `--no-collapse`).
     """
+    # Lap-21 #5: drop external_module nodes from listings in default mode.
+    # These are stubs from unresolved imports (`kg_compile_v2_compile`,
+    # `numpy`, etc.) — load-bearing when --include-inferred widens the
+    # graph (they participate in inferred call edges) but pure noise in
+    # default/AST listings, where they mix snake_case stubs alongside
+    # real PascalCase/camelCase symbols and bury the meaningful rows.
+    # `extracted_only=True` is the gate (set False by --include-inferred).
+    external_hidden = 0
+    if extracted_only:
+        filtered_ids = []
+        for nid in ids:
+            attrs = G.nodes[nid]
+            if (attrs.get("file_type") == "external"
+                    or attrs.get("node_kind") == "external_module"):
+                external_hidden += 1
+                continue
+            filtered_ids.append(nid)
+        ids = filtered_ids
+        if total >= len(filtered_ids) + external_hidden:
+            total -= external_hidden
+
     raw_items = []
     for nid in ids:
         item = _node_summary(G, nid)
@@ -962,6 +983,9 @@ def _listing_data(G: nx.DiGraph, ids: list[str], pivot_name: str,
         items = list(raw_items)
 
     items = items[:limit]
+    drops_out = dict(drops or {})
+    if external_hidden:
+        drops_out["external"] = external_hidden
     return {
         "type": "listing",
         "pivot": pivot_name,
@@ -974,7 +998,7 @@ def _listing_data(G: nx.DiGraph, ids: list[str], pivot_name: str,
         "collapsed": collapsed_count,
         "sort": sort_label,
         "items": items,
-        "drops": drops or {},
+        "drops": drops_out,
         "kinds": sorted(kinds) if kinds else None,
         "bodies": bodies,
         # Echoed so the renderer can confirm `--include-inferred` was
@@ -1837,6 +1861,8 @@ def _render_listing_text(data: dict, *, show_ops: bool, md: bool = False) -> str
             bits.append(f"+{total} hidden via --kind ({rels})")
         if drops.get("archived"):
             bits.append(f"+{drops['archived']} archived hidden")
+        if drops.get("external"):
+            bits.append(f"+{drops['external']} external (unresolved imports) hidden")
         if drops.get("files"):
             bits.append(f"+{drops['files']} files hidden — pass --include-files to widen")
         if drops.get("rationale"):
@@ -1923,6 +1949,8 @@ def _render_listing_text(data: dict, *, show_ops: bool, md: bool = False) -> str
         drop_bits.append(f"+{total} hidden via --kind ({rels})")
     if drops.get("archived"):
         drop_bits.append(f"+{drops['archived']} archived hidden")
+    if drops.get("external"):
+        drop_bits.append(f"+{drops['external']} external (unresolved imports) hidden")
     if drops.get("files"):
         drop_bits.append(f"+{drops['files']} files hidden — pass --include-files to widen")
     if drops.get("rationale"):
