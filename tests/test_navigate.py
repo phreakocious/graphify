@@ -2236,6 +2236,35 @@ def test_frontier_header_disambiguates_focus_from_community(tmp_path, monkeypatc
     )
 
 
+def test_frontier_header_drops_hub_marker_when_focus_is_hub(tmp_path, monkeypatch):
+    """Lap-21 polish: when the focused node IS the community's hub,
+    `c53 hub:buildDecodeEngine()` restates the focus's own label.
+    Suppress to `c53` in that case."""
+    from graphify.navigate import navigate
+    nodes = [
+        {"id": "n_engine", "label": "DecodeEngine", "file_type": "code",
+         "source_file": "b.py", "source_location": "L2", "community": 3},
+        {"id": "n_uno", "label": "alpha", "file_type": "code",
+         "source_file": "c.py", "source_location": "L3", "community": 3},
+        {"id": "n_duo", "label": "beta", "file_type": "code",
+         "source_file": "d.py", "source_location": "L4", "community": 3},
+    ]
+    links = [
+        {"source": "n_uno", "target": "n_engine", "relation": "calls",
+         "confidence": "EXTRACTED"},
+        {"source": "n_duo", "target": "n_engine", "relation": "calls",
+         "confidence": "EXTRACTED"},
+    ]
+    _write_graph(tmp_path / "graphify-out", nodes, links)
+    monkeypatch.chdir(tmp_path)
+    out = navigate(["@DecodeEngine"], session=False, fmt="text")
+    header = next((ln for ln in out.splitlines() if ln.startswith("@ ")), "")
+    assert "DecodeEngine" in header, f"focus label should appear:\n{out}"
+    assert "hub:" not in header, (
+        f"focusing on the hub itself should suppress `hub:` repeat:\n{out}"
+    )
+
+
 def test_disambig_listing_suppresses_files_table(tmp_path, monkeypatch):
     """Lap-13 field-report fix: on @-disambig listings the `[a-h]` file
     letters and `[1-N]` pick numbers stack confusingly. Each row shows

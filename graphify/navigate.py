@@ -146,6 +146,7 @@ def load_graph(graph_path: str | Path,
     # has nothing else (rare — usually a community of just a couple of
     # standalone files).
     community_labels: dict[int, str] = {}
+    community_hubs: dict[int, str] = {}
     for cid, members in communities.items():
         non_rat = [m for m in members
                    if G.nodes[m].get("file_type") != "rationale"]
@@ -157,7 +158,8 @@ def load_graph(graph_path: str | Path,
             pick_pool,
             key=lambda n: -(G.in_degree(n) + G.out_degree(n)),
         )
-        raw = G.nodes[ranked[0]].get("label", ranked[0])
+        hub_nid = ranked[0]
+        raw = G.nodes[hub_nid].get("label", hub_nid)
         # Strip whitespace, collapse multi-line, cap label length so the
         # frontier/listing line budgets aren't blown out by sentence-shaped
         # labels (a docstring rationale that slipped through, etc.).
@@ -165,7 +167,9 @@ def load_graph(graph_path: str | Path,
         if len(clean) > 28:
             clean = clean[:27] + "…"
         community_labels[cid] = clean
+        community_hubs[cid] = hub_nid
     G.graph["community_labels"] = community_labels
+    G.graph["community_hubs"] = community_hubs
     # Mark cross-language INFERRED edges so `_passes_confidence` can drop
     # them with a single dict lookup instead of resolving languages on the
     # hot path. Drops surface as `+N cross-lang hidden`.
@@ -649,11 +653,13 @@ def _node_summary(G: nx.DiGraph, nid: str) -> dict:
     meta = _file_meta(src) if src else {}
     cid = a.get("community")
     labels = (G.graph.get("community_labels") if hasattr(G, "graph") else None) or {}
+    hubs = (G.graph.get("community_hubs") if hasattr(G, "graph") else None) or {}
     return {
         "id": nid,
         "label": a.get("label", nid),
         "community": cid,
         "community_label": labels.get(cid) if cid is not None else None,
+        "is_community_hub": cid is not None and hubs.get(cid) == nid,
         "degree": G.in_degree(nid) + G.out_degree(nid),
         "source_file": src,
         "source_location": a.get("source_location"),
@@ -1443,7 +1449,12 @@ def _render_frontier_text(data: dict, cursor: Cursor, *, show_ops: bool,
     # to, not Atlas itself. Using `hub:` makes the role explicit without
     # adding length. Listings keep `=` because their surrounding `all in`
     # / `coc summary` text disambiguates the relationship.
-    cstr = f"c{cid} hub:{clabel}" if clabel else f"c{cid}"
+    # Lap-21 polish: when the focus IS the community's hub, `hub:<label>`
+    # restates the focus's own label — pure noise. Suppress.
+    if clabel and not n.get("is_community_hub"):
+        cstr = f"c{cid} hub:{clabel}"
+    else:
+        cstr = f"c{cid}"
     src = _short_src(n.get("source_file"), n.get("source_location"))
     ftype_tag = ""
     ft = n.get("file_type", "")
