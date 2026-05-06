@@ -1,0 +1,16 @@
+{
+  "candidate_id": "baseline_navigator",
+  "task_id": "seed_task_001_compute_score_median",
+  "trial": 0,
+  "passed": true,
+  "tokens_to_completion": 20625,
+  "tokens_input": 10481,
+  "tokens_output": 1316,
+  "tokens_cache_read": 26117,
+  "tokens_cache_write": 8828,
+  "wall_seconds": 32.829608872998506,
+  "n_api_calls": 11,
+  "n_tool_calls": 10,
+  "oracle_detail": "....                                                                     [100%]\n4 passed in 0.02s",
+  "final_assistant_text": "All 4 tests pass.\n\n**Summary:**\n- The failing test expected `compute_score` to return the **median**, but the implementation in `src/mylib/utils.py` returned the **mean**.\n- I rewrote `compute_score` to compute the median (handling odd length, even length via average of two middle values, and the empty-list case returning `0.0`).\n- Re-ran `pytest tests/test_utils.py`: **4 passed**.\n\nThe task is complete."
+}
