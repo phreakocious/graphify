@@ -2917,3 +2917,79 @@ def test_auto_widen_not_triggered_with_kinds_filter(tmp_path, monkeypatch):
     assert "auto-widened" not in out, (
         f"--kind filter should suppress auto-widen:\n{out}"
     )
+
+
+def test_include_inferred_silent_emits_no_inferred_to_add_frontier(tmp_path, monkeypatch):
+    """Lap-20 field-report fix #5: when `--include-inferred` is on but no
+    pivot has hidden inferred edges, the frontier render must say so. Without
+    this confirmation the flag looks broken — output is byte-identical to
+    the AST-only default."""
+    from graphify.navigate import navigate
+    nodes = [
+        {"id": "tgt", "label": "f()", "file_type": "code",
+         "source_file": "a.py", "source_location": "L10"},
+        {"id": "c1", "label": "caller()", "file_type": "code",
+         "source_file": "a.py", "source_location": "L1"},
+    ]
+    # Only EXTRACTED edges — no inferred edges to add.
+    links = [
+        {"source": "c1", "target": "tgt", "relation": "calls",
+         "confidence": "EXTRACTED"},
+    ]
+    _write_graph(tmp_path / "graphify-out", nodes, links)
+    monkeypatch.chdir(tmp_path)
+    out = navigate(["@f"], session=False, fmt="text", extracted_only=False)
+    assert "no inferred edges to add" in out, (
+        f"frontier should confirm --include-inferred is honored "
+        f"when nothing extra applies:\n{out}"
+    )
+
+
+def test_include_inferred_silent_emits_no_inferred_to_add_listing(tmp_path, monkeypatch):
+    """Lap-20 field-report fix #5: same symmetric confirmation on a non-empty
+    listing with no inferred drops. Listing pivot output should mark
+    `--include-inferred` as honored even when the rendered rows would have
+    been the same under AST-only."""
+    from graphify.navigate import navigate
+    nodes = [
+        {"id": "tgt", "label": "f()", "file_type": "code",
+         "source_file": "a.py", "source_location": "L10"},
+        {"id": "c1", "label": "caller()", "file_type": "code",
+         "source_file": "a.py", "source_location": "L1"},
+    ]
+    links = [
+        {"source": "c1", "target": "tgt", "relation": "calls",
+         "confidence": "EXTRACTED"},
+    ]
+    _write_graph(tmp_path / "graphify-out", nodes, links)
+    monkeypatch.chdir(tmp_path)
+    out = navigate(["@f", "in"], session=False, fmt="text", extracted_only=False)
+    assert "no inferred edges to add" in out, (
+        f"listing should confirm --include-inferred is honored when no "
+        f"inferred drops exist:\n{out}"
+    )
+
+
+def test_include_inferred_default_off_silent_no_marker(tmp_path, monkeypatch):
+    """Sanity: the symmetric confirmation must NOT fire when
+    `--include-inferred` was NOT passed. Default extracted-only output
+    stays unchanged."""
+    from graphify.navigate import navigate
+    nodes = [
+        {"id": "tgt", "label": "f()", "file_type": "code",
+         "source_file": "a.py", "source_location": "L10"},
+        {"id": "c1", "label": "caller()", "file_type": "code",
+         "source_file": "a.py", "source_location": "L1"},
+    ]
+    links = [
+        {"source": "c1", "target": "tgt", "relation": "calls",
+         "confidence": "EXTRACTED"},
+    ]
+    _write_graph(tmp_path / "graphify-out", nodes, links)
+    monkeypatch.chdir(tmp_path)
+    out = navigate(["@f"], session=False, fmt="text")  # extracted_only=True default
+    assert "no inferred edges to add" not in out, (
+        f"confirmation must not appear under default extracted-only:\n{out}"
+    )
+
+

@@ -810,6 +810,10 @@ def _frontier_data(G: nx.DiGraph, communities: dict[int, list[str]],
         "contains_rationale_count": contains_rationale_count,
         "impl_of_in_count": impl_of_in_count,
         "type_ref_in_count": type_ref_in_count,
+        # Echoed so the renderer can confirm `--include-inferred` was
+        # honored when the resulting view is identical to the default
+        # (no inferred edges existed to add).
+        "extracted_only": extracted_only,
     }
 
 
@@ -1698,6 +1702,16 @@ def _render_frontier_text(data: dict, cursor: Cursor, *, show_ops: bool,
             "  hint: hidden inferred edges available — "
             "add `--include-inferred` to widen pivots beyond AST ground truth.",
             cursor, quiet_hints)
+    elif data.get("extracted_only") is False:
+        # Symmetric case (lap-20 field-report fix): the user opted in with
+        # `--include-inferred` but every pivot would render identically to
+        # the default. Without this confirmation the flag looks broken
+        # (output is byte-identical with/without it). Mirrors the existing
+        # asymmetric "hidden inferred edges available" hint above.
+        _emit_hint(out, "no_inferred_to_add",
+            "  hint: --include-inferred on — no inferred edges to add "
+            "(view is identical to AST-only default).",
+            cursor, quiet_hints)
 
     if data.get("last_listing_size") and data.get("last_pivot"):
         out.append(f"  last: {data['last_pivot']}({data['last_listing_size']}) · pick [N]")
@@ -1849,6 +1863,12 @@ def _render_listing_text(data: dict, *, show_ops: bool, md: bool = False) -> str
                     and not by_rel)
         cue = "  (add --include-inferred to widen)" if inf_only else ""
         header += f"  ({', '.join(drop_bits)}){cue}"
+    elif data.get("extracted_only") is False and not drops.get("inferred"):
+        # Symmetric case (lap-20 field-report fix): the user passed
+        # `--include-inferred` but no inferred edges existed to add to
+        # this listing. Confirm the flag was honored so it doesn't look
+        # broken (output would otherwise be identical to the default).
+        header += "  (--include-inferred on — no inferred edges to add)"
     out.append(header)
 
     # Cluster hoisting — Lap-3 reported every item line carrying a `cN` tag is
