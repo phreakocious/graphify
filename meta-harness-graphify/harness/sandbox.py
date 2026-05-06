@@ -156,6 +156,16 @@ class Sandbox:
             venv_dir=venv_dir,
             candidate_graphify_src=candidate_src,
         )
+        # If the target repo has a Python project (pyproject.toml or setup.py),
+        # editable-install it into the sandbox venv. Without this, src-layout
+        # fixtures fail to import from oracle pytest unless the agent happens
+        # to run pip install -e . themselves — introducing flake.
+        if (target_repo / "pyproject.toml").is_file() or (target_repo / "setup.py").is_file():
+            subprocess.run(
+                [str(venv_python), "-m", "pip", "install", "--quiet", "-e", str(target_repo)],
+                check=True,
+                timeout=300,
+            )
         return cls(
             root=sandbox_root,
             target_repo=target_repo,

@@ -25,6 +25,7 @@ mhg = "meta_harness:cli"
 
 [tool.setuptools]
 packages = ["harness", "agents", "tasks"]
+py-modules = ["meta_harness"]
 
 [tool.pytest.ini_options]
 markers = [
