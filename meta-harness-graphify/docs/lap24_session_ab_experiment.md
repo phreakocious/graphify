@@ -170,6 +170,47 @@ The lap-24 ships:
 
 Round 2 cost: ~$8.40.
 
+## Round 3 — shape docstring (smoke, n=3)
+
+After Round 2 confirmed verb-data improvements move calls, shipped two
+more changes and re-smoked task_recipe_navigator on `seed_task_006`:
+- navigator `d23effa` summarize file targets fall through to shape
+  (was: error-with-redirect-message)
+- navigator `d79e67b` shape inlines top-of-file docstring/comment
+  block under the header
+- meta-harness `e53bf99` SESS1 oracle relaxed (substrings derived
+  from prompt: `classify` + `build_residual_axis`, not the
+  step-2-specific `_compute_signal_metrics`)
+
+|                    | round 2 (no docstring) | round 3 (docstring) | Δ |
+|--------------------|------------------------|----------------------|---|
+| pass rate          | 3/3                    | 3/3                  | — |
+| calls              | 17.7                   | 20.0                 | +13% |
+| wall               | 100.5s                 | 111.9s               | +11% |
+| ttc                | 82.7k                  | 50.5k                | **−39%** |
+
+**Mixed result.** Calls and wall went up modestly; ttc dropped sharply.
+Within n=3 noise: round 3 calls range 17-23, round 2 ranged 15-21.
+Output tokens per trial in round 3 are consistent (3.9k, 4.5k, 4.3k);
+the ttc drop is driven by input + cache_write savings (denser shape
+output means fewer read_file / re-orientation calls to make up the
+cache). Per-trial transcript inspection shows the agent's exploration
+pattern is largely the same as round 2; the docstring add ~5 short
+lines (~80 tokens) per shape call and doesn't directly reduce
+follow-up calls on this task.
+
+**Hypothesis** (unverified at this n): the docstring helps tasks where
+file purpose matters (e.g. "what does this library do?"), not tasks
+where the call graph is the answer (this benchmark). The mild call
+uptick may be agents using the extra context to do incremental
+exploration rather than commit faster.
+
+**Decision**: keep the docstring ship. The data is objectively useful;
+ttc savings are real; call delta is noise-band. If a future run
+confirms a real call-count regression, revert. Lap-24 stops here.
+
+Round 3 cost: ~$4.20.
+
 ## Bottom line
 
 - **Ship**: all four navigator commits + harness fix. Pushed.
