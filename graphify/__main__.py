@@ -121,6 +121,7 @@ _HELP_BLOCKS: dict[str, list[str]] = {
         "    --include-inferred      include LLM-inferred edges (default: AST-extracted only)",
         "    --min-confidence X      drop edges below score X (only meaningful with --include-inferred)",
         "    --kind <rel[,rel,...]>  restrict in/out listings to edges of these relations (e.g. calls,uses)",
+        "    --node-kind <k[,k,...]> restrict listings to nodes of these kinds (e.g. function,method,class). Useful on `@<key>` substring disambig: `--node-kind=function` lops file/iface/external rows.",
         "    --bodies N              show first N source lines under each contains/methods item",
         "    --depth N               for in/out, walk N hops via non-structural edges (default 1)",
         "    --limit N               max items per listing (default 25)",
@@ -2666,6 +2667,7 @@ def main() -> None:
         # COC_LIST_LIMIT_DEFAULT). Setting an int here bypasses both.
         limit: int | None = None
         kinds: set[str] | None = None
+        node_kinds: set[str] | None = None  # --node-kind filter on node_kind attr
         bodies: int | None = None
         depth: int = 1
         archived_mode: str = "all"  # --no-archived → "no" / --archived-only → "only"
@@ -2721,6 +2723,12 @@ def main() -> None:
             elif a.startswith("--kind="):
                 kinds = {k.strip() for k in a.split("=", 1)[1].split(",") if k.strip()}
                 i += 1
+            elif a == "--node-kind" and i + 1 < len(args):
+                node_kinds = {k.strip() for k in args[i + 1].split(",") if k.strip()}
+                i += 2
+            elif a.startswith("--node-kind="):
+                node_kinds = {k.strip() for k in a.split("=", 1)[1].split(",") if k.strip()}
+                i += 1
             elif a == "--bodies" and i + 1 < len(args):
                 bodies = int(args[i + 1]); i += 2
             elif a.startswith("--bodies="):
@@ -2771,6 +2779,7 @@ def main() -> None:
             show_ops_hint=show_ops_hint,
             limit=limit,
             kinds=kinds,
+            node_kinds=node_kinds,
             bodies=bodies,
             depth=depth,
             archived_mode=archived_mode,

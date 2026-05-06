@@ -896,7 +896,8 @@ def _listing_data(G: nx.DiGraph, ids: list[str], pivot_name: str,
                   kinds: set[str] | None = None,
                   bodies: int | None = None,
                   extracted_only: bool = True,
-                  collapse_dupes: bool = True) -> dict:
+                  collapse_dupes: bool = True,
+                  node_kinds: set[str] | None = None) -> dict:
     """Build a listing dict from a list of node ids.
 
     Lap-9 collapse: when >=5 adjacent items share a label, group them into
@@ -928,6 +929,36 @@ def _listing_data(G: nx.DiGraph, ids: list[str], pivot_name: str,
         ids = filtered_ids
         if total >= len(filtered_ids) + external_hidden:
             total -= external_hidden
+
+    # Lap-21 polish: --node-kind drops rows whose node_kind isn't in the
+    # allowlist. TS-Claude reported `@compile` substring-listing returning
+    # 37 rows where the top 3 (the actual functions) were what they
+    # wanted; --node-kind=function lops the file/iface/external rows.
+    # Synonym: "method" matches both raw "method" and "impl_method";
+    # "function" matches "function" only. The set is matched as a strict
+    # equality check on each item's node_kind attribute.
+    node_kind_hidden = 0
+    if node_kinds:
+        # Expand canonical synonyms so `--node-kind=method` catches both
+        # "method" and "impl_method" without requiring callers to know
+        # the extractor's tag scheme.
+        expanded = set(node_kinds)
+        if "method" in expanded:
+            expanded.update({"impl_method", "iface_method"})
+        if "function" in expanded:
+            expanded.update({"impl_method"})  # treat impls as functions too
+        if "interface" in expanded:
+            expanded.update({"iface_method"})
+        kept = []
+        for nid in ids:
+            nk = G.nodes[nid].get("node_kind") or ""
+            if nk in expanded:
+                kept.append(nid)
+            else:
+                node_kind_hidden += 1
+        ids = kept
+        if total >= len(kept) + node_kind_hidden:
+            total -= node_kind_hidden
 
     raw_items = []
     for nid in ids:
@@ -986,6 +1017,8 @@ def _listing_data(G: nx.DiGraph, ids: list[str], pivot_name: str,
     drops_out = dict(drops or {})
     if external_hidden:
         drops_out["external"] = external_hidden
+    if node_kind_hidden:
+        drops_out["node_kind"] = node_kind_hidden
     return {
         "type": "listing",
         "pivot": pivot_name,
@@ -1863,6 +1896,8 @@ def _render_listing_text(data: dict, *, show_ops: bool, md: bool = False) -> str
             bits.append(f"+{drops['archived']} archived hidden")
         if drops.get("external"):
             bits.append(f"+{drops['external']} external (unresolved imports) hidden")
+        if drops.get("node_kind"):
+            bits.append(f"+{drops['node_kind']} hidden via --node-kind")
         if drops.get("files"):
             bits.append(f"+{drops['files']} files hidden — pass --include-files to widen")
         if drops.get("rationale"):
@@ -1951,6 +1986,8 @@ def _render_listing_text(data: dict, *, show_ops: bool, md: bool = False) -> str
         drop_bits.append(f"+{drops['archived']} archived hidden")
     if drops.get("external"):
         drop_bits.append(f"+{drops['external']} external (unresolved imports) hidden")
+    if drops.get("node_kind"):
+        drop_bits.append(f"+{drops['node_kind']} hidden via --node-kind")
     if drops.get("files"):
         drop_bits.append(f"+{drops['files']} files hidden — pass --include-files to widen")
     if drops.get("rationale"):
@@ -3340,6 +3377,7 @@ def navigate(ops: list[str] | str, *,
              explain_cost: bool = False,
              md: bool = False,
              transitive: bool = False,
+             node_kinds: set[str] | None = None,
              show_session: str | None = None,
              quiet_hints: bool = False) -> str:
     """Apply a chain of ops, return rendered output.
@@ -3630,7 +3668,8 @@ def navigate(ops: list[str] | str, *,
                                               sort_label="match relevance",
                                               limit=effective_limit,
                                               drops=drops,
-                                              collapse_dupes=collapse_dupes)
+                                              collapse_dupes=collapse_dupes,
+                                              node_kinds=node_kinds)
                     cursor.last_listing = [it["id"] for it in last_data["items"]]
                     cursor.last_pivot = "@-disambig"
                 else:
@@ -3809,6 +3848,7 @@ def navigate(ops: list[str] | str, *,
                         # ids, so re-collapsing is a no-op that adds risk.
                         collapse_dupes=False,
                         extracted_only=extracted_only,
+                        node_kinds=node_kinds,
                     )
                     last_data["filter"] = {
                         "pattern": pattern,
@@ -3897,6 +3937,7 @@ def navigate(ops: list[str] | str, *,
                         bodies=None,
                         extracted_only=extracted_only,
                         collapse_dupes=collapse_dupes,
+                        node_kinds=node_kinds,
                     )
                     # Annotate text-only rows with the line number(s) of
                     # the mention(s). Without this the agent doesn't know
@@ -3993,7 +4034,8 @@ def navigate(ops: list[str] | str, *,
                                                   kinds=kinds,
                                                   bodies=bodies if pkey in ("contains", "methods") else None,
                                                   extracted_only=extracted_only,
-                                                  collapse_dupes=collapse_dupes)
+                                                  collapse_dupes=collapse_dupes,
+                                                  node_kinds=node_kinds)
                         # Persist only the rendered window — keeps the cursor file
                         # small (coc on a 1000-node community would otherwise be ~40KB).
                         # Post-collapse, [N] indices map to the first member of each

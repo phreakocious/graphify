@@ -2236,6 +2236,56 @@ def test_frontier_header_disambiguates_focus_from_community(tmp_path, monkeypatc
     )
 
 
+def test_navigate_node_kind_filter_on_substring_disambig(tmp_path, monkeypatch):
+    """Lap-21 polish: `@compile` substring listing returned 37 rows
+    where the top 3 (the actual functions) were what the user wanted.
+    `--node-kind=function` lops file/iface/external rows out of the
+    disambig listing."""
+    import json as _json, subprocess
+    nodes = [
+        # The intended targets: functions named compile_*.
+        {"id": "fn1", "label": "compile_v1()", "file_type": "code",
+         "source_file": "src/v1.ts", "source_location": "L1",
+         "node_kind": "function"},
+        {"id": "fn2", "label": "compile_v2()", "file_type": "code",
+         "source_file": "src/v2.ts", "source_location": "L1",
+         "node_kind": "function"},
+        # Noise that would otherwise crowd the listing.
+        {"id": "iface", "label": "compileSpec", "file_type": "code",
+         "source_file": "src/iface.ts", "source_location": "L1",
+         "node_kind": "interface"},
+        {"id": "type1", "label": "compileResult", "file_type": "code",
+         "source_file": "src/types.ts", "source_location": "L1",
+         "node_kind": "type_alias"},
+        {"id": "file1", "label": "compile_helpers.ts", "file_type": "code",
+         "source_file": "src/compile_helpers.ts", "source_location": "L1",
+         "node_kind": "file"},
+        {"id": "ext1", "label": "compile_external", "file_type": "external",
+         "node_kind": "external_module",
+         "source_file": "", "source_location": ""},
+    ]
+    graph_dir = tmp_path / "graphify-out"
+    graph_dir.mkdir()
+    (graph_dir / "graph.json").write_text(_json.dumps(
+        {"directed": True, "multigraph": False,
+         "graph": {}, "nodes": nodes, "links": []}), encoding="utf-8")
+
+    res = subprocess.run(
+        ["graphify", "navigate", "@compile", "--node-kind=function",
+         "--graph", str(graph_dir / "graph.json")],
+        capture_output=True, text=True, cwd=str(tmp_path),
+    )
+    out = res.stdout + res.stderr
+    assert "compile_v1" in out, f"functions should remain:\n{out}"
+    assert "compile_v2" in out, f"functions should remain:\n{out}"
+    assert "compileSpec" not in out, f"interface should be filtered:\n{out}"
+    assert "compileResult" not in out, f"type_alias should be filtered:\n{out}"
+    assert "compile_helpers" not in out, f"file should be filtered:\n{out}"
+    assert "node-kind" in out and "hidden" in out, (
+        f"hidden-count should be surfaced:\n{out}"
+    )
+
+
 def test_search_by_symbol_collapses_same_symbol_hits(tmp_path, monkeypatch):
     """Lap-21 #7: TS-Claude reported `search 'stagedDecode'` returning 4
     hits all attributed to the same `stagedDecode()` function (different
