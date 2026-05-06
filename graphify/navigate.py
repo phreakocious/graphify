@@ -3172,6 +3172,111 @@ def _render_search_text(data: dict, *, md: bool = False) -> str:
 # --- file shape summary ----------------------------------------------------
 
 _SHAPE_DEFAULT_LIMIT = 8
+_SHAPE_DOCSTRING_LINES = 5
+
+
+def _file_top_docstring(sf: str, *, max_lines: int = _SHAPE_DOCSTRING_LINES) -> list[str]:
+    """Return up to `max_lines` of the file's leading docstring or
+    comment block, stripped and trimmed. Empirical: agents who run
+    shape on an unfamiliar file routinely follow up with `read_file
+    <file>` just to read the top-of-file docstring for orienting
+    context (see lap-24 session-benchmark t0 transcript). Surfacing
+    the docstring inline saves that follow-up.
+
+    Recognized leaders: Python `\"\"\"...\"\"\"` / `'''...'''`,
+    line comments `# ...`, `// ...`, `/// ...`, `//! ...`. Block
+    comments `/* ... */` are picked up via `*` on continuation
+    lines. No-docstring → empty list.
+    """
+    try:
+        with open(sf, "r", encoding="utf-8", errors="replace") as f:
+            head = [next(f) for _ in range(40)]
+    except (OSError, StopIteration):
+        try:
+            with open(sf, "r", encoding="utf-8", errors="replace") as f:
+                head = f.readlines()
+        except OSError:
+            return []
+    # Skip leading blanks and shebangs/encoding lines.
+    i = 0
+    while i < len(head):
+        s = head[i].strip()
+        if not s:
+            i += 1
+            continue
+        if s.startswith("#!") or (s.startswith("#") and "coding" in s and "=" in s):
+            i += 1
+            continue
+        break
+    if i >= len(head):
+        return []
+    first = head[i].lstrip()
+    out: list[str] = []
+    # Python triple-quoted docstring.
+    if first.startswith('"""') or first.startswith("'''"):
+        triple = first[:3]
+        # Single-line docstring (`"""one-liner"""` on first line).
+        rest = first[3:]
+        if triple in rest:
+            line = rest.split(triple, 1)[0].strip()
+            if line:
+                out.append(line)
+            return out[:max_lines]
+        # Multi-line: collect until closing triple-quote.
+        if rest.strip():
+            out.append(rest.rstrip())
+        i += 1
+        while i < len(head) and len(out) < max_lines:
+            ln = head[i].rstrip()
+            if triple in ln:
+                pre = ln.split(triple, 1)[0].rstrip()
+                if pre.strip():
+                    out.append(pre.strip())
+                break
+            if ln.strip():
+                out.append(ln.strip())
+            i += 1
+        return out[:max_lines]
+    # Line-comment block: `#`, `//`, `///`, `//!`, `--`.
+    line_prefixes = ("# ", "#", "//", "--")
+    if any(first.startswith(p) for p in line_prefixes):
+        while i < len(head) and len(out) < max_lines:
+            s = head[i].strip()
+            if not s:
+                # Blank line ends the block.
+                break
+            if not any(s.startswith(p) for p in line_prefixes):
+                break
+            # Strip the comment leader (`# `, `// `, `/// `, etc.)
+            stripped = s.lstrip("#/-").lstrip()
+            if stripped:
+                out.append(stripped)
+            i += 1
+        return out[:max_lines]
+    # Block comment `/* ... */` — collect until `*/`.
+    if first.startswith("/*"):
+        rest = first[2:]
+        if "*/" in rest:
+            line = rest.split("*/", 1)[0].strip().lstrip("*").strip()
+            if line:
+                out.append(line)
+            return out[:max_lines]
+        if rest.strip():
+            out.append(rest.strip().lstrip("*").strip())
+        i += 1
+        while i < len(head) and len(out) < max_lines:
+            s = head[i].strip()
+            if "*/" in s:
+                pre = s.split("*/", 1)[0].strip().lstrip("*").strip()
+                if pre:
+                    out.append(pre)
+                break
+            stripped = s.lstrip("*").strip()
+            if stripped:
+                out.append(stripped)
+            i += 1
+        return out[:max_lines]
+    return []
 
 
 def shape_file(G: nx.DiGraph, file_nid: str, *,
@@ -3337,6 +3442,11 @@ def shape_file(G: nx.DiGraph, file_nid: str, *,
     entry_points.sort(key=lambda x: (-x["ext_in"], x["label"]))
 
     total_lines = len(file_lines) if file_lines else None
+    # Lap-24 follow-up: top-of-file docstring/comment block. Agents who
+    # run shape on an unfamiliar file routinely chase a `read_file
+    # <file>` next, just to read the orientation paragraph at the top.
+    # Capturing 3-5 lines of it inline saves that follow-up.
+    docstring = _file_top_docstring(sf) if sf else []
     return {
         "type": "shape",
         "label": label,
@@ -3350,6 +3460,7 @@ def shape_file(G: nx.DiGraph, file_nid: str, *,
         "longest_fn": longest_fn,
         "entry_points": entry_points[:3],
         "total_lines": total_lines,
+        "docstring": docstring,
         # `limit=None` (`--all`) returns the full lists; default 8 keeps the
         # one-screen summary tight. The `+N more` line in the renderer still
         # surfaces what was truncated, per the omission-counts rule.
@@ -3501,6 +3612,13 @@ def _render_shape_text(data: dict) -> str:
     """Compact one-screen shape summary: counts + samples + longest fn."""
     parts: list[str] = []
     parts.append(f"  shape @{data['label']}  {data.get('source_file') or '?'}")
+    # Lap-24 follow-up: top-of-file docstring inline. Renders right
+    # under the header so an agent reading shape sees the file's
+    # purpose paragraph before the structural counts.
+    docstring = data.get("docstring") or []
+    if docstring:
+        for line in docstring:
+            parts.append(f"    > {line}")
     bits: list[str] = []
     if data["classes"]:
         bits.append(f"{data['classes']} class(es)")

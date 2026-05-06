@@ -3866,6 +3866,115 @@ def test_shape_file_surfaces_entry_points(tmp_path, monkeypatch):
     )
 
 
+def test_shape_file_surfaces_top_of_file_docstring(tmp_path, monkeypatch):
+    """Lap-24 follow-up: shape inlines up to ~5 lines of the file's
+    leading docstring or comment block. Empirical from session-benchmark
+    t0 transcript: agent ran `shape` then chased a `read_file <file>`
+    just to read the orientation paragraph at the top. Surfacing it in
+    the same shape call saves the follow-up.
+
+    Covers both Python triple-quoted module docstrings and line-comment
+    leaders (`#`, `//`)."""
+    from graphify.navigate import shape_file, _render_shape_text, load_graph
+    # Python triple-quoted.
+    py_sf = tmp_path / "py_module.py"
+    py_sf.write_text(
+        '"""Top-line summary of the module.\n'
+        '\n'
+        'Second paragraph mentions a key concept.\n'
+        '"""\n'
+        '\n'
+        'def foo():\n'
+        '    return 1\n'
+    )
+    nodes = [
+        {"id": "f", "label": "py_module.py", "file_type": "code",
+         "source_file": str(py_sf), "source_location": "L1",
+         "node_kind": "file"},
+        {"id": "fn", "label": "foo()", "file_type": "code",
+         "source_file": str(py_sf), "source_location": "L6",
+         "node_kind": "function"},
+    ]
+    links = [{"source": "f", "target": "fn", "relation": "contains",
+              "confidence": "EXTRACTED"}]
+    _write_graph(tmp_path / "graphify-out", nodes, links)
+    monkeypatch.chdir(tmp_path)
+    G, _comm = load_graph(tmp_path / "graphify-out" / "graph.json")
+    data = shape_file(G, "f")
+    docstring = data.get("docstring") or []
+    assert docstring, f"docstring should be captured: {data}"
+    assert "Top-line summary of the module." in docstring, docstring
+    assert "Second paragraph mentions a key concept." in docstring, docstring
+    rendered = _render_shape_text(data)
+    assert "> Top-line summary of the module." in rendered, (
+        f"docstring should render with `> ` prefix:\n{rendered}"
+    )
+
+    # Line-comment leader.
+    cm_sf = tmp_path / "comment_module.py"
+    cm_sf.write_text(
+        "# Module that does the thing.\n"
+        "# Stores X and Y, returns Z.\n"
+        "\n"
+        "def bar():\n"
+        "    return 2\n"
+    )
+    nodes2 = [
+        {"id": "f2", "label": "comment_module.py", "file_type": "code",
+         "source_file": str(cm_sf), "source_location": "L1",
+         "node_kind": "file"},
+        {"id": "fn2", "label": "bar()", "file_type": "code",
+         "source_file": str(cm_sf), "source_location": "L4",
+         "node_kind": "function"},
+    ]
+    links2 = [{"source": "f2", "target": "fn2", "relation": "contains",
+               "confidence": "EXTRACTED"}]
+    _write_graph(tmp_path / "graphify-out", nodes2, links2)
+    G2, _ = load_graph(tmp_path / "graphify-out" / "graph.json")
+    data2 = shape_file(G2, "f2")
+    docstring2 = data2.get("docstring") or []
+    assert "Module that does the thing." in docstring2, docstring2
+    assert "Stores X and Y, returns Z." in docstring2, docstring2
+    # Blank line ends the comment block — fn body shouldn't leak in.
+    assert not any("def bar" in d for d in docstring2), docstring2
+
+
+def test_shape_file_no_docstring_when_file_starts_with_code(tmp_path, monkeypatch):
+    """No leading docstring/comment → empty docstring list, no `>`
+    line in rendered output. Avoids inventing fake context for files
+    that just start with imports."""
+    from graphify.navigate import shape_file, _render_shape_text, load_graph
+    sf = tmp_path / "code_only.py"
+    sf.write_text(
+        "import os\n"
+        "import sys\n"
+        "\n"
+        "def baz():\n"
+        "    return 3\n"
+    )
+    nodes = [
+        {"id": "f", "label": "code_only.py", "file_type": "code",
+         "source_file": str(sf), "source_location": "L1",
+         "node_kind": "file"},
+        {"id": "fn", "label": "baz()", "file_type": "code",
+         "source_file": str(sf), "source_location": "L4",
+         "node_kind": "function"},
+    ]
+    links = [{"source": "f", "target": "fn", "relation": "contains",
+              "confidence": "EXTRACTED"}]
+    _write_graph(tmp_path / "graphify-out", nodes, links)
+    monkeypatch.chdir(tmp_path)
+    G, _comm = load_graph(tmp_path / "graphify-out" / "graph.json")
+    data = shape_file(G, "f")
+    assert data.get("docstring") == [], (
+        f"no leading docstring → empty list:\n{data}"
+    )
+    rendered = _render_shape_text(data)
+    assert "> " not in rendered, (
+        f"no docstring → no `> ` lines in render:\n{rendered}"
+    )
+
+
 def test_shape_file_promotes_entry_point_fns_past_limit(tmp_path, monkeypatch):
     """Lap-24: shape's fns list now stamps `×N` for cross-file callers
     AND pins entry-point fns into the truncated listing even when they
