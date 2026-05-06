@@ -2690,6 +2690,42 @@ def test_doc_node_emits_signature_and_rationale(tmp_path, monkeypatch):
     assert "no rationale attached" in rendered2
 
 
+def test_doc_node_collapses_multiline_ts_signature(tmp_path, monkeypatch):
+    """Lap-21 #4: `doc @compile` truncated at the first newline of the
+    signature, printing `sig: export async function compile(` on a
+    multi-line TS sig. Fix: read the full signature and join with
+    spaces."""
+    from graphify.navigate import doc_node, _render_doc_text, load_graph
+    sf = str(tmp_path / "compile.ts")
+    nodes = [
+        {"id": "compile_fn", "label": "compile()", "file_type": "code",
+         "source_file": sf, "source_location": "L1",
+         "node_kind": "function"},
+    ]
+    _write_graph(tmp_path / "graphify-out", nodes, [])
+    (tmp_path / "compile.ts").write_text(
+        "export async function compile(\n"
+        "  spec: Spec,\n"
+        "  opts: Opts,\n"
+        "): Promise<Engine> {\n"
+        "  return engine;\n"
+        "}\n"
+    )
+    monkeypatch.chdir(tmp_path)
+    G, _comm = load_graph(tmp_path / "graphify-out" / "graph.json")
+    data = doc_node(G, "compile_fn")
+    rendered = _render_doc_text(data)
+    assert "spec: Spec" in rendered, (
+        f"sig should include params, got:\n{rendered}"
+    )
+    assert "Promise<Engine>" in rendered, (
+        f"sig should include return type, got:\n{rendered}"
+    )
+    # And the sig line should be a SINGLE line — no embedded newlines.
+    sig_lines = [ln for ln in rendered.splitlines() if ln.strip().startswith("sig:")]
+    assert len(sig_lines) == 1, f"expected one sig line, got {sig_lines}"
+
+
 def test_search_bodies_returns_hits_with_symbol_context(tmp_path, monkeypatch):
     """`search_bodies` greps each node's source file and attaches symbol
     context (label, file:line, community, degree) to each match. The

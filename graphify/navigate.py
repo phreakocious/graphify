@@ -3031,9 +3031,16 @@ def doc_node(G: nx.DiGraph, nid: str, *, max_rationale_lines: int = 40) -> dict:
 
     header_line = ""
     if sf and loc:
-        body, _ln, _trunc = _read_body_full(sf, loc, max_lines=1, flat=True)
+        # Lap-21 #4: read enough lines to capture a multi-line signature,
+        # then collapse via _signature_end so TS norms like
+        # `function foo(\n  a,\n): T {` render as one `sig:` line instead
+        # of truncating after the open-paren.
+        body, _ln, _trunc = _read_body_full(sf, loc, max_lines=20, flat=True)
         if body:
-            header_line = body[0]
+            sig_end_idx = _signature_end(body, 0, max_search=20)
+            header_line = " ".join(
+                s.strip() for s in body[:sig_end_idx] if s.strip()
+            ) or body[0]
 
     rationale_blocks: list[dict] = []
     seen: set[str] = set()
