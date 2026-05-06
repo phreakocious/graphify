@@ -621,6 +621,42 @@ def test_path_qualified_dotted_suffix_matches_object_method():
     assert match_type == "exact"
 
 
+def test_dotted_class_method_walks_all_matching_classes():
+    """Lap-20c EGF head-to-head field report: when a class name is shared
+    across files (e.g. a production version + an `investigations/` draft),
+    the dotted resolver must walk BOTH classes' methods and emit a
+    disambig listing rather than bailing to fuzzy and silently landing
+    on the wrong one. Today's failure mode: `peek
+    SpectralGraphGeometry.compute_metrics` silently picked the draft
+    because fuzzy ranked the long similar labels close enough that
+    investigations/ won the tie-break."""
+    G = nx.DiGraph()
+    # Production class + method
+    G.add_node("prod_cls", label="SpectralGraphGeometry", file_type="code",
+               source_file="src/kg/spectral.ts", source_location="L10")
+    G.add_node("prod_method", label=".compute_metrics()", file_type="code",
+               source_file="src/kg/spectral.ts", source_location="L42")
+    G.add_edge("prod_cls", "prod_method", relation="method")
+    # Draft in investigations/
+    G.add_node("draft_cls", label="SpectralGraphGeometry", file_type="code",
+               source_file="investigations/spectral-draft.ts", source_location="L1")
+    G.add_node("draft_method", label=".compute_metrics()", file_type="code",
+               source_file="investigations/spectral-draft.ts", source_location="L20")
+    G.add_edge("draft_cls", "draft_method", relation="method")
+    idx = label_index(G)
+    chosen, candidates, match_type, _ = resolve_focus(
+        G, idx, "SpectralGraphGeometry.compute_metrics"
+    )
+    assert chosen is None, (
+        f"shared class name should produce disambig, not silent pick; "
+        f"got chosen={chosen!r}"
+    )
+    assert match_type == "exact"
+    assert set(candidates) == {"prod_method", "draft_method"}, (
+        f"both class' methods should appear; got {candidates}"
+    )
+
+
 def test_path_qualified_no_symbol_lists_files_actual_symbols():
     """Lap-20b TS-Claude field report: `<file>/<sym>` where the symbol
     portion misses must list the prefix-matching file's actual symbols

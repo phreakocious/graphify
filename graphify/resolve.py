@@ -525,7 +525,7 @@ def resolve_focus(G: nx.DiGraph, idx: dict[str, list[str]],
     # idiom) falls through to fuzzy and returns "no node matches" because
     # the label is `.bar()` (method-shape, no class qualifier in the
     # label itself). The fix: when target has exactly one `.` (and isn't
-    # a path), split into class + method, resolve the class, walk its
+    # a path), split into class + method, resolve the class(es), walk
     # method/contains edges, match by normalized method name.
     if "." in key and "/" not in key and not key.startswith("."):
         cls_part, _, meth_part = key.partition(".")
@@ -538,21 +538,27 @@ def resolve_focus(G: nx.DiGraph, idx: dict[str, list[str]],
             # who typed `compute()` resolves the same as `compute`.
             meth_target = meth_part.rstrip("()").lstrip("_")
             cls_matches = idx.get(cls_part, [])
-            # If the class part is itself ambiguous, don't try to walk
-            # all candidate classes — that would silently pick one. The
-            # fall-through to fuzzy gives the agent a disambig listing.
-            if len(cls_matches) == 1:
-                cls_nid = cls_matches[0]
+            # Lap-20c (EGF head-to-head field report): walk ALL matching
+            # classes when the class name is shared across files (e.g.
+            # `SpectralGraphGeometry` exists in both production and
+            # `investigations/`). Previously we bailed here and let
+            # global fuzzy pick — which silently landed on the draft
+            # because the rank tie-break on long similar labels is
+            # subtle. Walking all candidates and emitting a disambig
+            # gives the agent the choice and surfaces the duplication
+            # honestly.
+            if cls_matches:
                 method_hits: list[str] = []
-                for v in G.successors(cls_nid):
-                    e = G.edges[cls_nid, v]
-                    rel = e.get("relation") or ""
-                    if rel not in ("method", "contains"):
-                        continue
-                    child_label = _norm(G.nodes[v].get("label", v))
-                    child_stripped = child_label.rstrip("()").lstrip(".").lstrip("_")
-                    if child_stripped == meth_target or child_label == meth_part:
-                        method_hits.append(v)
+                for cls_nid in cls_matches:
+                    for v in G.successors(cls_nid):
+                        e = G.edges[cls_nid, v]
+                        rel = e.get("relation") or ""
+                        if rel not in ("method", "contains"):
+                            continue
+                        child_label = _norm(G.nodes[v].get("label", v))
+                        child_stripped = child_label.rstrip("()").lstrip(".").lstrip("_")
+                        if child_stripped == meth_target or child_label == meth_part:
+                            method_hits.append(v)
                 if len(method_hits) == 1:
                     return method_hits[0], [], "exact", []
                 if len(method_hits) > 1:
