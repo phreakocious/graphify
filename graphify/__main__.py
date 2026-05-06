@@ -62,10 +62,12 @@ _HELP_BLOCKS: dict[str, list[str]] = {
     "peek": [
         "  peek <symbol>           one-shot body read — resolve, dump body, touch no cursor/session/history",
         "    --lines N               max lines of body to dump (default 200; walker bails at natural dedent first)",
+        "    --bodies N              when peeking a class, body lines per method (default 3)",
         "    --md                    render the focus label as a clickable `[label](file:line)` link",
         "    --graph <path>          path to graph.json (default graphify-out/graph.json)",
         "    Pairs with `navigate ... read` — use peek when you don't want to commit to a session.",
         "    Accepts `Class.method` and `dir/file/Symbol` qualifiers, same as navigate.",
+        "    On a class node, peek emits a curated dump (class header + each method's sig + N body lines) instead of the full class body — saves the per-method walk.",
     ],
     "doc": [
         "  doc <symbol>            one-shot signature + docstring/rationale dump — \"what does this metric/method/class mean?\" without pulling the implementation",
@@ -2259,18 +2261,25 @@ def main() -> None:
         # Pairs with `read` (the in-session flow) — `peek` is for
         # "what does this 20-line function do?" without committing to
         # a navigation chain.
+        # Lap-21 #2 (sub-agent head-to-head): when `peek <Class>` resolves
+        # to a class node, switch to a curated dump — class header +
+        # each method's signature + N body lines — instead of dumping
+        # the entire class body. Saves the 5-call walk to find/peek
+        # individual methods.
         if any(a in ("-h", "--help") for a in sys.argv[2:]):
             _print_subcmd_help("peek")
             return
         from graphify.navigate import (
             DEFAULT_GRAPH_PATH, load_graph,
-            _read_body_full, _render_body_text,
+            _read_body_full, _render_body_text, _read_body_preview,
         )
         from graphify.resolve import label_index, resolve_focus
         from graphify.analyze import _is_file_node
         args = sys.argv[2:]
         graph_path = DEFAULT_GRAPH_PATH
         max_lines = 200
+        bodies = 3       # lines per method when peeking a class
+        method_limit = 12  # cap on methods shown in curated dump
         md = False
         target: str | None = None
         i = 0
@@ -2284,6 +2293,10 @@ def main() -> None:
                 max_lines = max(1, int(args[i + 1])); i += 2
             elif a.startswith("--lines="):
                 max_lines = max(1, int(a.split("=", 1)[1])); i += 1
+            elif a == "--bodies" and i + 1 < len(args):
+                bodies = max(0, int(args[i + 1])); i += 2
+            elif a.startswith("--bodies="):
+                bodies = max(0, int(a.split("=", 1)[1])); i += 1
             elif a == "--md":
                 md = True; i += 1
             elif target is None:
@@ -2333,6 +2346,89 @@ def main() -> None:
         nattrs = G.nodes[chosen]
         sf = nattrs.get("source_file")
         loc = nattrs.get("source_location")
+        node_kind = nattrs.get("node_kind") or ""
+
+        # Lap-21 #2: curated dump for classes. Land on the class header
+        # + each method's sig + first N body lines. The agent gets a
+        # one-call orientation instead of:
+        #   1. peek Class            (gets a 200-line body wall)
+        #   2. navigate @Class methods   (lists method ids)
+        #   3. peek Class.method_a   (4-5 times, one per method)
+        # Reuses _read_body_preview for per-method body windows.
+        if node_kind in ("class", "interface") and sf and loc:
+            label = nattrs.get("label", chosen)
+            # Walk the class's methods via successor edges (`method` or
+            # `contains`). Sort by start-line so the dump reads top-to-
+            # bottom in source order — matches an agent reading the file.
+            method_ids: list[str] = []
+            for v in G.successors(chosen):
+                rel = G.edges[chosen, v].get("relation") or ""
+                if rel not in ("method", "contains"):
+                    continue
+                v_kind = G.nodes[v].get("node_kind") or ""
+                v_label = G.nodes[v].get("label", "")
+                # Functions/methods only — skip nested classes, types, etc.
+                if v_kind in ("class", "interface", "type_alias"):
+                    continue
+                if not (v_label.endswith("()") or v_kind in
+                        ("method", "impl_method", "iface_method", "function")):
+                    continue
+                method_ids.append(v)
+
+            def _start_line(nid: str) -> int:
+                vloc = G.nodes[nid].get("source_location") or ""
+                if vloc.startswith("L"):
+                    try:
+                        return int(vloc[1:].split("-", 1)[0].split(":", 1)[0])
+                    except ValueError:
+                        return 1 << 30
+                return 1 << 30
+            method_ids.sort(key=_start_line)
+
+            # Print header.
+            loc_short = loc[1:] if loc.startswith("L") else loc
+            kind_word = "class" if node_kind == "class" else "interface"
+            print(f"  peek {kind_word} @{label}  {sf}:{loc_short}  "
+                  f"({len(method_ids)} method(s))")
+            # Class header line — first line of class body, single line.
+            class_head, _ln, _trunc = _read_body_full(
+                sf, loc, max_lines=1, flat=True
+            )
+            if class_head:
+                print(f"  {class_head[0].strip()}")
+
+            shown = method_ids[:method_limit]
+            for idx, mid in enumerate(shown, 1):
+                m = G.nodes[mid]
+                m_label = m.get("label", mid) or mid
+                m_loc = m.get("source_location") or ""
+                m_loc_short = m_loc[1:] if m_loc.startswith("L") else ""
+                # Strip leading dot for display since we already announced
+                # "class Foo" — `.foo()` reads as `foo()` in this scope.
+                disp = m_label.lstrip(".") if m_label.startswith(".") else m_label
+                preview = _read_body_preview(
+                    m.get("source_file") or sf, m_loc, n=max(1, bodies + 1)
+                )
+                print(f"    [{idx}] {disp}  L{m_loc_short}" if m_loc_short
+                      else f"    [{idx}] {disp}")
+                # First entry is the signature line; stripped to one line.
+                # Indent body lines so the per-method block reads as a unit.
+                for j, line in enumerate(preview or []):
+                    if j == 0:
+                        # _read_body_preview already returns the header.
+                        # Skip if it just repeats the label-only sig (rare;
+                        # body_preview falls back when source unreadable).
+                        if line.strip().startswith("def ") or line.strip().startswith(
+                            ("async def ", "function ", "static ", "public ", "private ", "protected ", "export ", "constructor")
+                        ) or "(" in line:
+                            print(f"        {line.strip()}")
+                            continue
+                    print(f"        {line.rstrip()}")
+            more = len(method_ids) - len(shown)
+            if more > 0:
+                print(f"    +{more} more — `peek {label}.<method>` for individual bodies")
+            return
+
         is_file = _is_file_node(G, chosen)
         body, ln, trunc = _read_body_full(sf, loc, max_lines=max_lines, flat=is_file)
         data = {

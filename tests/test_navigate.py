@@ -2236,6 +2236,89 @@ def test_frontier_header_disambiguates_focus_from_community(tmp_path, monkeypatc
     )
 
 
+def test_peek_class_emits_curated_dump(tmp_path):
+    """Lap-21 #2 (sub-agent head-to-head): `peek <Class>` (no method)
+    used to dump the entire class body. With many methods that can be
+    hundreds of lines and forces the agent to do follow-up `peek
+    Class.method_X` calls. Curated dump: class header + each method's
+    sig + N body lines, all in one call."""
+    import json as _json, subprocess
+    nodes = [
+        {"id": "cls", "label": "Worker", "file_type": "code",
+         "source_file": "worker.py", "source_location": "L1",
+         "node_kind": "class"},
+        {"id": "m_init", "label": "__init__()", "file_type": "code",
+         "source_file": "worker.py", "source_location": "L2-6",
+         "node_kind": "method"},
+        {"id": "m_run", "label": "run()", "file_type": "code",
+         "source_file": "worker.py", "source_location": "L8-12",
+         "node_kind": "method"},
+        {"id": "m_stop", "label": "stop()", "file_type": "code",
+         "source_file": "worker.py", "source_location": "L14-17",
+         "node_kind": "method"},
+    ]
+    links = [
+        {"source": "cls", "target": "m_init", "relation": "method",
+         "confidence": "EXTRACTED"},
+        {"source": "cls", "target": "m_run", "relation": "method",
+         "confidence": "EXTRACTED"},
+        {"source": "cls", "target": "m_stop", "relation": "method",
+         "confidence": "EXTRACTED"},
+    ]
+    graph_dir = tmp_path / "graphify-out"
+    graph_dir.mkdir()
+    (graph_dir / "graph.json").write_text(_json.dumps(
+        {"directed": True, "multigraph": False,
+         "graph": {}, "nodes": nodes, "links": links}), encoding="utf-8")
+    (tmp_path / "worker.py").write_text(
+        "class Worker:\n"                       # L1
+        "    def __init__(self, n):\n"          # L2
+        "        self.n = n\n"                  # L3
+        "        self.queue = []\n"             # L4
+        "        self.running = False\n"        # L5
+        "        self.cb = None\n"              # L6
+        "\n"                                    # L7
+        "    def run(self):\n"                  # L8
+        "        self.running = True\n"         # L9
+        "        for item in self.queue:\n"     # L10
+        "            self.process(item)\n"      # L11
+        "        return self.n\n"               # L12
+        "\n"                                    # L13
+        "    def stop(self):\n"                 # L14
+        "        self.running = False\n"        # L15
+        "        self.queue.clear()\n"          # L16
+        "        return None\n"                 # L17
+    )
+    res = subprocess.run(
+        ["graphify", "peek", "Worker",
+         "--graph", str(graph_dir / "graph.json")],
+        capture_output=True, text=True, cwd=str(tmp_path),
+    )
+    assert res.returncode == 0, f"peek failed:\n{res.stderr}"
+    out = res.stdout
+    # Header announces it's a class with method count.
+    assert "peek class @Worker" in out and "3 method(s)" in out, (
+        f"missing curated header:\n{out}"
+    )
+    # Class declaration line shown.
+    assert "class Worker:" in out, f"missing class header line:\n{out}"
+    # All three methods listed.
+    assert "__init__()" in out, out
+    assert "run()" in out, out
+    assert "stop()" in out, out
+    # Method bodies sampled — at least one signature + body line per
+    # method should appear.
+    assert "self.n = n" in out, f"missing __init__ body sample:\n{out}"
+    assert "self.running = True" in out, f"missing run body sample:\n{out}"
+    # Sort order is by start_line — __init__ before run before stop.
+    init_idx = out.index("__init__()")
+    run_idx = out.index("run()")
+    stop_idx = out.index("stop()")
+    assert init_idx < run_idx < stop_idx, (
+        f"methods should appear in source order:\n{out}"
+    )
+
+
 def test_method_listings_attribute_owning_class(tmp_path, monkeypatch):
     """Lap-21 #1 (sub-agent head-to-head): rows for `.method()`-shape
     nodes show `Class.method()` instead of bare `.method()`. The agent
