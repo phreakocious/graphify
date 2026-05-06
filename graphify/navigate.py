@@ -4413,6 +4413,18 @@ def navigate(ops: list[str] | str, *,
     # see lap-22 comment block above for the rationale.
     if session_id is not None:
         parts.append(f"  session: {session_id}  (resume with --session {session_id})")
+        # Lap-22b: on a disambig listing, the numbered rows look
+        # pickable (because they ARE — `navigate "[N]"` works) but
+        # only when the next call threads --session. Three rollouts
+        # in lap-22 cited "tried [N], got 'no listing to pick from'."
+        # The cursor is now persisted (ff214ee) so the pick succeeds
+        # — agents just didn't know to thread --session. Name it
+        # explicitly next to the session id.
+        if cursor.last_listing and cursor.last_pivot == "@-disambig":
+            parts.append(
+                f"  to pick a row: graphify navigate \"[N]\" "
+                f"--session {session_id}"
+            )
 
     # Persist cursor AFTER render so renderer-side mutations (hints_emitted)
     # land on disk. This must run after the body of work that might mutate

@@ -403,6 +403,99 @@ def test_session_id_printed_on_every_persist_call(tmp_path, monkeypatch):
     assert "session:" not in out3, f"session=False should suppress:\n{out3}"
 
 
+def test_disambig_listing_names_session_pick_command(tmp_path, monkeypatch):
+    """Lap-22b meta-harness field-report fix: when an `@<label>` query
+    matches multiple nodes, the rendered listing shows numbered rows
+    `[1]`, `[2]`, ... that ARE pickable via `navigate "[N]" --session
+    <id>` — but three lap-22 rollouts cited "tried [N], got 'no listing
+    to pick from'." After the cursor-persistence fix in ff214ee the
+    pick succeeds; agents just don't realise they have to thread
+    --session. Name the pick command explicitly next to the session id
+    on disambig output so the affordance is visible."""
+    import json as _json
+    from graphify.navigate import navigate
+    # Two same-label nodes in different files → disambig listing.
+    nodes = [
+        {"id": "fa", "label": "lib.py", "file_type": "code",
+         "source_file": "lib.py", "source_location": "L1",
+         "node_kind": "file"},
+        {"id": "fb", "label": "tools.py", "file_type": "code",
+         "source_file": "tools.py", "source_location": "L1",
+         "node_kind": "file"},
+        {"id": "ra", "label": "run()", "file_type": "code",
+         "source_file": "lib.py", "source_location": "L10-20",
+         "node_kind": "function", "community": 0},
+        {"id": "rb", "label": "run()", "file_type": "code",
+         "source_file": "tools.py", "source_location": "L30-40",
+         "node_kind": "function", "community": 0},
+    ]
+    links = [
+        {"source": "fa", "target": "ra", "relation": "contains",
+         "confidence": "EXTRACTED"},
+        {"source": "fb", "target": "rb", "relation": "contains",
+         "confidence": "EXTRACTED"},
+    ]
+    graph_dir = tmp_path / "graphify-out"
+    graph_dir.mkdir()
+    (graph_dir / "graph.json").write_text(_json.dumps(
+        {"nodes": nodes, "links": links}), encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+    out = navigate(["@run"], session=True, fmt="text")
+    # Sanity: this is a disambig listing.
+    assert "ambiguous" in out, f"expected disambig listing:\n{out}"
+    # Session id present (was already covered by ff214ee test).
+    assert "session:" in out, f"session id missing:\n{out}"
+    # New: pick-row command appears next to the session id with the
+    # actual session id substituted in. Without this the agent reads
+    # the numbered rows as pickable but doesn't know they need
+    # --session, and gets "no listing to pick from" on the next call.
+    assert "graphify navigate \"[N]\" --session" in out, (
+        f"disambig output should name the pick-row command + --session "
+        f"so the agent sees the affordance:\n{out}"
+    )
+
+
+def test_pivot_listing_does_not_emit_pick_hint(tmp_path, monkeypatch):
+    """The pick-row hint is scoped to disambig listings (where the
+    field reports came from). On a regular pivot listing (in/out/methods
+    /contains), the agent typically already passed --session or is
+    chaining within one call — emitting the hint there would be noise
+    on every chain step. Belt-and-suspenders: assert the hint stays
+    quiet on a non-disambig listing."""
+    import json as _json
+    from graphify.navigate import navigate
+    nodes = [
+        {"id": "f", "label": "lib.py", "file_type": "code",
+         "source_file": "lib.py", "source_location": "L1",
+         "node_kind": "file"},
+        {"id": "g", "label": "go()", "file_type": "code",
+         "source_file": "lib.py", "source_location": "L5",
+         "node_kind": "function", "community": 0},
+        {"id": "h", "label": "helper()", "file_type": "code",
+         "source_file": "lib.py", "source_location": "L20",
+         "node_kind": "function", "community": 0},
+    ]
+    links = [
+        {"source": "f", "target": "g", "relation": "contains",
+         "confidence": "EXTRACTED"},
+        {"source": "f", "target": "h", "relation": "contains",
+         "confidence": "EXTRACTED"},
+        {"source": "g", "target": "h", "relation": "calls",
+         "confidence": "EXTRACTED"},
+    ]
+    graph_dir = tmp_path / "graphify-out"
+    graph_dir.mkdir()
+    (graph_dir / "graph.json").write_text(_json.dumps(
+        {"nodes": nodes, "links": links}), encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+    # Focus → out (regular pivot listing, not disambig).
+    out = navigate(["@go", "out"], session=True, fmt="text")
+    assert "session:" in out
+    assert "to pick a row" not in out, (
+        f"non-disambig pivot should not emit the pick hint:\n{out}"
+    )
+
+
 def test_siblings_on_file_returns_n_a(tmp_path, monkeypatch):
     """Lap-6 friction 10: `siblings` on a file used to return empty;
     the user couldn't tell whether it was a real empty or a misuse.
