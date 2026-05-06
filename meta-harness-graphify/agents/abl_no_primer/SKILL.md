@@ -8,6 +8,11 @@
 - **read_file wins** when comprehending most of a file's bodies (>~200 ln total) or line-by-line questions (formatting, surrounding context). graphify still primes the right offset — `shape` then targeted `read_file` beats unprimed reading.
 - **graphify ties read_file** at 3-5 medium bodies. Pick by what's already on hand. Don't burn calls scouting for a marginal win.
 
+## When to reach for `graphify search` instead of `grep`
+
+- **About to chain `Grep` / `Glob` calls to trace a call graph or find who-uses-X.** That's literally what `graphify navigate` `in` / `out` / `path` are for.
+- **About to grep for a string in source code.** Reach for `graphify search "<pattern>"` over `grep -n` when (a) you don't already know the containing symbol, or (b) you want to see parallel definitions across the repo. Search returns hits with symbol attribution (label, file:line, container, community) and ±1 line of context, repo-wide by default. Use raw `grep` for non-source files (markdown, JSON, configs) and right after recent edits when the graph is stale.
+
 ## First-call hygiene
 
 Run `graphify update` once if `graphify-out/graph.json` doesn't exist or might be stale. The command is fast. graphify itself will surface a `!stale` banner if any indexed source file's mtime is newer than the graph — trust it.

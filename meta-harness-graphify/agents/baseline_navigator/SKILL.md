@@ -2,13 +2,18 @@
 
 `graphify` is your primary code-navigation surface. It's a queryable knowledge graph of the repository — every function, class, method, and the edges between them — that lets you understand structure, find symbols, and trace call relationships at a fraction of the token cost of `read_file` + `grep`.
 
-## When graphify wins vs. read_file (R3 calibration)
+## When graphify wins vs. read_file / grep (R3 calibration)
 
 - **graphify wins** when ≤2 bodies are needed, structure-only answers (shape, summarize, community-of), cross-file disambiguation of same-name symbols, or who-uses-X / dead-end tracing across the call graph.
 - **read_file wins** when comprehending most of a file's bodies (>~200 ln total) or line-by-line questions (formatting, surrounding context). graphify still primes the right offset — `shape` then targeted `read_file` beats unprimed reading.
 - **graphify ties read_file** at 3-5 medium bodies. Pick by what's already on hand. Don't burn calls scouting for a marginal win.
 
 **graphify-first as a primer.** Even on big tasks: a `shape` call (or `navigate @entry`) before any `read_file` primes you with structural pivot data — entry points, callers, hub identity, line ranges. The orientation cost is small; the compounding savings across follow-up calls are large.
+
+## When to reach for `graphify search` instead of `grep`
+
+- **About to chain `Grep` / `Glob` calls to trace a call graph or find who-uses-X.** That's literally what `graphify navigate` `in` / `out` / `path` are for.
+- **About to grep for a string in source code.** Reach for `graphify search "<pattern>"` over `grep -n` when (a) you don't already know the containing symbol, or (b) you want to see parallel definitions across the repo. Search returns hits with symbol attribution (label, file:line, container, community) and ±1 line of context, repo-wide by default. Use raw `grep` for non-source files (markdown, JSON, configs) and right after recent edits when the graph is stale.
 
 ## First-call hygiene
 

@@ -10,6 +10,11 @@
 
 **graphify-first as a primer.** Even on big tasks: a `shape` call (or `navigate @entry`) before any `read_file` primes you with structural pivot data — entry points, callers, hub identity, line ranges. The orientation cost is small; the compounding savings across follow-up calls are large.
 
+## When to reach for `graphify search` instead of `grep`
+
+- **About to chain `Grep` / `Glob` calls to trace a call graph or find who-uses-X.** That's literally what `graphify navigate` `in` / `out` / `path` are for.
+- **About to grep for a string in source code.** Reach for `graphify search "<pattern>"` over `grep -n` when (a) you don't already know the containing symbol, or (b) you want to see parallel definitions across the repo. Search returns hits with symbol attribution (label, file:line, container, community) and ±1 line of context, repo-wide by default. Use raw `grep` for non-source files (markdown, JSON, configs) and right after recent edits when the graph is stale.
+
 ## Verb cheat-sheet
 
 | Verb | Use for |
