@@ -2245,8 +2245,17 @@ def main() -> None:
                 # An agent who typed `summarize @foo` for a function should
                 # be redirected to peek/blast instead of getting a generic
                 # error.
-                hint = "peek" if node_kind in ("function", "method", "impl_method",
-                                               "iface_method") else "peek or blast"
+                # Lap-24 fix: file targets were getting "peek or blast" —
+                # wrong verb. The agent who typed `summarize @<file>` (a
+                # natural typo for "give me an overview of this file")
+                # should land on `shape`, the file-orientation verb.
+                if node_kind == "file":
+                    hint = "shape"
+                elif node_kind in ("function", "method", "impl_method",
+                                   "iface_method"):
+                    hint = "peek"
+                else:
+                    hint = "peek or blast"
                 print(f"@{label} is a {node_kind or 'symbol'}, not a class. "
                       f"Try `graphify {hint} \"@{label}\"` instead.",
                       file=sys.stderr)

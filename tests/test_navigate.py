@@ -5051,6 +5051,42 @@ def test_summarize_rejects_function_target_with_redirect(tmp_path, monkeypatch):
     assert "peek" in err, f"error should redirect to peek:\n{err}"
 
 
+def test_summarize_rejects_file_target_redirects_to_shape(tmp_path, monkeypatch):
+    """Lap-24: a file target on summarize was getting "peek or blast" as
+    the redirect — wrong verb. The agent who typed `summarize @<file>`
+    (a natural typo for "give me an overview of this file") should land
+    on `shape`, the file-orientation verb. Targeted regression for the
+    redirect logic."""
+    import subprocess
+    nodes = [
+        {"id": "f", "label": "lib.py", "file_type": "code",
+         "source_file": "lib.py", "source_location": "L1",
+         "node_kind": "file"},
+        {"id": "fn", "label": "do_work()", "file_type": "code",
+         "source_file": "lib.py", "source_location": "L5-10",
+         "node_kind": "function"},
+    ]
+    links = [
+        {"source": "f", "target": "fn", "relation": "contains",
+         "confidence": "EXTRACTED"},
+    ]
+    _write_graph(tmp_path / "graphify-out", nodes, links)
+    monkeypatch.chdir(tmp_path)
+    res = subprocess.run(
+        ["python", "-m", "graphify", "summarize", "lib.py"],
+        capture_output=True, text=True, cwd=str(tmp_path), timeout=15,
+    )
+    assert res.returncode == 1, "should exit non-zero on file target"
+    err = res.stderr
+    assert "not a class" in err, f"error should name the shape mismatch:\n{err}"
+    assert "graphify shape" in err, (
+        f"file target should redirect to shape, not peek/blast:\n{err}"
+    )
+    assert "peek" not in err, (
+        f"file target redirect should not mention peek:\n{err}"
+    )
+
+
 def test_summarize_no_target_keeps_repo_overview(tmp_path, monkeypatch):
     """Regression check: bare `graphify summarize` still emits the
     repo-wide architectural overview (top communities, edge mix, etc.).
