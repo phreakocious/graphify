@@ -3311,6 +3311,11 @@ def shape_file(G: nx.DiGraph, file_nid: str, *,
     # Walks PREDECESSORS (in-edges) since callers point AT callees.
     # Excludes structural edges (contains/method/inherits/rationale_for)
     # so methods aren't credited for their parent class's containment.
+    # Lap-24: stash the per-fn ext_in count in a side dict so the
+    # renderer can stamp `×N` on the fns list — agents who saw "21
+    # fns" in shape but had to follow up with navigate/grep to find
+    # which were public API now get the answer in the same call.
+    fn_ext_in: dict[str, int] = {}
     entry_points: list[dict] = []
     for nid in fns:
         ext_in = 0
@@ -3322,6 +3327,7 @@ def shape_file(G: nx.DiGraph, file_nid: str, *,
             if rel in _STRUCTURAL:
                 continue
             ext_in += 1
+        fn_ext_in[nid] = ext_in
         if ext_in > 0:
             entry_points.append({
                 "label": G.nodes[nid].get("label", nid),
@@ -3352,15 +3358,44 @@ def shape_file(G: nx.DiGraph, file_nid: str, *,
         # Lap-21 #3 (sub-agent head-to-head): include precise line ranges
         # so an agent who needs `Read --offset --limit` doesn't burn a
         # navigate call to recover them. Mirrors fn_labels' truncation.
-        "fn_entries": [
-            {
-                "label": G.nodes[n].get("label", n),
-                "start_line": fn_ranges.get(n, (None, None))[0],
-                "end_line": fn_ranges.get(n, (None, None))[1],
-            }
-            for n in (fns[:limit] if limit else fns)
-        ],
+        # Lap-24: also stamp `ext_in` per fn so the renderer can mark
+        # exported / API-surface fns inline (`×7`). Truncation now
+        # ALWAYS includes any fn with ext_in > 0, even when it falls
+        # past `limit` in source order — without this, the
+        # `fns: ..., +N more` line hides the file's actual API surface
+        # whenever the public function lives past the first 8
+        # definitions (e.g. EGF tools/dynamical_fingerprint.py where
+        # classify() is the 16th fn).
+        "fn_entries": _build_fn_entries(G, fns, fn_ext_in, fn_ranges, limit),
     }
+
+
+def _build_fn_entries(G, fns, fn_ext_in, fn_ranges, limit):
+    """Return fn_entries respecting `limit` but pinning any
+    cross-file-called fns even when they fall past the limit. The
+    first N entries in source order get rendered first; entry-point
+    fns past N are appended so the agent sees the file's API surface
+    in one call instead of having to widen with --all."""
+    if limit is None or limit <= 0:
+        keep = list(fns)
+    else:
+        head = fns[:limit]
+        keep_set = set(head)
+        promoted = [n for n in fns[limit:] if fn_ext_in.get(n, 0) > 0]
+        for n in promoted:
+            if n not in keep_set:
+                head.append(n)
+                keep_set.add(n)
+        keep = head
+    return [
+        {
+            "label": G.nodes[n].get("label", n),
+            "start_line": fn_ranges.get(n, (None, None))[0],
+            "end_line": fn_ranges.get(n, (None, None))[1],
+            "ext_in": fn_ext_in.get(n, 0),
+        }
+        for n in keep
+    ]
 
 
 def doc_node(G: nx.DiGraph, nid: str, *, max_rationale_lines: int = 40) -> dict:
@@ -3500,12 +3535,19 @@ def _render_shape_text(data: dict) -> str:
         for ent in fn_entries:
             lab = ent.get("label", "")
             s, e = ent.get("start_line"), ent.get("end_line")
+            # Lap-24: stamp `×N` on fns with cross-file callers so the
+            # fns list itself surfaces the file's API surface, not just
+            # the truncated entry-points line below. An agent who saw
+            # "21 fns: A, B, C..." had to follow up with navigate/grep
+            # to learn which were exported; now the marker is inline.
+            ext_in = ent.get("ext_in") or 0
+            ext_marker = f" ×{ext_in}" if ext_in > 0 else ""
             if s is not None and e is not None and e != s:
-                bits.append(f"{lab} L{s}-{e}")
+                bits.append(f"{lab} L{s}-{e}{ext_marker}")
             elif s is not None:
-                bits.append(f"{lab} L{s}")
+                bits.append(f"{lab} L{s}{ext_marker}")
             else:
-                bits.append(lab)
+                bits.append(f"{lab}{ext_marker}")
         parts.append(f"    fns: {', '.join(bits)}{sfx}")
     elif data.get("fn_labels"):
         more = data["fns"] - len(data["fn_labels"])

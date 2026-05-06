@@ -3866,6 +3866,82 @@ def test_shape_file_surfaces_entry_points(tmp_path, monkeypatch):
     )
 
 
+def test_shape_file_promotes_entry_point_fns_past_limit(tmp_path, monkeypatch):
+    """Lap-24: shape's fns list now stamps `×N` for cross-file callers
+    AND pins entry-point fns into the truncated listing even when they
+    fall past `limit`. Without this, the file's actual API surface is
+    hidden inside the `+N more` tail whenever the public function lives
+    past the first 8 definitions.
+
+    Empirical case: EGF tools/dynamical_fingerprint.py has classify()
+    as the 16th fn (L542). Old default-limit-8 listing showed 8
+    internal helpers + `+13 more` and never named classify in the fns
+    line — agents had to follow up with navigate/grep to find which
+    fn was the export. The entry-points line below names it but the
+    fns list itself shouldn't undersell the API surface."""
+    from graphify.navigate import shape_file, _render_shape_text, load_graph
+    sf = str(tmp_path / "engine.py")
+    other_sf = str(tmp_path / "consumer.py")
+    # 12 internal helpers (no cross-file callers), then 1 public fn at
+    # the end. Default limit is 8 so the public fn falls past it.
+    nodes = [
+        {"id": "f", "label": "engine.py", "file_type": "code",
+         "source_file": sf, "source_location": "L1"},
+    ]
+    for i in range(12):
+        nodes.append({
+            "id": f"h{i}", "label": f"helper{i:02d}()", "file_type": "code",
+            "source_file": sf, "source_location": f"L{(i + 1) * 10}",
+            "node_kind": "function",
+        })
+    nodes.append({
+        "id": "pub", "label": "publish()", "file_type": "code",
+        "source_file": sf, "source_location": "L500",
+        "node_kind": "function",
+    })
+    nodes.append({
+        "id": "caller", "label": "caller()", "file_type": "code",
+        "source_file": other_sf, "source_location": "L1",
+        "node_kind": "function",
+    })
+    links = [
+        {"source": "f", "target": f"h{i}", "relation": "contains",
+         "confidence": "EXTRACTED"} for i in range(12)
+    ]
+    links.append({"source": "f", "target": "pub", "relation": "contains",
+                  "confidence": "EXTRACTED"})
+    # Cross-file caller into pub.
+    links.append({"source": "caller", "target": "pub", "relation": "calls",
+                  "confidence": "EXTRACTED"})
+    _write_graph(tmp_path / "graphify-out", nodes, links)
+    monkeypatch.chdir(tmp_path)
+    G, _comm = load_graph(tmp_path / "graphify-out" / "graph.json")
+    data = shape_file(G, "f")  # default limit=8
+    fn_labels = [e["label"] for e in data.get("fn_entries") or []]
+    # All 8 helpers in source order ARE in the listing, AND publish is
+    # promoted into the listing despite being the 13th fn by source.
+    assert "publish()" in fn_labels, (
+        f"entry-point fn should be promoted past --limit: {fn_labels}"
+    )
+    pub_entry = next(e for e in data["fn_entries"] if e["label"] == "publish()")
+    assert pub_entry["ext_in"] == 1, pub_entry
+    rendered = _render_shape_text(data)
+    # Marker shows next to publish() in the rendered fns line.
+    assert "publish() ×1" in rendered, (
+        f"renderer should stamp ×N on entry-point fns:\n{rendered}"
+    )
+    # Helpers without cross-file callers must not get a `×N` suffix.
+    assert "helper00() ×" not in rendered, (
+        f"helpers without ext callers must not get ×N:\n{rendered}"
+    )
+    assert "helper07() ×" not in rendered, rendered
+    # `+N more` count should reflect the un-promoted tail (4 helpers
+    # left, not 5 — publish was promoted out of the tail).
+    assert "+4 more" in rendered, (
+        f"promoted entry-point fn should not double-count in `+N more`:\n{rendered}"
+    )
+
+
 def test_shape_file_limit_and_all(tmp_path, monkeypatch):
     """`shape_file(..., limit=N)` truncates class_labels/fn_labels to N;
     `limit=None` returns the full lists. `+N more` is the renderer's job."""
