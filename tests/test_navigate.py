@@ -2437,6 +2437,126 @@ def test_locate_exits_nonzero_when_all_symbols_miss(tmp_path, monkeypatch):
     )
 
 
+def test_blast_emits_callers_and_callees_in_one_call(tmp_path, monkeypatch):
+    """Lap-22 (meta-harness friction corpus): `graphify blast <symbol>` is
+    the one-shot blast-radius command. Two agents independently asked for
+    this on the EGF blast-radius task. blast resolves the target, walks
+    callers + callees with kind=calls, renders two markdown sections.
+    Cursor-free; touches no session."""
+    import subprocess
+    nodes = [
+        {"id": "f", "label": "lib.py", "file_type": "code",
+         "source_file": "lib.py", "source_location": "L1",
+         "node_kind": "file"},
+        {"id": "caller_a", "label": "caller_a()", "file_type": "code",
+         "source_file": "lib.py", "source_location": "L5-9",
+         "node_kind": "function"},
+        {"id": "caller_b", "label": "caller_b()", "file_type": "code",
+         "source_file": "lib.py", "source_location": "L11-15",
+         "node_kind": "function"},
+        {"id": "target", "label": "target_fn()", "file_type": "code",
+         "source_file": "lib.py", "source_location": "L20-30",
+         "node_kind": "function"},
+        {"id": "callee_x", "label": "callee_x()", "file_type": "code",
+         "source_file": "lib.py", "source_location": "L40-44",
+         "node_kind": "function"},
+        {"id": "callee_y", "label": "callee_y()", "file_type": "code",
+         "source_file": "lib.py", "source_location": "L46-50",
+         "node_kind": "function"},
+    ]
+    links = [
+        # File contains all symbols (structural).
+        {"source": "f", "target": "caller_a", "relation": "contains",
+         "confidence": "EXTRACTED"},
+        {"source": "f", "target": "caller_b", "relation": "contains",
+         "confidence": "EXTRACTED"},
+        {"source": "f", "target": "target", "relation": "contains",
+         "confidence": "EXTRACTED"},
+        {"source": "f", "target": "callee_x", "relation": "contains",
+         "confidence": "EXTRACTED"},
+        {"source": "f", "target": "callee_y", "relation": "contains",
+         "confidence": "EXTRACTED"},
+        # Two callers → target.
+        {"source": "caller_a", "target": "target", "relation": "calls",
+         "confidence": "EXTRACTED"},
+        {"source": "caller_b", "target": "target", "relation": "calls",
+         "confidence": "EXTRACTED"},
+        # Target → two callees.
+        {"source": "target", "target": "callee_x", "relation": "calls",
+         "confidence": "EXTRACTED"},
+        {"source": "target", "target": "callee_y", "relation": "calls",
+         "confidence": "EXTRACTED"},
+    ]
+    _write_graph(tmp_path / "graphify-out", nodes, links)
+    monkeypatch.chdir(tmp_path)
+    res = subprocess.run(
+        ["python", "-m", "graphify", "blast", "target_fn"],
+        capture_output=True, text=True, cwd=str(tmp_path), timeout=15,
+    )
+    assert res.returncode == 0, f"blast failed: stderr={res.stderr}"
+    out = res.stdout
+    # Header counts.
+    assert "blast @target_fn" in out, f"header missing target:\n{out}"
+    assert "2 caller" in out and "2 callee" in out, (
+        f"header counts wrong:\n{out}"
+    )
+    # Two-section structure.
+    callers_idx = out.find("## Callers")
+    callees_idx = out.find("## Callees")
+    assert callers_idx >= 0 and callees_idx > callers_idx, (
+        f"both sections must appear, callers before callees:\n{out}"
+    )
+    callers_block = out[callers_idx:callees_idx]
+    callees_block = out[callees_idx:]
+    assert "caller_a" in callers_block and "caller_b" in callers_block, (
+        f"both callers should appear in callers section:\n{callers_block}"
+    )
+    assert "callee_x" in callees_block and "callee_y" in callees_block, (
+        f"both callees should appear in callees section:\n{callees_block}"
+    )
+    # Callers shouldn't bleed into callees and vice versa.
+    assert "caller_a" not in callees_block, (
+        f"caller leaked into callees section:\n{callees_block}"
+    )
+    assert "callee_x" not in callers_block, (
+        f"callee leaked into callers section:\n{callers_block}"
+    )
+
+
+def test_blast_emits_none_when_isolated_symbol(tmp_path, monkeypatch):
+    """A symbol with no incoming or outgoing call edges should produce
+    `(none)` placeholders for both sections rather than an empty pair of
+    headings the agent has to interpret."""
+    import subprocess
+    nodes = [
+        {"id": "f", "label": "lib.py", "file_type": "code",
+         "source_file": "lib.py", "source_location": "L1",
+         "node_kind": "file"},
+        {"id": "lone", "label": "lone_fn()", "file_type": "code",
+         "source_file": "lib.py", "source_location": "L5-10",
+         "node_kind": "function"},
+    ]
+    links = [
+        {"source": "f", "target": "lone", "relation": "contains",
+         "confidence": "EXTRACTED"},
+    ]
+    _write_graph(tmp_path / "graphify-out", nodes, links)
+    monkeypatch.chdir(tmp_path)
+    res = subprocess.run(
+        ["python", "-m", "graphify", "blast", "lone_fn"],
+        capture_output=True, text=True, cwd=str(tmp_path), timeout=15,
+    )
+    assert res.returncode == 0, f"blast failed: stderr={res.stderr}"
+    out = res.stdout
+    assert "0 callers" in out and "0 callees" in out, (
+        f"isolated symbol header should report 0/0:\n{out}"
+    )
+    # `(none)` placeholder under each empty section.
+    assert out.count("(none)") == 2, (
+        f"isolated symbol should render two (none) placeholders, got:\n{out}"
+    )
+
+
 def test_dead_ends_pivot_lists_uncalled_methods(tmp_path, monkeypatch):
     """Lap-21 (Gemini #2): `@<focus> dead-ends` lists contained
     function/method children with 0 non-structural in-edges. Surfaces

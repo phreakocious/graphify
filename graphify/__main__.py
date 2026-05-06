@@ -80,6 +80,15 @@ _HELP_BLOCKS: dict[str, list[str]] = {
         "    Resolves each arg the same way `peek` does (Class.method, path-qualified, fuzzy fallback). Output is one row per target with `<label>  <file>:<line-range>`. Ambiguous and missed symbols print a per-row note but don't fail the batch; exit 1 only when every symbol misses.",
         "    Use when you'd otherwise run 3+ `peek`/`navigate` calls just to find file:line for several symbols you already know by name.",
     ],
+    "blast": [
+        "  blast <symbol>          one-shot blast radius — callers + callees of a symbol, side-by-side, cursor-free",
+        "    --limit N               max items per side (default 30)",
+        "    --include-inferred      include LLM-inferred edges (default: AST-extracted only)",
+        "    --md                    render labels and locations as `[label](src:line)` markdown links",
+        "    --graph <path>          path to graph.json (default graphify-out/graph.json)",
+        "    Resolves the same as `peek` (Class.method, path-qualified, fuzzy fallback). Emits two sections — `## Callers` and `## Callees` — each restricted to call edges. Pairs with refactor-planning prompts (\"what calls X and what does X call?\"). Cursor-free; touches no session.",
+        "    Use when you'd otherwise run `navigate @sym in` then re-focus and `navigate @sym out --kind=calls` — that's three calls; blast is one.",
+    ],
     "doc": [
         "  doc <symbol>            one-shot signature + docstring/rationale dump — \"what does this metric/method/class mean?\" without pulling the implementation",
         "    --lines N               max lines per rationale block (default 40)",
@@ -2662,6 +2671,129 @@ def main() -> None:
                 print(f"  {t:<32} not found")
         if hits == 0:
             sys.exit(1)
+
+    elif cmd == "blast":
+        # Lap-22 (meta-harness friction corpus): one-shot callers + callees
+        # for a symbol — the "blast radius" of a symbol for refactor planning.
+        # Two agents independently asked for this on the same EGF blast-radius
+        # task in the meta-harness rollouts; today's recovery is `navigate
+        # @sym in` then re-focus and `navigate @sym out --kind=calls`,
+        # three calls plus session bookkeeping. blast collapses that to one
+        # cursor-free call. Internally piggybacks on the existing `callers`
+        # and `callees` cursor pivots (which themselves route into in/out
+        # with kinds={"calls"}), so rank/drop/disambig logic stays in one
+        # place.
+        if any(a in ("-h", "--help") for a in sys.argv[2:]):
+            _print_subcmd_help("blast")
+            return
+        from graphify.navigate import (
+            DEFAULT_GRAPH_PATH, load_graph, Cursor,
+            _pivot_data, _listing_data, _render_listing_text,
+        )
+        from graphify.resolve import label_index, resolve_focus
+        args = sys.argv[2:]
+        graph_path = DEFAULT_GRAPH_PATH
+        md = False
+        limit = 30
+        include_inferred = False
+        target: str | None = None
+        i = 0
+        while i < len(args):
+            a = args[i]
+            if a == "--graph" and i + 1 < len(args):
+                graph_path = args[i + 1]; i += 2
+            elif a.startswith("--graph="):
+                graph_path = a.split("=", 1)[1]; i += 1
+            elif a == "--limit" and i + 1 < len(args):
+                limit = max(1, int(args[i + 1])); i += 2
+            elif a.startswith("--limit="):
+                limit = max(1, int(a.split("=", 1)[1])); i += 1
+            elif a == "--md":
+                md = True; i += 1
+            elif a == "--include-inferred":
+                include_inferred = True; i += 1
+            elif target is None:
+                target = a; i += 1
+            else:
+                print(f"warning: ignoring extra arg `{a}`. blast takes a single target.",
+                      file=sys.stderr)
+                i += 1
+        if not target:
+            print("Usage: graphify blast <symbol> [--limit N] [--md] "
+                  "[--include-inferred] [--graph PATH]",
+                  file=sys.stderr)
+            sys.exit(1)
+        gp = Path(graph_path)
+        if not gp.exists():
+            print(f"error: graph not found at {gp}. run `graphify update <path>` first.",
+                  file=sys.stderr)
+            sys.exit(1)
+        G, communities = load_graph(gp)
+        idx = label_index(G)
+        chosen, candidates, match_type, _alts = resolve_focus(G, idx, target)
+        if not chosen:
+            # Mirror peek's disambig output so the caller can re-issue
+            # blast with a path-qualified target.
+            if candidates:
+                print(f"ambiguous `{target}` ({len(candidates)} matches). "
+                      f"qualify with @<dir>/<file>/<symbol>:", file=sys.stderr)
+                for nid in candidates[:8]:
+                    a = G.nodes[nid]
+                    sf = a.get("source_file", "?")
+                    loc = a.get("source_location", "")
+                    label = a.get("label", nid)
+                    print(f"  {label}  {sf}{':' + loc[1:] if loc.startswith('L') else ''}",
+                          file=sys.stderr)
+                if len(candidates) > 8:
+                    print(f"  +{len(candidates) - 8} more", file=sys.stderr)
+                sys.exit(1)
+            print(f"no node matches `{target}`.", file=sys.stderr)
+            sys.exit(1)
+        if match_type and match_type != "exact":
+            chosen_label = G.nodes[chosen].get("label", chosen)
+            print(f"# matched `{target}` → {chosen_label} ({match_type})")
+        cursor = Cursor(current=chosen)
+        extracted_only = not include_inferred
+
+        # Two pivot calls share the cursor; their kind={"calls"} filter is
+        # baked into the callers/callees branch of _pivot_data.
+        _, in_ids, in_edges, in_sort, in_drops = _pivot_data(
+            G, communities, cursor, "callers",
+            extracted_only=extracted_only, min_confidence=None,
+        )
+        _, out_ids, out_edges, out_sort, out_drops = _pivot_data(
+            G, communities, cursor, "callees",
+            extracted_only=extracted_only, min_confidence=None,
+        )
+        in_listing = _listing_data(
+            G, in_ids, "callers", in_edges, len(in_ids), in_sort, limit, in_drops,
+            extracted_only=extracted_only,
+        )
+        out_listing = _listing_data(
+            G, out_ids, "callees", out_edges, len(out_ids), out_sort, limit, out_drops,
+            extracted_only=extracted_only,
+        )
+
+        nattrs = G.nodes[chosen]
+        label = nattrs.get("label", chosen)
+        sf = nattrs.get("source_file") or "?"
+        loc = nattrs.get("source_location") or ""
+        loc_str = (":" + loc[1:]) if isinstance(loc, str) and loc.startswith("L") else ""
+        print(f"blast @{label}  {sf}{loc_str}  "
+              f"({len(in_ids)} caller{'s' if len(in_ids) != 1 else ''}, "
+              f"{len(out_ids)} callee{'s' if len(out_ids) != 1 else ''})")
+        print()
+        print("## Callers")
+        if in_ids:
+            print(_render_listing_text(in_listing, show_ops=False, md=md))
+        else:
+            print("  (none)")
+        print()
+        print("## Callees")
+        if out_ids:
+            print(_render_listing_text(out_listing, show_ops=False, md=md))
+        else:
+            print("  (none)")
 
     elif cmd == "doc":
         # One-shot rationale dump. Field-report wish: "I had to pivot from
