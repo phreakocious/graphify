@@ -12,6 +12,20 @@ agent's context window and the questions they'll ask next, not the
 human-glanceable view. A dense one-screen summary that pre-answers three
 follow-up questions beats a clean header that forces three more calls.
 
+## graphify isn't a small-task tool — it's a primer
+
+The naive frame is "graphify when the answer is small, Read when it's big."
+That undersells the edge. **graphify-first works on big tasks too**: a `shape`
+call (or `navigate @entry`) before any Read primes the agent with structural
+pivot data — entry points, callers, hub identity, line ranges — that informs
+every Read decision that follows. The orientation cost is small; the
+compounding savings across follow-up calls are large.
+
+When you ship a feature here, ask: does this make graphify a better *primer*?
+Surfacing precise line ranges, entry points by external in-edges,
+class-method curated dumps — these all reduce the cost of "graphify first
+even when the task is large."
+
 ## Token / context preservation
 
 - **Pre-answer follow-ups, don't gate them.** A pivot listing carries

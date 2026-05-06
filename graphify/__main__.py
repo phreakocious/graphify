@@ -1183,17 +1183,22 @@ def main() -> None:
         print("Usage: graphify <command>")
         print()
         # Lap-21 #4 (sub-agent head-to-head): document the win/lose
-        # boundary up front so agents pick correctly without learning
-        # by failure. Shape/symbol-shaped questions and 1-2 small body
-        # peeks beat Read-then-grep; once the answer is "most of a
-        # file", Read is the right tool.
+        # boundary up front. Lap-21 follow-up: priming-for-large-tasks
+        # is the under-sold edge — even when the task will eventually
+        # need most of a file, leading with `graphify shape` (or
+        # `navigate @entry`) primes the structural pivots that inform
+        # every Read decision that follows.
         print("When to use graphify vs Read:")
-        print("  graphify   structure-only questions, symbol → file:line lookup,")
-        print("             1-2 small body peeks, callers/callees, class shape,")
-        print("             find-where-string-mentioned-in-code")
-        print("  Read       you'll need most of a file (>~200 ln read), or the")
-        print("             question is line-by-line (formatting / surrounding")
-        print("             context that a peek-window misses)")
+        print("  graphify first   always lead with shape/navigate. The structural")
+        print("                   primer — entry points, callers, class shape —")
+        print("                   is cheap and informs every Read that follows.")
+        print("                   On small tasks, graphify often IS the answer")
+        print("                   (1-2 small bodies via `peek`; structure-only")
+        print("                   questions via `shape`/`navigate`).")
+        print("  Read for content once you know what to read. Reach for Read when")
+        print("                   you need most of a file (>~200 ln) or the")
+        print("                   question is line-by-line (formatting,")
+        print("                   surrounding context a peek-window misses).")
         print()
         # Lap-20d (TS-Claude #5): workflow templates retain better than
         # per-flag docs. Lead with the 80% paths so an agent who only
