@@ -1,0 +1,3195 @@
+"""graphify CLI - `graphify install` sets up the Claude Code skill."""
+from __future__ import annotations
+import json
+import platform
+import re
+import shutil
+import sys
+from pathlib import Path
+
+try:
+    from importlib.metadata import version as _pkg_version
+    __version__ = _pkg_version("graphifyy")
+except Exception:
+    __version__ = "unknown"
+
+
+def _check_skill_version(skill_dst: Path) -> None:
+    """Warn if the installed skill is from an older graphify version."""
+    version_file = skill_dst.parent / ".graphify_version"
+    if not version_file.exists():
+        return
+    installed = version_file.read_text(encoding="utf-8").strip()
+    if installed != __version__:
+        print(f"  warning: skill is from graphify {installed}, package is {__version__}. Run 'graphify install' to update.")
+
+
+def _refresh_all_version_stamps() -> None:
+    """After a successful install, update .graphify_version in all other known skill dirs.
+
+    Prevents stale-version warnings from platforms that were installed previously
+    but not explicitly re-installed during this upgrade.
+    """
+    for cfg in _PLATFORM_CONFIG.values():
+        vf = Path.home() / cfg["skill_dst"]
+        vf = vf.parent / ".graphify_version"
+        if vf.exists():
+            vf.write_text(__version__, encoding="utf-8")
+
+# Per-subcommand help blocks. Defined once and reused both by the top-level
+# `graphify --help` and by `graphify <cmd> --help` so subcommand help stays
+# in sync with the global usage screen and a confused agent typing
+# `graphify navigate --help` doesn't have its `--help` parsed as an op.
+_HELP_BLOCKS: dict[str, list[str]] = {
+    "path": [
+        "  path \"A\" \"B\"            shortest path between two nodes in graph.json",
+        "    --graph <path>          path to graph.json (default graphify-out/graph.json)",
+        "    --include-inferred      include LLM-inferred edges (default: AST-extracted only)",
+        "    --edges <mode>          reach (default): exclude type_ref/rationale_for and (symbol-to-symbol) contains/imports — semantic reachability.  calls: strict call-graph (calls/method/impl_of/inherits only) — \"how does X reach Y at runtime?\".  all: every edge type (literal connectedness, may route through type signatures).",
+    ],
+    "explain": [
+        "  explain \"X\"             plain-language explanation of a node and its neighbors",
+        "    --graph <path>          path to graph.json (default graphify-out/graph.json)",
+        "    --include-inferred      include LLM-inferred edges (default: AST-extracted only)",
+        "    --limit N               max neighbors to list (default 20)",
+    ],
+    "changed": [
+        "  changed [ref]           list code files added/modified/removed since graph extract (or vs git ref)",
+        "    --since-commit <ref>    diff vs a known git baseline (e.g. `--since-commit ae96912` or branch name); same as the positional [ref] but discoverable",
+        "    --since <ref>           shorter alias for --since-commit",
+        "    --graph <path>          path to graph.json (default graphify-out/graph.json)",
+    ],
+    "summarize": [
+        "  summarize               one-call architectural overview: top communities (by hub), entry points (cross-file callers), edge mix, language counts, freshness",
+        "    --graph <path>          path to graph.json (default graphify-out/graph.json)",
+        "    Cheap primer for an agent landing fresh on a repo. Reuses data already on the graph — no re-extraction.",
+    ],
+    "peek": [
+        "  peek <symbol>           one-shot body read — resolve, dump body, touch no cursor/session/history",
+        "    --lines N               max lines of body to dump (default 200; walker bails at natural dedent first)",
+        "    --bodies N              when peeking a class, body lines per method (default 3)",
+        "    --md                    render the focus label as a clickable `[label](file:line)` link",
+        "    --graph <path>          path to graph.json (default graphify-out/graph.json)",
+        "    Pairs with `navigate ... read` — use peek when you don't want to commit to a session.",
+        "    Accepts `Class.method` and `dir/file/Symbol` qualifiers, same as navigate.",
+        "    On a class node, peek emits a curated dump (class header + each method's sig + N body lines) instead of the full class body — saves the per-method walk.",
+    ],
+    "locate": [
+        "  locate <s1> [<s2> ...]  multi-symbol file:line lookup, no body — find where many things live in one call",
+        "    --graph <path>          path to graph.json (default graphify-out/graph.json)",
+        "    Resolves each arg the same way `peek` does (Class.method, path-qualified, fuzzy fallback). Output is one row per target with `<label>  <file>:<line-range>`. Ambiguous and missed symbols print a per-row note but don't fail the batch; exit 1 only when every symbol misses.",
+        "    Use when you'd otherwise run 3+ `peek`/`navigate` calls just to find file:line for several symbols you already know by name.",
+    ],
+    "doc": [
+        "  doc <symbol>            one-shot signature + docstring/rationale dump — \"what does this metric/method/class mean?\" without pulling the implementation",
+        "    --lines N               max lines per rationale block (default 40)",
+        "    --md                    render labels as `[label](file:line)` markdown links",
+        "    --json                  structured JSON output",
+        "    --graph <path>          path to graph.json (default graphify-out/graph.json)",
+        "    Resolves the same as `peek` (Class.method, path-qualified, fuzzy fallback). When no rationale is attached, the signature still prints + a hint to `peek`/`navigate`.",
+    ],
+    "shape": [
+        "  shape <file>            file structure summary: N classes / M fns / K consts / X imports / longest fn — orientation without committing to a `contains` pivot",
+        "    --limit N               max class/fn names listed in the summary (default 8; the `+N more` tail still surfaces what was truncated)",
+        "    --all                   list every class/fn name (no truncation; pairs well with `shape large_file.ts --all` when you already know the file is the target)",
+        "    --json                  structured JSON output",
+        "    --graph <path>          path to graph.json (default graphify-out/graph.json)",
+        "    Resolves the same as `peek` (path-qualified, fuzzy fallback). Errors if target isn't a file.",
+    ],
+    "search": [
+        "  search <pattern>        body-text grep across nodes — return hits with symbol context (label, file:line, container, community, degree)",
+        "    --kind code|rationale|all   restrict by node file_type (default code: skips doc-comment fragments)",
+        "    --no-archived           skip archived paths (default)",
+        "    --archived-only         show only matches in archived/legacy code",
+        "    --all-archived          include both active and archived",
+        "    --limit N               max hits (default 50)",
+        "    --context N             N lines of pre/post context around each match (default 1; pass 0 to disable)",
+        "    --by-symbol             collapse same-symbol hits — one row per containing node with `×N (lines: ...)` (good for `where is X used?`)",
+        "    --md                    label rendered as `[label](file:line)` markdown link",
+        "    --json                  structured JSON output",
+        "    --graph <path>          path to graph.json (default graphify-out/graph.json)",
+        "    Pattern is a case-insensitive regex; falls back to literal substring on `re.error`. The mode is surfaced in the header so unintended substring fallbacks are visible.",
+    ],
+    "navigate": [
+        "  navigate [ops...]       cursor-based graph navigation (LLM-friendly)",
+        "    @<label>                focus on a node by label/id (fuzzy fallback for typos)",
+        "    @<Class>.<method>       method-on-class shortcut (`@Runner.compute` resolves to the class's `.compute()` method, not a free function named `compute`)",
+        "    @.<method>()            method-label form — leading dot marks it as a method (matches `.compute()` across classes via substring; pick from disambig if multiple)",
+        "    @<dir/file>             path-qualified file resolution (`@tools/foo.py` or `@tools/foo` — extension optional)",
+        "    @<dir/file/Symbol>      path-qualified symbol (`@tools/foo.py/_classify_file` — leading `_` works either way)",
+        "    in | out | methods | contains    list typed pivots",
+        "    callers | callees       sugar for `in --kind=calls` / `out --kind=calls`",
+        "    dependents              transitive callers (default depth=3 via call edges; --depth N overrides)",
+        "    dependencies            transitive callees (default depth=3 via call edges; --depth N overrides)",
+        "    coc                     co-community siblings (same Leiden cluster)",
+        "    coc summary             structural shape (top hubs / composition / edge mix) instead of enumeration — cheap on big communities",
+        "    rat | inh | parent      rationale anchors / inherits / structural parent",
+        "    siblings                structural peers (same parent file/class)",
+        "    read | body [N]         dump full body of focused node (N caps lines, default 200; walker bails at natural dedent first)",
+        "    [N] | N                 focus on Nth item from previous listing in the chain",
+        "    back | reset            pop history / clear cursor",
+        "    --session <id>          resume a prior session (id printed when chaining is in flight: --session was passed, a chain paused at disambig, or the cursor walked >1 step)",
+        "    --no-session            disable session entirely (no disk, no id printed)",
+        "    --show-session <id>     render the saved cursor's frontier without mutating it (peek where you left off; no ops processed)",
+        "    --quiet-hints           suppress all `hint:` lines (also: per-session dedup means each hint kind shows once when --session <id> is passed)",
+        "    --json                  structured JSON output",
+        "    --include-inferred      include LLM-inferred edges (default: AST-extracted only)",
+        "    --min-confidence X      drop edges below score X (only meaningful with --include-inferred)",
+        "    --kind <rel[,rel,...]>  restrict in/out listings to edges of these relations (e.g. calls,uses)",
+        "    --node-kind <k[,k,...]> restrict listings to nodes of these kinds (e.g. function,method,class). Useful on `@<key>` substring disambig: `--node-kind=function` lops file/iface/external rows.",
+        "    --bodies N              show first N source lines under each contains/methods item",
+        "    --depth N               for in/out, walk N hops via non-structural edges (default 1)",
+        "    --limit N               max items per listing (default 25)",
+        "    --legend                prepend column-key legend",
+        "    --ops-hint              append the ops cheat-sheet line (default: omitted; cheat-sheet still surfaces on first-contact empty-cursor calls)",
+        "    --no-ops-hint           back-compat no-op (cheat-sheet is now off by default)",
+        "    --no-archived           hide nodes under frozen/legacy/deprecated/archive(d)/ paths",
+        "    --archived-only         show only archived nodes (inverse of --no-archived)",
+        "    --include-files         widen `coc` to include file-level hubs (default: symbols only)",
+        "    --code-only             filter rationale nodes from `coc` listings — orient on the code-symbol neighbourhood without docstring fragments",
+        "    --no-collapse           expand dupe-label groups in listings (default: collapse ≥5 same-label rows into one)",
+        "    --explain-cost          on a pivot, return `would-show N nodes ≈ K bytes` preview without rendering the listing (lets you gate `coc` against a 1000-node community before committing)",
+        "    --md                    render labels and src:line as `[label](src:line)` markdown links (clickable in IDE / Claude Code)",
+        "    --transitive            on `out` from a file node with 0 direct out edges, route through `contains` children and aggregate their outbound semantic edges (collapses the script-leaf drill into one call)",
+        "    --graph <path>          path to graph.json (default graphify-out/graph.json)",
+        "    Chain ops in one call: graphify navigate @Foo methods 1 in",
+    ],
+}
+
+
+def _print_subcmd_help(cmd: str) -> None:
+    """Print `<cmd> --help`. Falls back to top-level help if cmd is unknown."""
+    block = _HELP_BLOCKS.get(cmd)
+    if not block:
+        # Unknown subcommand → defer to the caller; top-level help screen
+        # already prints every subcommand so we don't synthesize anything here.
+        return
+    print(f"Usage: graphify {cmd} ...")
+    print()
+    for line in block:
+        print(line)
+    print()
+
+
+_SETTINGS_HOOK = {
+    "matcher": "Read|Glob|Grep",
+    "hooks": [
+        {
+            "type": "command",
+            # Defer the gating decision to `graphify _hook` so we can suppress
+            # the nudge on non-code Reads (graphify only indexes source —
+            # nudging on a .md/.json/.yaml read is noise) without ballooning
+            # this shell line into something unmaintainable. The shell guard
+            # avoids paying python startup when no graph exists.
+            "command": (
+                "[ -f graphify-out/graph.json ] && "
+                "graphify _hook 2>/dev/null || true"
+            ),
+        }
+    ],
+}
+
+_SKILL_REGISTRATION = (
+    "\n# graphify\n"
+    "- **graphify** (`~/.claude/skills/graphify/SKILL.md`) "
+    "- any input to knowledge graph. Trigger: `/graphify`\n"
+    "When the user types `/graphify`, invoke the Skill tool "
+    "with `skill: \"graphify\"` before doing anything else.\n"
+)
+
+
+_PLATFORM_CONFIG: dict[str, dict] = {
+    "claude": {
+        "skill_file": "skill.md",
+        "skill_dst": Path(".claude") / "skills" / "graphify" / "SKILL.md",
+        "claude_md": True,
+    },
+    "codex": {
+        "skill_file": "skill-codex.md",
+        "skill_dst": Path(".agents") / "skills" / "graphify" / "SKILL.md",
+        "claude_md": False,
+    },
+    "opencode": {
+        "skill_file": "skill-opencode.md",
+        "skill_dst": Path(".config") / "opencode" / "skills" / "graphify" / "SKILL.md",
+        "claude_md": False,
+    },
+    "aider": {
+        "skill_file": "skill-aider.md",
+        "skill_dst": Path(".aider") / "graphify" / "SKILL.md",
+        "claude_md": False,
+    },
+    "copilot": {
+        "skill_file": "skill-copilot.md",
+        "skill_dst": Path(".copilot") / "skills" / "graphify" / "SKILL.md",
+        "claude_md": False,
+    },
+    "claw": {
+        "skill_file": "skill-claw.md",
+        "skill_dst": Path(".openclaw") / "skills" / "graphify" / "SKILL.md",
+        "claude_md": False,
+    },
+    "droid": {
+        "skill_file": "skill-droid.md",
+        "skill_dst": Path(".factory") / "skills" / "graphify" / "SKILL.md",
+        "claude_md": False,
+    },
+    "trae": {
+        "skill_file": "skill-trae.md",
+        "skill_dst": Path(".trae") / "skills" / "graphify" / "SKILL.md",
+        "claude_md": False,
+    },
+    "trae-cn": {
+        "skill_file": "skill-trae.md",
+        "skill_dst": Path(".trae-cn") / "skills" / "graphify" / "SKILL.md",
+        "claude_md": False,
+    },
+    "hermes": {
+        "skill_file": "skill-claw.md",
+        "skill_dst": Path(".hermes") / "skills" / "graphify" / "SKILL.md",
+        "claude_md": False,
+    },
+    "kiro": {
+        "skill_file": "skill-kiro.md",
+        "skill_dst": Path(".kiro") / "skills" / "graphify" / "SKILL.md",
+        "claude_md": False,
+    },
+    "antigravity": {
+        "skill_file": "skill.md",
+        "skill_dst": Path(".agent") / "skills" / "graphify" / "SKILL.md",
+        "claude_md": False,
+    },
+    "windows": {
+        "skill_file": "skill-windows.md",
+        "skill_dst": Path(".claude") / "skills" / "graphify" / "SKILL.md",
+        "claude_md": True,
+    },
+}
+
+
+def install(platform: str = "claude") -> None:
+    if platform == "gemini":
+        gemini_install()
+        return
+    if platform == "cursor":
+        _cursor_install(Path("."))
+        return
+    if platform not in _PLATFORM_CONFIG:
+        print(
+            f"error: unknown platform '{platform}'. Choose from: {', '.join(_PLATFORM_CONFIG)}, gemini, cursor",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    cfg = _PLATFORM_CONFIG[platform]
+    skill_src = Path(__file__).parent / cfg["skill_file"]
+    if not skill_src.exists():
+        print(f"error: {cfg['skill_file']} not found in package - reinstall graphify", file=sys.stderr)
+        sys.exit(1)
+
+    skill_dst = Path.home() / cfg["skill_dst"]
+    skill_dst.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy(skill_src, skill_dst)
+    (skill_dst.parent / ".graphify_version").write_text(__version__, encoding="utf-8")
+    print(f"  skill installed  ->  {skill_dst}")
+
+    if cfg["claude_md"]:
+        # Register in ~/.claude/CLAUDE.md (Claude Code only)
+        claude_md = Path.home() / ".claude" / "CLAUDE.md"
+        if claude_md.exists():
+            content = claude_md.read_text(encoding="utf-8")
+            if "graphify" in content:
+                print(f"  CLAUDE.md        ->  already registered (no change)")
+            else:
+                claude_md.write_text(content.rstrip() + _SKILL_REGISTRATION, encoding="utf-8")
+                print(f"  CLAUDE.md        ->  skill registered in {claude_md}")
+        else:
+            claude_md.parent.mkdir(parents=True, exist_ok=True)
+            claude_md.write_text(_SKILL_REGISTRATION.lstrip(), encoding="utf-8")
+            print(f"  CLAUDE.md        ->  created at {claude_md}")
+
+    if platform == "opencode":
+        _install_opencode_plugin(Path("."))
+
+    # Refresh version stamps in all other previously-installed skill dirs so
+    # stale-version warnings don't fire for platforms not explicitly re-installed.
+    _refresh_all_version_stamps()
+
+    print()
+    print("Done. Open your AI coding assistant and type:")
+    print()
+    print("  /graphify .")
+    print()
+
+
+_CLAUDE_MD_SECTION = """\
+## graphify
+
+This project has a graphify knowledge graph at `graphify-out/graph.json`. Use it to keep your context window from collapsing under a heavy codebase.
+
+### When you should reach for graphify
+
+Before any of these moves, scout the graph first — it's 50–500x cheaper than the alternative:
+
+- **About to `Read` a source-code file you don't already know.** Run `graphify shape "<file>"` for a one-screen summary, or `graphify navigate "@<symbol>"` for the affordance frame. The frontier shows you whether the file is a leaf, hub, or router, and what shape of context you actually need.
+- **About to chain `Grep` / `Glob` calls to trace a call graph or find who-uses-X.** That's literally what `graphify navigate` `in`/`out`/`path` are for.
+- **About to grep for a string in source code.** Reach for `graphify search "<pattern>"` over `grep -n` when (a) you don't already know the containing symbol, or (b) you want to see parallel definitions across the repo. Search returns hits with symbol attribution (label, file:line, container, community) and ±1 line of context, repo-wide by default. Use raw `grep` for non-source files (markdown, JSON, configs) and right after recent edits when the graph is stale.
+- **About to read a single function to remind yourself what it does.** `graphify peek "<symbol>"` is a one-shot body dump — no cursor, no session.
+- **About to implement, change, or debug something in unfamiliar territory.** Map the blast radius first: focus the entry point, run `in --depth=2 --kind=calls` to see callers two hops out, decide what's actually load-bearing.
+- **You don't know where to start.** `graphify navigate "@<best-guess-label>"` is a free probe — a hit returns a frontier, a miss returns real names you can grab onto.
+
+**Don't reach for graphify when reading**: `.json` / `.yaml` / `.toml` / `.csv` / `.md` / `.txt` / `.log` / lockfiles / build output / your own memory or scratch files. graphify only indexes source code — for data, configs, prose, and machine output, just `Read` directly.
+
+### Verbs
+
+```
+graphify navigate "@<symbol>"                       # focus + frontier (~200 tok)
+graphify navigate "@<symbol>" methods 6 in          # chain: focus, list methods, pick 6th, show callers
+graphify peek "<symbol>"                            # one-shot body dump, no cursor
+graphify shape "<file>"                             # N classes / M fns / longest fn — orient without `contains`
+graphify search "<pattern>"                         # body-text grep, hits attributed to symbol
+graphify path "A" "B"                               # reachability between two nodes (~50 tok)
+graphify explain "<symbol>"                         # one-shot summary of one node (~350 tok)
+graphify diff old.json new.json                     # what changed: added/removed nodes/edges
+graphify update .                                   # AST re-extract after edits, no LLM cost
+graphify changed [git-ref]                          # files added/modified since last extract or vs ref
+```
+
+### Resolution forms (the `@` target)
+
+- `@<label>` — by symbol name, fuzzy-fallback for typos.
+- `@<Class>.<method>` — method-on-class shortcut. `@Runner.compute` lands on the method, *not* a free function `compute()`.
+- `@.<method>()` — method-label form (`.compute()`); use when you don't know the owning class. Disambig listing if more than one class has it.
+- `@<dir/file>` or `@<dir/file/Symbol>` — path-qualified. Extension optional; leading `_` works either way.
+
+### Useful flags on `navigate`
+
+| flag | when |
+|---|---|
+| `--include-inferred` | widen to LLM-inferred edges (default: AST-only) |
+| `--depth N` | walk N hops via non-structural edges; pairs with `--kind=calls` for blast-radius |
+| `--kind <rel>[,...]` | restrict edges (e.g. `--kind=calls`) |
+| `--bodies N` | first N source lines under each `contains`/`methods` row — catches dead stubs / pass-throughs |
+| `--explain-cost` | preview "would-show N nodes ≈ K bytes" before committing on a big pivot |
+| `--transitive` | from a script-leaf file with no direct out-edges, walk via `contains` and aggregate children's outbound |
+| `--code-only` | filter rationale (docstring) nodes out of `coc` listings |
+| `--md` | render labels and src:line as markdown links for IDE click-through |
+| `--show-session <id>` | peek a saved session's frontier without mutating it (great for parallel exploration) |
+| `--limit N` | raise per-listing cap from 25 |
+
+Per-id cursor files mean parallel calls don't race. The session id only prints when chaining is in flight (chain paused at disambig, `--session` was passed, or cursor walked >1 step) — pass it via `--session <id>` to resume.
+
+### What NOT to do
+
+- Don't read `GRAPH_REPORT.md` end-to-end — it's a 40KB+ overview that costs ~10K tokens and the community-list section is filler in AST-only mode. Use `graphify navigate` instead.
+- Don't run `graphify query` on a question you haven't narrowed yet — it caps at ~2K tokens of flat node listings, mostly noise. Narrow with `navigate` first.
+"""
+
+_CLAUDE_MD_MARKER = "## graphify"
+
+# AGENTS.md section for Codex, OpenCode, and OpenClaw.
+# All three platforms read AGENTS.md in the project root for persistent instructions.
+_AGENTS_MD_SECTION = """\
+## graphify
+
+This project has a graphify knowledge graph at `graphify-out/graph.json`. Use it to keep your context window from collapsing under a heavy codebase.
+
+### When you should reach for graphify
+
+Before any of these moves, scout the graph first — it's 50–500x cheaper:
+
+- **About to read a source-code file you don't already know.** `graphify shape "<file>"` for a one-screen summary, or `graphify navigate "@<symbol>"` for the affordance frame.
+- **About to chain greps to trace a call graph or find who-uses-X.** That's what `graphify navigate` `in`/`out`/`path` are for.
+- **About to grep for a string in source code.** `graphify search "<pattern>"` when you don't already know the containing symbol, or you want to see parallel defs across the repo. Hits come with symbol attribution (label, file:line, container) and ±1 line of context, repo-wide by default. Raw `grep` for non-source files / right after edits when the graph is stale.
+- **About to read one function.** `graphify peek "<symbol>"` is a one-shot body dump.
+- **About to implement, change, or debug in unfamiliar territory.** Map the blast radius first: focus the entry point, `in --depth=2 --kind=calls`.
+- **You don't know where to start.** `graphify navigate "@<best-guess-label>"` is a free probe.
+
+**Don't reach for graphify when reading**: `.json` / `.yaml` / `.toml` / `.csv` / `.md` / `.txt` / `.log` / lockfiles / build output / scratch files. graphify only indexes source code.
+
+### Verbs
+
+```
+graphify navigate "@<symbol>" methods 6 in   # focus, list methods, pick 6th, show callers
+graphify peek "<symbol>"                     # one-shot body dump
+graphify shape "<file>"                      # class/fn/import counts, longest fn
+graphify search "<pattern>"                  # body-text grep, attributed to symbol
+graphify path "A" "B"                        # reachability (~50 tok)
+graphify explain "<symbol>"                  # one-shot node summary (~350 tok)
+graphify update .                            # AST re-extract, no LLM cost
+```
+
+### Resolution forms (the `@` target)
+
+- `@<label>` — by name, fuzzy on typos.
+- `@<Class>.<method>` — method shortcut (`@Runner.compute` resolves to the method, not a free `compute()`).
+- `@.<method>()` — method-label form when you don't know the owning class.
+- `@<dir/file>` or `@<dir/file/Symbol>` — path-qualified.
+
+### Useful flags on `navigate`
+
+`--include-inferred` widens to LLM-inferred edges; `--depth N` walks N hops via non-structural edges (`out --depth=2 --kind=calls` for blast-radius); `--bodies N` shows N source lines under each row; `--explain-cost` previews node/byte count before committing; `--code-only` filters rationale nodes from `coc`; `--md` renders labels as markdown links; `--show-session <id>` peeks a saved cursor without mutating it.
+
+Chain ops left-to-right; output is the last op's result. When chaining is in flight (chain paused, `--session` passed, or cursor walked >1 step) the output prints `session: <id>` — pass it via `--session <id>` to resume.
+
+### What NOT to do
+
+- Don't read `GRAPH_REPORT.md` end-to-end — ~10K tokens of overview. Use `graphify navigate` instead.
+- Don't run `graphify query` on a question you haven't narrowed yet — flat node dumps, mostly noise.
+"""
+
+_AGENTS_MD_MARKER = "## graphify"
+
+_GEMINI_MD_SECTION = """\
+## graphify
+
+This project has a graphify knowledge graph at `graphify-out/graph.json`. Use it to keep your context window from collapsing under a heavy codebase.
+
+### When you should reach for graphify
+
+Before any of these moves, scout the graph first — it's 50–500x cheaper:
+
+- **About to read a source-code file you don't already know.** `graphify shape "<file>"` for a one-screen summary, or `graphify navigate "@<symbol>"` for the affordance frame.
+- **About to chain greps to trace a call graph or find who-uses-X.** `graphify navigate` `in`/`out`/`path`.
+- **About to grep for a string in source code.** `graphify search "<pattern>"` when you don't already know the containing symbol, or you want parallel defs across the repo. Hits come with symbol attribution (label, file:line, container) and ±1 line of context, repo-wide by default. Raw `grep` for non-source files / right after edits when the graph is stale.
+- **About to read one function.** `graphify peek "<symbol>"` is a one-shot body dump.
+- **About to implement, change, or debug in unfamiliar territory.** Map the blast radius: focus + `in --depth=2 --kind=calls`.
+- **You don't know where to start.** `graphify navigate "@<best-guess-label>"` is a free probe.
+
+**Don't reach for graphify when reading**: `.json` / `.yaml` / `.toml` / `.csv` / `.md` / `.txt` / `.log` / lockfiles / build output / scratch files. graphify only indexes source code.
+
+### Verbs
+
+```
+graphify navigate "@<symbol>" methods 6 in   # chain: focus, methods, pick 6th, show callers
+graphify peek "<symbol>"                     # one-shot body dump
+graphify shape "<file>"                      # class/fn counts + longest fn
+graphify search "<pattern>"                  # body-text grep, attributed to symbol
+graphify path "A" "B"                        # reachability (~50 tok)
+graphify explain "<symbol>"                  # node summary (~350 tok)
+graphify update .                            # AST re-extract after edits
+```
+
+### Resolution forms (the `@` target)
+
+- `@<label>` — by name, fuzzy on typos.
+- `@<Class>.<method>` — method shortcut. `@Runner.compute` lands on the method, not a free `compute()`.
+- `@.<method>()` — method-label form, owner-class agnostic.
+- `@<dir/file>` or `@<dir/file/Symbol>` — path-qualified.
+
+### Useful flags on `navigate`
+
+`--include-inferred`, `--depth N` (multi-hop), `--kind <rel>[,...]`, `--bodies N` (preview lines under each row), `--explain-cost` (preview before committing), `--code-only` (filter rationale from `coc`), `--md` (markdown links), `--show-session <id>` (peek without mutating).
+
+Chain ops left-to-right; output is the last op's result. When chaining is in flight, the output prints `session: <id>` — pass it via `--session <id>` to resume.
+
+### What NOT to do
+
+- Don't read `GRAPH_REPORT.md` end-to-end — ~10K tokens of overview. Use `graphify navigate` instead.
+- Don't run `graphify query` on a question you haven't narrowed yet.
+"""
+
+_GEMINI_MD_MARKER = "## graphify"
+
+_GEMINI_HOOK = {
+    "matcher": "read_file|list_directory",
+    "hooks": [
+        {
+            "type": "command",
+            "command": (
+                "[ -f graphify-out/graph.json ] && "
+                r"""echo '{"decision":"allow","additionalContext":"graphify-out/graph.json exists. Before reading/listing unfamiliar code, scout it cheaper: `graphify navigate \"@<symbol>\"` returns a dense affordance frame (~200 tok). Then pivot with in/out/methods/coc/parent/[N], or jump to file:line once a node is load-bearing. See ~/.gemini/skills/graphify/SKILL.md."}' """
+                r"""|| echo '{"decision":"allow"}'"""
+            ),
+        }
+    ],
+}
+
+
+def gemini_install(project_dir: Path | None = None) -> None:
+    """Copy skill file to ~/.gemini/skills/graphify/, write GEMINI.md section, and install BeforeTool hook."""
+    # Copy skill file to ~/.gemini/skills/graphify/SKILL.md
+    # On Windows, Gemini CLI prioritises ~/.agents/skills/ over ~/.gemini/skills/
+    skill_src = Path(__file__).parent / "skill.md"
+    if platform.system() == "Windows":
+        skill_dst = Path.home() / ".agents" / "skills" / "graphify" / "SKILL.md"
+    else:
+        skill_dst = Path.home() / ".gemini" / "skills" / "graphify" / "SKILL.md"
+    skill_dst.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy(skill_src, skill_dst)
+    (skill_dst.parent / ".graphify_version").write_text(__version__, encoding="utf-8")
+    print(f"  skill installed  ->  {skill_dst}")
+
+    target = (project_dir or Path(".")) / "GEMINI.md"
+
+    if target.exists():
+        content = target.read_text(encoding="utf-8")
+        if _GEMINI_MD_MARKER in content:
+            print("graphify already configured in GEMINI.md")
+        else:
+            target.write_text(content.rstrip() + "\n\n" + _GEMINI_MD_SECTION, encoding="utf-8")
+            print(f"graphify section written to {target.resolve()}")
+    else:
+        target.write_text(_GEMINI_MD_SECTION, encoding="utf-8")
+        print(f"graphify section written to {target.resolve()}")
+
+    _install_gemini_hook(project_dir or Path("."))
+    print()
+    print("Gemini CLI will now check the knowledge graph before answering")
+    print("codebase questions and rebuild it after code changes.")
+
+
+def _install_gemini_hook(project_dir: Path) -> None:
+    settings_path = project_dir / ".gemini" / "settings.json"
+    settings_path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        settings = json.loads(settings_path.read_text(encoding="utf-8")) if settings_path.exists() else {}
+    except json.JSONDecodeError:
+        settings = {}
+    before_tool = settings.setdefault("hooks", {}).setdefault("BeforeTool", [])
+    settings["hooks"]["BeforeTool"] = [h for h in before_tool if "graphify" not in str(h)]
+    settings["hooks"]["BeforeTool"].append(_GEMINI_HOOK)
+    settings_path.write_text(json.dumps(settings, indent=2), encoding="utf-8")
+    print("  .gemini/settings.json  ->  BeforeTool hook registered")
+
+
+def _uninstall_gemini_hook(project_dir: Path) -> None:
+    settings_path = project_dir / ".gemini" / "settings.json"
+    if not settings_path.exists():
+        return
+    try:
+        settings = json.loads(settings_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return
+    before_tool = settings.get("hooks", {}).get("BeforeTool", [])
+    filtered = [h for h in before_tool if "graphify" not in str(h)]
+    if len(filtered) == len(before_tool):
+        return
+    settings["hooks"]["BeforeTool"] = filtered
+    settings_path.write_text(json.dumps(settings, indent=2), encoding="utf-8")
+    print("  .gemini/settings.json  ->  BeforeTool hook removed")
+
+
+def gemini_uninstall(project_dir: Path | None = None) -> None:
+    """Remove the graphify section from GEMINI.md, uninstall hook, and remove skill file."""
+    # Remove skill file (mirror the install path detection)
+    if platform.system() == "Windows":
+        skill_dst = Path.home() / ".agents" / "skills" / "graphify" / "SKILL.md"
+    else:
+        skill_dst = Path.home() / ".gemini" / "skills" / "graphify" / "SKILL.md"
+    if skill_dst.exists():
+        skill_dst.unlink()
+        print(f"  skill removed    ->  {skill_dst}")
+    version_file = skill_dst.parent / ".graphify_version"
+    if version_file.exists():
+        version_file.unlink()
+    for d in (skill_dst.parent, skill_dst.parent.parent):
+        try:
+            d.rmdir()
+        except OSError:
+            break
+
+    target = (project_dir or Path(".")) / "GEMINI.md"
+    if not target.exists():
+        print("No GEMINI.md found in current directory - nothing to do")
+        return
+    content = target.read_text(encoding="utf-8")
+    if _GEMINI_MD_MARKER not in content:
+        print("graphify section not found in GEMINI.md - nothing to do")
+        return
+    cleaned = re.sub(r"\n*## graphify\n.*?(?=\n## |\Z)", "", content, flags=re.DOTALL).rstrip()
+    if cleaned:
+        target.write_text(cleaned + "\n", encoding="utf-8")
+        print(f"graphify section removed from {target.resolve()}")
+    else:
+        target.unlink()
+        print(f"GEMINI.md was empty after removal - deleted {target.resolve()}")
+    _uninstall_gemini_hook(project_dir or Path("."))
+
+
+_VSCODE_INSTRUCTIONS_MARKER = "## graphify"
+_VSCODE_INSTRUCTIONS_SECTION = """\
+## graphify
+
+Before answering architecture or codebase questions, read `graphify-out/GRAPH_REPORT.md` if it exists.
+If `graphify-out/wiki/index.md` exists, navigate it for deep questions.
+Type `/graphify` in Copilot Chat to build or update the knowledge graph.
+"""
+
+
+def vscode_install(project_dir: Path | None = None) -> None:
+    """Install graphify skill for VS Code Copilot Chat + write .github/copilot-instructions.md."""
+    skill_src = Path(__file__).parent / "skill-vscode.md"
+    if not skill_src.exists():
+        skill_src = Path(__file__).parent / "skill-copilot.md"
+    skill_dst = Path.home() / ".copilot" / "skills" / "graphify" / "SKILL.md"
+    skill_dst.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy(skill_src, skill_dst)
+    (skill_dst.parent / ".graphify_version").write_text(__version__, encoding="utf-8")
+    print(f"  skill installed  ->  {skill_dst}")
+
+    instructions = (project_dir or Path(".")) / ".github" / "copilot-instructions.md"
+    instructions.parent.mkdir(parents=True, exist_ok=True)
+    if instructions.exists():
+        content = instructions.read_text(encoding="utf-8")
+        if _VSCODE_INSTRUCTIONS_MARKER in content:
+            print(f"  {instructions}  ->  already configured (no change)")
+        else:
+            instructions.write_text(content.rstrip() + "\n\n" + _VSCODE_INSTRUCTIONS_SECTION, encoding="utf-8")
+            print(f"  {instructions}  ->  graphify section added")
+    else:
+        instructions.write_text(_VSCODE_INSTRUCTIONS_SECTION, encoding="utf-8")
+        print(f"  {instructions}  ->  created")
+
+    print()
+    print("VS Code Copilot Chat configured. Type /graphify in the chat panel to build the graph.")
+    print("Note: for GitHub Copilot CLI (terminal), use: graphify copilot install")
+
+
+def vscode_uninstall(project_dir: Path | None = None) -> None:
+    """Remove graphify VS Code Copilot Chat skill and .github/copilot-instructions.md section."""
+    skill_dst = Path.home() / ".copilot" / "skills" / "graphify" / "SKILL.md"
+    if skill_dst.exists():
+        skill_dst.unlink()
+        print(f"  skill removed    ->  {skill_dst}")
+    version_file = skill_dst.parent / ".graphify_version"
+    if version_file.exists():
+        version_file.unlink()
+    for d in (skill_dst.parent, skill_dst.parent.parent, skill_dst.parent.parent.parent):
+        try:
+            d.rmdir()
+        except OSError:
+            break
+
+    instructions = (project_dir or Path(".")) / ".github" / "copilot-instructions.md"
+    if not instructions.exists():
+        return
+    content = instructions.read_text(encoding="utf-8")
+    if _VSCODE_INSTRUCTIONS_MARKER not in content:
+        return
+    cleaned = re.sub(r"\n*## graphify\n.*?(?=\n## |\Z)", "", content, flags=re.DOTALL).rstrip()
+    if cleaned:
+        instructions.write_text(cleaned + "\n", encoding="utf-8")
+        print(f"  graphify section removed from {instructions}")
+    else:
+        instructions.unlink()
+        print(f"  {instructions}  ->  deleted (was empty after removal)")
+
+
+_ANTIGRAVITY_RULES_PATH = Path(".agent") / "rules" / "graphify.md"
+_ANTIGRAVITY_WORKFLOW_PATH = Path(".agent") / "workflows" / "graphify.md"
+
+_ANTIGRAVITY_RULES = """\
+## graphify
+
+This project has a graphify knowledge graph at graphify-out/.
+
+Rules:
+- Before answering architecture or codebase questions, read graphify-out/GRAPH_REPORT.md for god nodes and community structure
+- If graphify-out/wiki/index.md exists, navigate it instead of reading raw files
+- If the graphify MCP server is active, utilize tools like `query_graph`, `get_node`, and `shortest_path` for precise architecture navigation instead of falling back to `grep`
+- After modifying code files in this session, run `graphify update .` to keep the graph current (AST-only, no API cost)
+"""
+
+_ANTIGRAVITY_WORKFLOW = """\
+# Workflow: graphify
+**Command:** /graphify
+**Description:** Turn any folder of files into a navigable knowledge graph
+
+## Steps
+Follow the graphify skill installed at ~/.agent/skills/graphify/SKILL.md to run the full pipeline.
+
+If no path argument is given, use `.` (current directory).
+"""
+
+
+_KIRO_STEERING = """\
+---
+inclusion: always
+---
+
+graphify: A knowledge graph of this project lives in `graphify-out/`. \
+If `graphify-out/GRAPH_REPORT.md` exists, read it before answering architecture questions, \
+tracing dependencies, or searching files — it contains god nodes, community structure, \
+and surprising connections the graph found. Navigate by graph structure instead of grepping raw files.
+"""
+
+_KIRO_STEERING_MARKER = "graphify: A knowledge graph of this project"
+
+
+def _kiro_install(project_dir: Path) -> None:
+    """Write graphify skill + steering file for Kiro IDE/CLI."""
+    project_dir = project_dir or Path(".")
+
+    # Skill file → .kiro/skills/graphify/SKILL.md
+    skill_src = Path(__file__).parent / "skill-kiro.md"
+    skill_dst = project_dir / ".kiro" / "skills" / "graphify" / "SKILL.md"
+    skill_dst.parent.mkdir(parents=True, exist_ok=True)
+    skill_dst.write_text(skill_src.read_text(encoding="utf-8"), encoding="utf-8")
+    print(f"  {skill_dst.relative_to(project_dir)}  ->  /graphify skill")
+
+    # Steering file → .kiro/steering/graphify.md (always-on)
+    steering_dir = project_dir / ".kiro" / "steering"
+    steering_dir.mkdir(parents=True, exist_ok=True)
+    steering_dst = steering_dir / "graphify.md"
+    if steering_dst.exists() and _KIRO_STEERING_MARKER in steering_dst.read_text(encoding="utf-8"):
+        print(f"  .kiro/steering/graphify.md  ->  already configured")
+    else:
+        steering_dst.write_text(_KIRO_STEERING, encoding="utf-8")
+        print(f"  .kiro/steering/graphify.md  ->  always-on steering written")
+
+    print()
+    print("Kiro will now read the knowledge graph before every conversation.")
+    print("Use /graphify to build or update the graph.")
+
+
+def _kiro_uninstall(project_dir: Path) -> None:
+    """Remove graphify skill + steering file for Kiro."""
+    project_dir = project_dir or Path(".")
+    removed = []
+
+    skill_dst = project_dir / ".kiro" / "skills" / "graphify" / "SKILL.md"
+    if skill_dst.exists():
+        skill_dst.unlink()
+        removed.append(str(skill_dst.relative_to(project_dir)))
+        # Remove parent dir if empty
+        try:
+            skill_dst.parent.rmdir()
+        except OSError:
+            pass
+
+    steering_dst = project_dir / ".kiro" / "steering" / "graphify.md"
+    if steering_dst.exists():
+        steering_dst.unlink()
+        removed.append(str(steering_dst.relative_to(project_dir)))
+
+    print("Removed: " + (", ".join(removed) if removed else "nothing to remove"))
+
+
+def _antigravity_install(project_dir: Path) -> None:
+    """Install graphify for Google Antigravity: skill + .agent/rules + .agent/workflows."""
+    # 1. Copy skill file to ~/.agent/skills/graphify/SKILL.md
+    install(platform="antigravity")
+
+    # 1.5. Inject YAML frontmatter for native Antigravity tool discovery
+    skill_dst = Path.home() / _PLATFORM_CONFIG["antigravity"]["skill_dst"]
+    if skill_dst.exists():
+        content = skill_dst.read_text(encoding="utf-8")
+        if not content.startswith("---\n"):
+            frontmatter = "---\nname: graphify-manager\ndescription: Rebuild the code graph or perform manual CLI queries when MCP server is offline.\n---\n\n"
+            skill_dst.write_text(frontmatter + content, encoding="utf-8")
+
+    # 2. Write .agent/rules/graphify.md
+    rules_path = project_dir / _ANTIGRAVITY_RULES_PATH
+    rules_path.parent.mkdir(parents=True, exist_ok=True)
+    if rules_path.exists():
+        print(f"graphify rule already exists at {rules_path} (no change)")
+    else:
+        rules_path.write_text(_ANTIGRAVITY_RULES, encoding="utf-8")
+        print(f"graphify rule written to {rules_path.resolve()}")
+
+    # 3. Write .agent/workflows/graphify.md
+    wf_path = project_dir / _ANTIGRAVITY_WORKFLOW_PATH
+    wf_path.parent.mkdir(parents=True, exist_ok=True)
+    if wf_path.exists():
+        print(f"graphify workflow already exists at {wf_path} (no change)")
+    else:
+        wf_path.write_text(_ANTIGRAVITY_WORKFLOW, encoding="utf-8")
+        print(f"graphify workflow written to {wf_path.resolve()}")
+
+    print()
+    print("Antigravity will now check the knowledge graph before answering")
+    print("codebase questions. Run /graphify first to build the graph.")
+    print()
+    print("To enable full MCP architecture navigation, add this to ~/.gemini/antigravity/mcp_config.json:")
+    print('  "graphify": {')
+    print('    "command": "uv",')
+    print('    "args": ["run", "--with", "graphifyy", "--with", "mcp", "-m", "graphify.serve", "${workspace.path}/graphify-out/graph.json"]')
+    print('  }')
+
+
+def _antigravity_uninstall(project_dir: Path) -> None:
+    """Remove graphify Antigravity rules, workflow, and skill files."""
+    # Remove rules file
+    rules_path = project_dir / _ANTIGRAVITY_RULES_PATH
+    if rules_path.exists():
+        rules_path.unlink()
+        print(f"graphify rule removed from {rules_path.resolve()}")
+    else:
+        print("No graphify Antigravity rule found - nothing to do")
+
+    # Remove workflow file
+    wf_path = project_dir / _ANTIGRAVITY_WORKFLOW_PATH
+    if wf_path.exists():
+        wf_path.unlink()
+        print(f"graphify workflow removed from {wf_path.resolve()}")
+
+    # Remove skill file
+    skill_dst = Path.home() / _PLATFORM_CONFIG["antigravity"]["skill_dst"]
+    if skill_dst.exists():
+        skill_dst.unlink()
+        print(f"graphify skill removed from {skill_dst}")
+    version_file = skill_dst.parent / ".graphify_version"
+    if version_file.exists():
+        version_file.unlink()
+    for d in (skill_dst.parent, skill_dst.parent.parent, skill_dst.parent.parent.parent):
+        try:
+            d.rmdir()
+        except OSError:
+            break
+
+
+_CURSOR_RULE_PATH = Path(".cursor") / "rules" / "graphify.mdc"
+_CURSOR_RULE = """\
+---
+description: graphify knowledge graph context
+alwaysApply: true
+---
+
+This project has a graphify knowledge graph at graphify-out/.
+
+- Before answering architecture or codebase questions, read graphify-out/GRAPH_REPORT.md for god nodes and community structure
+- If graphify-out/wiki/index.md exists, navigate it instead of reading raw files
+- After modifying code files in this session, run `graphify update .` to keep the graph current (AST-only, no API cost)
+"""
+
+
+def _cursor_install(project_dir: Path) -> None:
+    """Write .cursor/rules/graphify.mdc with alwaysApply: true."""
+    rule_path = (project_dir or Path(".")) / _CURSOR_RULE_PATH
+    rule_path.parent.mkdir(parents=True, exist_ok=True)
+    if rule_path.exists():
+        print(f"graphify rule already exists at {rule_path} (no change)")
+        return
+    rule_path.write_text(_CURSOR_RULE, encoding="utf-8")
+    print(f"graphify rule written to {rule_path.resolve()}")
+    print()
+    print("Cursor will now always include the knowledge graph context.")
+    print("Run /graphify . first to build the graph if you haven't already.")
+
+
+def _cursor_uninstall(project_dir: Path) -> None:
+    """Remove .cursor/rules/graphify.mdc."""
+    rule_path = (project_dir or Path(".")) / _CURSOR_RULE_PATH
+    if not rule_path.exists():
+        print("No graphify Cursor rule found - nothing to do")
+        return
+    rule_path.unlink()
+    print(f"graphify Cursor rule removed from {rule_path.resolve()}")
+
+
+# OpenCode tool.execute.before plugin — fires before every tool call.
+# Injects a graph reminder into bash command output when graph.json exists.
+_OPENCODE_PLUGIN_JS = """\
+// graphify OpenCode plugin
+// Injects a knowledge graph reminder before bash tool calls when the graph exists.
+import { existsSync } from "fs";
+import { join } from "path";
+
+export const GraphifyPlugin = async ({ directory }) => {
+  let reminded = false;
+
+  return {
+    "tool.execute.before": async (input, output) => {
+      if (reminded) return;
+      if (!existsSync(join(directory, "graphify-out", "graph.json"))) return;
+
+      if (input.tool === "bash") {
+        output.args.command =
+          'echo "[graphify] Knowledge graph available. Read graphify-out/GRAPH_REPORT.md for god nodes and architecture context before searching files." && ' +
+          output.args.command;
+        reminded = true;
+      }
+    },
+  };
+};
+"""
+
+_OPENCODE_PLUGIN_PATH = Path(".opencode") / "plugins" / "graphify.js"
+_OPENCODE_CONFIG_PATH = Path("opencode.json")
+
+
+def _install_opencode_plugin(project_dir: Path) -> None:
+    """Write graphify.js plugin and register it in opencode.json."""
+    plugin_file = project_dir / _OPENCODE_PLUGIN_PATH
+    plugin_file.parent.mkdir(parents=True, exist_ok=True)
+    plugin_file.write_text(_OPENCODE_PLUGIN_JS, encoding="utf-8")
+    print(f"  {_OPENCODE_PLUGIN_PATH}  ->  tool.execute.before hook written")
+
+    config_file = project_dir / _OPENCODE_CONFIG_PATH
+    if config_file.exists():
+        try:
+            config = json.loads(config_file.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            config = {}
+    else:
+        config = {}
+
+    plugins = config.setdefault("plugin", [])
+    entry = _OPENCODE_PLUGIN_PATH.as_posix()
+    if entry not in plugins:
+        plugins.append(entry)
+        config_file.write_text(json.dumps(config, indent=2), encoding="utf-8")
+        print(f"  {_OPENCODE_CONFIG_PATH}  ->  plugin registered")
+    else:
+        print(f"  {_OPENCODE_CONFIG_PATH}  ->  plugin already registered (no change)")
+
+
+def _uninstall_opencode_plugin(project_dir: Path) -> None:
+    """Remove graphify.js plugin and deregister from opencode.json."""
+    plugin_file = project_dir / _OPENCODE_PLUGIN_PATH
+    if plugin_file.exists():
+        plugin_file.unlink()
+        print(f"  {_OPENCODE_PLUGIN_PATH}  ->  removed")
+
+    config_file = project_dir / _OPENCODE_CONFIG_PATH
+    if not config_file.exists():
+        return
+    try:
+        config = json.loads(config_file.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return
+    plugins = config.get("plugin", [])
+    entry = _OPENCODE_PLUGIN_PATH.as_posix()
+    if entry in plugins:
+        plugins.remove(entry)
+        if not plugins:
+            config.pop("plugin")
+        config_file.write_text(json.dumps(config, indent=2), encoding="utf-8")
+        print(f"  {_OPENCODE_CONFIG_PATH}  ->  plugin deregistered")
+
+
+_CODEX_HOOK = {
+    "hooks": {
+        "PreToolUse": [
+            {
+                "matcher": "Bash",
+                "hooks": [
+                    {
+                        "type": "command",
+                        "command": (
+                            "[ -f graphify-out/graph.json ] && "
+                            r"""echo '{"hookSpecificOutput":{"hookEventName":"PreToolUse","additionalContext":"graphify: Knowledge graph exists. Read graphify-out/GRAPH_REPORT.md for god nodes and community structure before searching raw files."}}' """
+                            "|| true"
+                        ),
+                    }
+                ],
+            }
+        ]
+    }
+}
+
+
+def _install_codex_hook(project_dir: Path) -> None:
+    """Add graphify PreToolUse hook to .codex/hooks.json."""
+    hooks_path = project_dir / ".codex" / "hooks.json"
+    hooks_path.parent.mkdir(parents=True, exist_ok=True)
+
+    if hooks_path.exists():
+        try:
+            existing = json.loads(hooks_path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            existing = {}
+    else:
+        existing = {}
+
+    pre_tool = existing.setdefault("hooks", {}).setdefault("PreToolUse", [])
+    existing["hooks"]["PreToolUse"] = [h for h in pre_tool if "graphify" not in str(h)]
+    existing["hooks"]["PreToolUse"].extend(_CODEX_HOOK["hooks"]["PreToolUse"])
+    hooks_path.write_text(json.dumps(existing, indent=2), encoding="utf-8")
+    print(f"  .codex/hooks.json  ->  PreToolUse hook registered")
+
+
+def _uninstall_codex_hook(project_dir: Path) -> None:
+    """Remove graphify PreToolUse hook from .codex/hooks.json."""
+    hooks_path = project_dir / ".codex" / "hooks.json"
+    if not hooks_path.exists():
+        return
+    try:
+        existing = json.loads(hooks_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return
+    pre_tool = existing.get("hooks", {}).get("PreToolUse", [])
+    filtered = [h for h in pre_tool if "graphify" not in str(h)]
+    existing["hooks"]["PreToolUse"] = filtered
+    hooks_path.write_text(json.dumps(existing, indent=2), encoding="utf-8")
+    print(f"  .codex/hooks.json  ->  PreToolUse hook removed")
+
+
+def _agents_install(project_dir: Path, platform: str) -> None:
+    """Write the graphify section to the local AGENTS.md (Codex/OpenCode/OpenClaw)."""
+    target = (project_dir or Path(".")) / "AGENTS.md"
+
+    if target.exists():
+        content = target.read_text(encoding="utf-8")
+        if _AGENTS_MD_MARKER in content:
+            print(f"graphify already configured in AGENTS.md")
+        else:
+            target.write_text(content.rstrip() + "\n\n" + _AGENTS_MD_SECTION, encoding="utf-8")
+            print(f"graphify section written to {target.resolve()}")
+    else:
+        target.write_text(_AGENTS_MD_SECTION, encoding="utf-8")
+        print(f"graphify section written to {target.resolve()}")
+
+    if platform == "codex":
+        _install_codex_hook(project_dir or Path("."))
+    elif platform == "opencode":
+        _install_opencode_plugin(project_dir or Path("."))
+
+    print()
+    print(f"{platform.capitalize()} will now check the knowledge graph before answering")
+    print("codebase questions and rebuild it after code changes.")
+    if platform not in ("codex", "opencode"):
+        print()
+        print("Note: unlike Claude Code, there is no PreToolUse hook equivalent for")
+        print(f"{platform.capitalize()} — the AGENTS.md rules are the always-on mechanism.")
+
+
+def _agents_uninstall(project_dir: Path, platform: str = "") -> None:
+    """Remove the graphify section from the local AGENTS.md."""
+    target = (project_dir or Path(".")) / "AGENTS.md"
+
+    if not target.exists():
+        print("No AGENTS.md found in current directory - nothing to do")
+        return
+
+    content = target.read_text(encoding="utf-8")
+    if _AGENTS_MD_MARKER not in content:
+        print("graphify section not found in AGENTS.md - nothing to do")
+        return
+
+    cleaned = re.sub(
+        r"\n*## graphify\n.*?(?=\n## |\Z)",
+        "",
+        content,
+        flags=re.DOTALL,
+    ).rstrip()
+    if cleaned:
+        target.write_text(cleaned + "\n", encoding="utf-8")
+        print(f"graphify section removed from {target.resolve()}")
+    else:
+        target.unlink()
+        print(f"AGENTS.md was empty after removal - deleted {target.resolve()}")
+
+    if platform == "opencode":
+        _uninstall_opencode_plugin(project_dir or Path("."))
+
+
+def claude_install(project_dir: Path | None = None) -> None:
+    """Write the graphify section to the local CLAUDE.md."""
+    target = (project_dir or Path(".")) / "CLAUDE.md"
+
+    if target.exists():
+        content = target.read_text(encoding="utf-8")
+        if _CLAUDE_MD_MARKER in content:
+            print("graphify already configured in CLAUDE.md")
+            return
+        new_content = content.rstrip() + "\n\n" + _CLAUDE_MD_SECTION
+    else:
+        new_content = _CLAUDE_MD_SECTION
+
+    target.write_text(new_content, encoding="utf-8")
+    print(f"graphify section written to {target.resolve()}")
+
+    # Also write Claude Code PreToolUse hook to .claude/settings.json
+    _install_claude_hook(project_dir or Path("."))
+
+    print()
+    print("Claude Code will now check the knowledge graph before answering")
+    print("codebase questions and rebuild it after code changes.")
+
+
+def _install_claude_hook(project_dir: Path) -> None:
+    """Add graphify PreToolUse hook to .claude/settings.json."""
+    settings_path = project_dir / ".claude" / "settings.json"
+    settings_path.parent.mkdir(parents=True, exist_ok=True)
+
+    if settings_path.exists():
+        try:
+            settings = json.loads(settings_path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            settings = {}
+    else:
+        settings = {}
+
+    hooks = settings.setdefault("hooks", {})
+    pre_tool = hooks.setdefault("PreToolUse", [])
+
+    # Match by content, not by specific matcher string — so the dedup survives
+    # across versions where the matcher itself changes (e.g. Glob|Grep → Read|Glob|Grep).
+    hooks["PreToolUse"] = [h for h in pre_tool if "graphify" not in str(h)]
+    hooks["PreToolUse"].append(_SETTINGS_HOOK)
+    settings_path.write_text(json.dumps(settings, indent=2), encoding="utf-8")
+    print(f"  .claude/settings.json  ->  PreToolUse hook registered")
+
+
+def _uninstall_claude_hook(project_dir: Path) -> None:
+    """Remove graphify PreToolUse hook from .claude/settings.json."""
+    settings_path = project_dir / ".claude" / "settings.json"
+    if not settings_path.exists():
+        return
+    try:
+        settings = json.loads(settings_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return
+    pre_tool = settings.get("hooks", {}).get("PreToolUse", [])
+    filtered = [h for h in pre_tool if "graphify" not in str(h)]
+    if len(filtered) == len(pre_tool):
+        return
+    settings["hooks"]["PreToolUse"] = filtered
+    settings_path.write_text(json.dumps(settings, indent=2), encoding="utf-8")
+    print(f"  .claude/settings.json  ->  PreToolUse hook removed")
+
+
+def claude_uninstall(project_dir: Path | None = None) -> None:
+    """Remove the graphify section from the local CLAUDE.md."""
+    target = (project_dir or Path(".")) / "CLAUDE.md"
+
+    if not target.exists():
+        print("No CLAUDE.md found in current directory - nothing to do")
+        return
+
+    content = target.read_text(encoding="utf-8")
+    if _CLAUDE_MD_MARKER not in content:
+        print("graphify section not found in CLAUDE.md - nothing to do")
+        return
+
+    # Remove the ## graphify section: from the marker to the next ## heading or EOF
+    cleaned = re.sub(
+        r"\n*## graphify\n.*?(?=\n## |\Z)",
+        "",
+        content,
+        flags=re.DOTALL,
+    ).rstrip()
+    if cleaned:
+        target.write_text(cleaned + "\n", encoding="utf-8")
+        print(f"graphify section removed from {target.resolve()}")
+    else:
+        target.unlink()
+        print(f"CLAUDE.md was empty after removal - deleted {target.resolve()}")
+
+    _uninstall_claude_hook(project_dir or Path("."))
+
+
+def main() -> None:
+    # Check all known skill install locations for a stale version stamp.
+    # Skip during install/uninstall (hook writes trigger a fresh check anyway).
+    # Deduplicate paths so platforms sharing the same install dir don't warn twice.
+    if not any(arg in ("install", "uninstall") for arg in sys.argv):
+        for skill_dst in {Path.home() / cfg["skill_dst"] for cfg in _PLATFORM_CONFIG.values()}:
+            _check_skill_version(skill_dst)
+
+    # `graphify --version` / `-V` — standard CLI convention. Without this,
+    # `--version` falls through to "unknown command".
+    if len(sys.argv) >= 2 and sys.argv[1] in ("--version", "-V"):
+        print(f"graphify {__version__}")
+        return
+
+    # `graphify <cmd> --help` (or `-h`) — print just that subcommand's
+    # block. Without this, e.g. `graphify navigate --help` parses `--help`
+    # as a navigate op and errors. Common subcommands have entries in
+    # `_HELP_BLOCKS`; for the rest we fall through to the top-level help.
+    if len(sys.argv) >= 3 and sys.argv[2] in ("-h", "--help") and sys.argv[1] in _HELP_BLOCKS:
+        _print_subcmd_help(sys.argv[1])
+        return
+
+    if len(sys.argv) < 2 or sys.argv[1] in ("-h", "--help"):
+        print("Usage: graphify <command>")
+        print()
+        # Lap-21 #4 (sub-agent head-to-head): document the win/lose
+        # boundary up front. Lap-21 follow-up: priming-for-large-tasks
+        # is the under-sold edge — even when the task will eventually
+        # need most of a file, leading with `graphify shape` (or
+        # `navigate @entry`) primes the structural pivots that inform
+        # every Read decision that follows.
+        # Lap-21 (R3 sub-agent feedback): sharpen the body-count rule —
+        # graphify wins when ≤2 bodies are needed; body-heavy tasks
+        # (need most of a file) should fall straight to Read once
+        # graphify has primed the file:line targets.
+        print("When to use graphify vs Read:")
+        print("  graphify first   always lead with shape/navigate/summarize.")
+        print("                   The structural primer (entry points, callers,")
+        print("                   class shape, line ranges) is cheap and informs")
+        print("                   every Read that follows.")
+        print("  graphify wins    when you need ≤2 bodies, structure-only answers,")
+        print("                   or who-uses-X tracing across the call graph.")
+        print("                   `peek` for one body, `locate <s1> <s2>...` for")
+        print("                   file:line of several known symbols.")
+        print("  Read wins        when you need most of a file (>~200 ln of body)")
+        print("                   or the question is line-by-line (formatting,")
+        print("                   surrounding context a peek-window misses). Use")
+        print("                   `shape`/`navigate` to find the right offsets, ")
+        print("                   then read with `offset`/`limit` — don't scout")
+        print("                   with peek when you'll end up reading anyway.")
+        print()
+        # Lap-20d (TS-Claude #5): workflow templates retain better than
+        # per-flag docs. Lead with the 80% paths so an agent who only
+        # reads the first screen of help can already do useful work.
+        print("Common workflows:")
+        print("  Orient on a repo       graphify summarize")
+        print("  Orient on a file       graphify shape <file>")
+        print("  Read a function body   graphify peek <symbol>")
+        print("  Read a class           graphify peek <Class>   (curated: header + per-method sig + body)")
+        print("  Locate many symbols    graphify locate <s1> <s2> ...   (file:line for each, no body)")
+        print("  Find callers of X      graphify navigate \"@X\" in")
+        print("  Map a class            graphify navigate \"@Class\" methods --bodies 3")
+        print("  Find dead methods      graphify navigate \"@Class\" dead-ends")
+        print("  Find a string          graphify search \"<regex>\"")
+        print("  Where does X reach Y?  graphify path \"X\" \"Y\" --edges calls")
+        print("  Stale graph?           graphify changed   (then `graphify update .`)")
+        print()
+        print("Commands:")
+        print("  install [--platform P]  copy skill to platform config dir (claude|windows|codex|opencode|aider|claw|droid|trae|trae-cn|gemini|cursor|antigravity|hermes|kiro)")
+        for line in _HELP_BLOCKS["path"]:
+            print(line)
+        for line in _HELP_BLOCKS["explain"]:
+            print(line)
+        for line in _HELP_BLOCKS["changed"]:
+            print(line)
+        for line in _HELP_BLOCKS["summarize"]:
+            print(line)
+        for line in _HELP_BLOCKS["peek"]:
+            print(line)
+        for line in _HELP_BLOCKS["locate"]:
+            print(line)
+        for line in _HELP_BLOCKS["doc"]:
+            print(line)
+        for line in _HELP_BLOCKS["shape"]:
+            print(line)
+        for line in _HELP_BLOCKS["search"]:
+            print(line)
+        print("  add <url>               fetch a URL and save it to ./raw, then update the graph")
+        print("    --author \"Name\"         tag the author of the content")
+        print("    --contributor \"Name\"    tag who added it to the corpus")
+        print("    --dir <path>            target directory (default: ./raw)")
+        print("  watch <path>            watch a folder and rebuild the graph on code changes")
+        print("  update <path>           re-extract code files and update the graph (no LLM needed)")
+        print("  cluster-only <path>     rerun clustering on an existing graph.json and regenerate report")
+        print("  query \"<question>\"       BFS traversal of graph.json for a question")
+        print("    --dfs                   use depth-first instead of breadth-first")
+        print("    --budget N              cap output at N tokens (default 2000)")
+        print("    --graph <path>          path to graph.json (default graphify-out/graph.json)")
+        print("  save-result             save a Q&A result to graphify-out/memory/ for graph feedback loop")
+        print("    --question Q            the question asked")
+        print("    --answer A              the answer to save")
+        print("    --type T                query type: query|path_query|explain (default: query)")
+        print("    --nodes N1 N2 ...       source node labels cited in the answer")
+        print("    --memory-dir DIR        memory directory (default: graphify-out/memory)")
+        print("  diff <old.json> <new.json>  compare two graph snapshots and print what changed")
+        print("  benchmark [graph.json]  measure token reduction vs naive full-corpus approach")
+        for line in _HELP_BLOCKS["navigate"]:
+            print(line)
+        print("  hook install            install post-commit/post-checkout git hooks (all platforms)")
+        print("  hook uninstall          remove git hooks")
+        print("  hook status             check if git hooks are installed")
+        print("  gemini install          write GEMINI.md section + BeforeTool hook (Gemini CLI)")
+        print("  gemini uninstall        remove GEMINI.md section + BeforeTool hook")
+        print("  cursor install          write .cursor/rules/graphify.mdc (Cursor)")
+        print("  cursor uninstall        remove .cursor/rules/graphify.mdc")
+        print("  claude install          write graphify section to CLAUDE.md + PreToolUse hook (Claude Code)")
+        print("  claude uninstall        remove graphify section from CLAUDE.md + PreToolUse hook")
+        print("  codex install           write graphify section to AGENTS.md (Codex)")
+        print("  codex uninstall         remove graphify section from AGENTS.md")
+        print("  opencode install        write graphify section to AGENTS.md + tool.execute.before plugin (OpenCode)")
+        print("  opencode uninstall      remove graphify section from AGENTS.md + plugin")
+        print("  aider install           write graphify section to AGENTS.md (Aider)")
+        print("  aider uninstall         remove graphify section from AGENTS.md")
+        print("  copilot install         copy graphify skill to ~/.copilot/skills (GitHub Copilot CLI)")
+        print("  copilot uninstall       remove graphify skill from ~/.copilot/skills")
+        print("  vscode install          configure VS Code Copilot Chat (skill + .github/copilot-instructions.md)")
+        print("  vscode uninstall        remove VS Code Copilot Chat configuration")
+        print("  claw install            write graphify section to AGENTS.md (OpenClaw)")
+        print("  claw uninstall          remove graphify section from AGENTS.md")
+        print("  droid install           write graphify section to AGENTS.md (Factory Droid)")
+        print("  droid uninstall        remove graphify section from AGENTS.md")
+        print("  trae install            write graphify section to AGENTS.md (Trae)")
+        print("  trae uninstall         remove graphify section from AGENTS.md")
+        print("  trae-cn install         write graphify section to AGENTS.md (Trae CN)")
+        print("  trae-cn uninstall      remove graphify section from AGENTS.md")
+        print("  antigravity install     write .agent/rules + .agent/workflows + skill (Google Antigravity)")
+        print("  antigravity uninstall   remove .agent/rules, .agent/workflows, and skill")
+        print("  hermes install          write skill to ~/.hermes/skills/graphify/ (Hermes)")
+        print("  hermes uninstall        remove skill from ~/.hermes/skills/graphify/")
+        print("  kiro install            write skill to .kiro/skills/graphify/ + steering file (Kiro IDE/CLI)")
+        print("  kiro uninstall          remove skill + steering file")
+        print()
+        return
+
+    cmd = sys.argv[1]
+    if cmd == "_hook":
+        # PreToolUse hook handler — read JSON tool call on stdin, decide
+        # whether to emit the navigate-nudge. Suppresses on non-code Read
+        # because graphify only indexes source; nudging on a .md/.json/.yaml
+        # read is noise. Glob and Grep stay un-gated since both search code.
+        # Stdlib-only and quick-return so the hook adds minimal latency.
+        import os.path as _osp
+        try:
+            payload = json.loads(sys.stdin.read() or "{}")
+        except Exception:
+            return
+        tool = payload.get("tool_name") or ""
+        inp = payload.get("tool_input") or {}
+        fp = (inp.get("file_path") or "").strip()
+        if tool == "Read":
+            ext = _osp.splitext(fp)[1].lower()
+            # Mirror of graphify.detect.CODE_EXTENSIONS — kept inline so the
+            # hook stays stdlib-only (importing detect pulls in the rest of
+            # the package). Update both lists if either changes.
+            CODE_EXTS = {
+                ".py", ".ts", ".js", ".jsx", ".tsx", ".mjs", ".ejs", ".go",
+                ".rs", ".java", ".cpp", ".cc", ".cxx", ".c", ".h", ".hpp",
+                ".rb", ".swift", ".kt", ".kts", ".cs", ".scala", ".php",
+                ".lua", ".toc", ".zig", ".ps1", ".ex", ".exs", ".m", ".mm",
+                ".jl", ".vue", ".svelte", ".dart", ".v", ".sv",
+            }
+            if ext not in CODE_EXTS:
+                return
+            # Reading our own report → no nudge needed
+            if "graphify-out/" in fp:
+                return
+            # Lap-3: suppress the nudge if the file was just surfaced by a
+            # graphify navigate call. The session log is written by
+            # navigate._record_session_paths and lives alongside graph.json.
+            # Both sides are realpath'd because macOS aliases /tmp →
+            # /private/tmp; raw abspath wouldn't match.
+            try:
+                import time as _t
+                recent_log = Path("graphify-out/.session/recent-paths")
+                if recent_log.exists():
+                    now = _t.time()
+                    target = _osp.realpath(fp) if fp else ""
+                    for line in recent_log.read_text(encoding="utf-8").splitlines():
+                        ts_str, _, path = line.partition("\t")
+                        try:
+                            if now - float(ts_str) > 600:
+                                continue
+                        except ValueError:
+                            continue
+                        if path and target and path == target:
+                            return
+            except Exception:
+                pass
+        msg = (
+            "graphify-out/graph.json exists. Before reading/grepping "
+            "unfamiliar code, scout it cheaper: `graphify navigate "
+            "\"@<symbol>\"` returns a dense affordance frame (~200 tok). "
+            "Then pivot with in/out/methods/coc/parent/[N], or jump to "
+            "file:line once a node is load-bearing. See "
+            "~/.claude/skills/graphify/SKILL.md."
+        )
+        # Lap-3: one-shot staleness banner when the graph is conspicuously
+        # behind the working tree. Stamp file rate-limits to one banner per
+        # 30min so it doesn't piggyback on every code read.
+        try:
+            import time as _t
+            graph_p = Path("graphify-out/graph.json")
+            if graph_p.exists():
+                now = _t.time()
+                graph_age = now - graph_p.stat().st_mtime
+                if graph_age > 86400:  # > 1 day
+                    stamp = Path("graphify-out/.session/banner-stamp")
+                    last_banner = 0.0
+                    if stamp.exists():
+                        try:
+                            last_banner = float(stamp.read_text().strip())
+                        except (OSError, ValueError):
+                            last_banner = 0.0
+                    if now - last_banner > 1800:  # 30min
+                        days = int(graph_age // 86400)
+                        days_str = f"{days}d" if days >= 1 else f"{int(graph_age // 3600)}h"
+                        banner = (f"⚠ graph was extracted {days_str} ago — "
+                                  f"results may be stale. `graphify update .` "
+                                  f"refreshes incrementally. ")
+                        msg = banner + msg
+                        try:
+                            stamp.parent.mkdir(parents=True, exist_ok=True)
+                            stamp.write_text(f"{now:.0f}", encoding="utf-8")
+                        except OSError:
+                            pass
+        except Exception:
+            pass
+        out_payload = {"hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "additionalContext": msg,
+        }}
+        sys.stdout.write(json.dumps(out_payload))
+        return
+    if cmd == "install":
+        # Default to windows platform on Windows, claude elsewhere
+        default_platform = "windows" if platform.system() == "Windows" else "claude"
+        chosen_platform = default_platform
+        args = sys.argv[2:]
+        i = 0
+        while i < len(args):
+            if args[i].startswith("--platform="):
+                chosen_platform = args[i].split("=", 1)[1]
+                i += 1
+            elif args[i] == "--platform" and i + 1 < len(args):
+                chosen_platform = args[i + 1]
+                i += 2
+            else:
+                i += 1
+        install(platform=chosen_platform)
+    elif cmd == "claude":
+        subcmd = sys.argv[2] if len(sys.argv) > 2 else ""
+        if subcmd == "install":
+            claude_install()
+        elif subcmd == "uninstall":
+            claude_uninstall()
+        else:
+            print("Usage: graphify claude [install|uninstall]", file=sys.stderr)
+            sys.exit(1)
+    elif cmd == "gemini":
+        subcmd = sys.argv[2] if len(sys.argv) > 2 else ""
+        if subcmd == "install":
+            gemini_install()
+        elif subcmd == "uninstall":
+            gemini_uninstall()
+        else:
+            print("Usage: graphify gemini [install|uninstall]", file=sys.stderr)
+            sys.exit(1)
+    elif cmd == "cursor":
+        subcmd = sys.argv[2] if len(sys.argv) > 2 else ""
+        if subcmd == "install":
+            _cursor_install(Path("."))
+        elif subcmd == "uninstall":
+            _cursor_uninstall(Path("."))
+        else:
+            print("Usage: graphify cursor [install|uninstall]", file=sys.stderr)
+            sys.exit(1)
+    elif cmd == "vscode":
+        subcmd = sys.argv[2] if len(sys.argv) > 2 else ""
+        if subcmd == "install":
+            vscode_install()
+        elif subcmd == "uninstall":
+            vscode_uninstall()
+        else:
+            print("Usage: graphify vscode [install|uninstall]", file=sys.stderr)
+            sys.exit(1)
+    elif cmd == "copilot":
+        subcmd = sys.argv[2] if len(sys.argv) > 2 else ""
+        if subcmd == "install":
+            install(platform="copilot")
+        elif subcmd == "uninstall":
+            skill_dst = Path.home() / _PLATFORM_CONFIG["copilot"]["skill_dst"]
+            removed = []
+            if skill_dst.exists():
+                skill_dst.unlink()
+                removed.append(f"skill removed: {skill_dst}")
+            version_file = skill_dst.parent / ".graphify_version"
+            if version_file.exists():
+                version_file.unlink()
+            for d in (skill_dst.parent, skill_dst.parent.parent, skill_dst.parent.parent.parent):
+                try:
+                    d.rmdir()
+                except OSError:
+                    break
+            print("; ".join(removed) if removed else "nothing to remove")
+        else:
+            print("Usage: graphify copilot [install|uninstall]", file=sys.stderr)
+            sys.exit(1)
+    elif cmd == "kiro":
+        subcmd = sys.argv[2] if len(sys.argv) > 2 else ""
+        if subcmd == "install":
+            _kiro_install(Path("."))
+        elif subcmd == "uninstall":
+            _kiro_uninstall(Path("."))
+        else:
+            print("Usage: graphify kiro [install|uninstall]", file=sys.stderr)
+            sys.exit(1)
+    elif cmd in ("aider", "codex", "opencode", "claw", "droid", "trae", "trae-cn", "hermes"):
+        subcmd = sys.argv[2] if len(sys.argv) > 2 else ""
+        if subcmd == "install":
+            _agents_install(Path("."), cmd)
+        elif subcmd == "uninstall":
+            _agents_uninstall(Path("."), platform=cmd)
+            if cmd == "codex":
+                _uninstall_codex_hook(Path("."))
+        else:
+            print(f"Usage: graphify {cmd} [install|uninstall]", file=sys.stderr)
+            sys.exit(1)
+    elif cmd == "antigravity":
+        subcmd = sys.argv[2] if len(sys.argv) > 2 else ""
+        if subcmd == "install":
+            _antigravity_install(Path("."))
+        elif subcmd == "uninstall":
+            _antigravity_uninstall(Path("."))
+        else:
+            print("Usage: graphify antigravity [install|uninstall]", file=sys.stderr)
+            sys.exit(1)
+    elif cmd == "hook":
+        from graphify.hooks import install as hook_install, uninstall as hook_uninstall, status as hook_status
+        subcmd = sys.argv[2] if len(sys.argv) > 2 else ""
+        if subcmd == "install":
+            print(hook_install(Path(".")))
+        elif subcmd == "uninstall":
+            print(hook_uninstall(Path(".")))
+        elif subcmd == "status":
+            print(hook_status(Path(".")))
+        else:
+            print("Usage: graphify hook [install|uninstall|status]", file=sys.stderr)
+            sys.exit(1)
+    elif cmd == "query":
+        if any(a in ("-h", "--help") for a in sys.argv[2:]):
+            print("Usage: graphify query \"<question>\" [--dfs] [--budget N] [--limit N] [--graph path]")
+            print()
+            print("Scoring is term-bag-of-words against node labels + source files.")
+            print("That works well only when the question contains specific identifiers.")
+            print()
+            print("Best results: include `@<label>` tokens directly in the question to")
+            print("anchor the BFS — `query \"what calls @VectorIndex on insertion?\"`")
+            print("starts the traversal at the resolved node and ignores generic terms.")
+            print()
+            print("If no anchor is given, common stopwords (what/how/why/the/is/are/...)")
+            print("are filtered before term-matching, but the result is still a coarse")
+            print("sweep. For deterministic answers, prefer `graphify navigate \"@X\" out`.")
+            return
+        if len(sys.argv) < 3:
+            print("Usage: graphify query \"<question>\" [--dfs] [--budget N] [--limit N] [--graph path]", file=sys.stderr)
+            sys.exit(1)
+        from graphify.serve import _score_nodes, _bfs, _dfs, _subgraph_to_text
+        from graphify.security import sanitize_label
+        from networkx.readwrite import json_graph
+        question = sys.argv[2]
+        use_dfs = "--dfs" in sys.argv
+        budget = 2000
+        node_limit: int | None = None
+        graph_path = "graphify-out/graph.json"
+        args = sys.argv[3:]
+        i = 0
+        while i < len(args):
+            if args[i] == "--budget" and i + 1 < len(args):
+                try:
+                    budget = int(args[i + 1])
+                except ValueError:
+                    print(f"error: --budget must be an integer", file=sys.stderr)
+                    sys.exit(1)
+                i += 2
+            elif args[i].startswith("--budget="):
+                try:
+                    budget = int(args[i].split("=", 1)[1])
+                except ValueError:
+                    print(f"error: --budget must be an integer", file=sys.stderr)
+                    sys.exit(1)
+                i += 1
+            elif args[i] == "--limit" and i + 1 < len(args):
+                try:
+                    node_limit = int(args[i + 1])
+                except ValueError:
+                    print(f"error: --limit must be an integer", file=sys.stderr)
+                    sys.exit(1)
+                i += 2
+            elif args[i].startswith("--limit="):
+                try:
+                    node_limit = int(args[i].split("=", 1)[1])
+                except ValueError:
+                    print(f"error: --limit must be an integer", file=sys.stderr)
+                    sys.exit(1)
+                i += 1
+            elif args[i] == "--graph" and i + 1 < len(args):
+                graph_path = args[i + 1]; i += 2
+            else:
+                i += 1
+        gp = Path(graph_path).resolve()
+        if not gp.exists():
+            print(f"error: graph file not found: {gp}", file=sys.stderr)
+            sys.exit(1)
+        if not gp.suffix == ".json":
+            print(f"error: graph file must be a .json file", file=sys.stderr)
+            sys.exit(1)
+        try:
+            import json as _json
+            import networkx as _nx
+            from graphify.build import build_from_json
+            _raw = _json.loads(gp.read_text(encoding="utf-8"))
+            # Lap-21: build_from_json restores edge direction from
+            # _src/_tgt — node_link_graph yields an undirected Graph
+            # (graph.json carries `directed: False`) and resolve_focus's
+            # lap-20c dotted Class.method walk needs G.successors.
+            G = build_from_json(_raw, directed=True)
+        except Exception as exc:
+            print(f"error: could not load graph: {exc}", file=sys.stderr)
+            sys.exit(1)
+        # Anchor extraction: `@<label>` tokens in the question are
+        # explicit traversal starts (resolved via the same matcher
+        # navigate uses). Without anchors `query` is a bag-of-words
+        # term scan that returns generic top-N hits (`.len()`, `.new()`,
+        # `.push()`); with anchors it's a deterministic BFS from a
+        # concrete node, which is what most users actually want.
+        from graphify.resolve import resolve_focus, label_index
+        anchors_raw = [t for t in question.split() if t.startswith("@") and len(t) > 1]
+        anchor_starts: list[str] = []
+        if anchors_raw:
+            idx = label_index(G)
+            for raw in anchors_raw:
+                chosen, candidates, _mt, _alts = resolve_focus(G, idx, raw)
+                if chosen:
+                    anchor_starts.append(chosen)
+                elif candidates:
+                    print(f"warning: anchor `{raw}` is ambiguous "
+                          f"({len(candidates)} matches); ignoring. "
+                          f"qualify with the source path: e.g. `@tools/foo.py/{raw[1:]}` "
+                          f"(extension optional, leading `_` works either way).",
+                          file=sys.stderr)
+
+        # Stopword filter for the term-scoring fallback. The default
+        # English question shape (`what is X?`, `how does Y work?`)
+        # produced low-signal scores: every node with `is` or `does`
+        # in any field tied. Drop the obvious filler so the remaining
+        # nouns/identifiers actually drive ranking.
+        STOPWORDS = {
+            "the", "and", "for", "are", "but", "not", "you", "all",
+            "any", "can", "had", "has", "have", "what", "when", "where",
+            "which", "who", "why", "how", "does", "did", "this", "that",
+            "with", "from", "into", "out", "about", "show", "list", "find",
+            "tell", "give", "look",
+        }
+        terms = [t.lower() for t in question.split()
+                 if len(t) > 2 and t.lower() not in STOPWORDS
+                 and not t.startswith("@")]
+
+        if anchor_starts:
+            start = anchor_starts[:5]
+        else:
+            scored = _score_nodes(G, terms)
+            if not scored:
+                msg = "No matching nodes found."
+                if not terms:
+                    msg += (" Question contained only stopwords — "
+                            "try `query \"what calls @<label>?\"` "
+                            "or use `navigate \"@<label>\" out` instead.")
+                else:
+                    msg += (" Add an `@<label>` anchor to the question "
+                            "for deterministic traversal.")
+                print(msg)
+                sys.exit(0)
+            start = [nid for _, nid in scored[:5]]
+            # Lap-8 bridge: surface the top label hits so the agent can
+            # rerun as `navigate "@<label>"` rather than reading a flat
+            # term-scan dump. The reporter said the fallback warning was
+            # correct but didn't redirect — naming the candidates closes
+            # that gap. We sample from `scored[:5]` (the BFS start set)
+            # because those are the highest-relevance term matches; their
+            # labels are what the agent likely meant to focus.
+            top_labels = []
+            for _, nid in scored[:5]:
+                lbl = G.nodes[nid].get("label", nid)
+                if lbl and lbl not in top_labels:
+                    top_labels.append(lbl)
+            if top_labels:
+                hint = ", ".join(f"@{l}" for l in top_labels[:3])
+                print(f"_(no `@<label>` anchor — falling back to term scan; "
+                      f"did you mean to focus one of: {hint}? "
+                      f"`navigate \"@<label>\"` is more deterministic.)_",
+                      file=sys.stderr)
+            else:
+                print(f"_(no `@<label>` anchor — falling back to term scan; "
+                      f"prefer `navigate \"@<label>\"` for focused traversal)_",
+                      file=sys.stderr)
+        nodes, edges = (_dfs if use_dfs else _bfs)(G, start, depth=2)
+        # Lap-12: in the no-anchor fallback, the term-scorer's top-N (which
+        # also produces the "did you mean" hint) must appear first in the
+        # rendered subgraph. Without `priority_nodes`, BFS-expansion's
+        # degree-sort surfaces hub neighbours (`types.ts`, generic helpers)
+        # above the actual term-scored hit — the agent reads the suggestion
+        # engine and the result list as contradicting each other. Threading
+        # `start` through aligns them.
+        priority = start if not anchor_starts else None
+        print(_subgraph_to_text(G, nodes, edges, token_budget=budget,
+                                priority_nodes=priority,
+                                node_limit=node_limit))
+    elif cmd == "save-result":
+        # graphify save-result --question Q --answer A --type T [--nodes N1 N2 ...]
+        import argparse as _ap
+        p = _ap.ArgumentParser(prog="graphify save-result")
+        p.add_argument("--question", required=True)
+        p.add_argument("--answer", required=True)
+        p.add_argument("--type", dest="query_type", default="query")
+        p.add_argument("--nodes", nargs="*", default=[])
+        p.add_argument("--memory-dir", default="graphify-out/memory")
+        opts = p.parse_args(sys.argv[2:])
+        from graphify.ingest import save_query_result as _sqr
+        out = _sqr(
+            question=opts.question,
+            answer=opts.answer,
+            memory_dir=Path(opts.memory_dir),
+            query_type=opts.query_type,
+            source_nodes=opts.nodes or None,
+        )
+        print(f"Saved to {out}")
+    elif cmd == "path":
+        if any(a in ("-h", "--help") for a in sys.argv[2:]):
+            _print_subcmd_help("path")
+            return
+        if len(sys.argv) < 4:
+            print("Usage: graphify path \"<source>\" \"<target>\" [--graph path] [--include-inferred] [--edges all|reach|calls]", file=sys.stderr)
+            sys.exit(1)
+        from graphify.resolve import resolve_focus, label_index
+        from graphify.analyze import _is_file_node
+        from networkx.readwrite import json_graph
+        import networkx as _nx
+        source_label = sys.argv[2]
+        target_label = sys.argv[3]
+        graph_path = "graphify-out/graph.json"
+        include_inferred = False  # default: AST ground truth only
+        # `reach` (default) excludes type_ref / rationale_for from
+        # symbol-to-symbol paths so reachability means call/use chains,
+        # not "mentioned in a parameter type signature". `all` opts back in
+        # for users who want to see the literal connectedness.
+        edge_mode = "reach"
+        args = sys.argv[4:]
+        for i, a in enumerate(args):
+            if a == "--graph" and i + 1 < len(args):
+                graph_path = args[i + 1]
+            elif a == "--include-inferred":
+                include_inferred = True
+            elif a == "--edges" and i + 1 < len(args):
+                em = args[i + 1].lower()
+                if em not in ("all", "reach", "calls"):
+                    print(f"error: --edges must be one of: all, reach, calls (got {em!r})", file=sys.stderr)
+                    sys.exit(1)
+                edge_mode = em
+            elif a.startswith("--edges="):
+                em = a.split("=", 1)[1].lower()
+                if em not in ("all", "reach", "calls"):
+                    print(f"error: --edges must be one of: all, reach, calls (got {em!r})", file=sys.stderr)
+                    sys.exit(1)
+                edge_mode = em
+        gp = Path(graph_path).resolve()
+        if not gp.exists():
+            print(f"error: graph file not found: {gp}", file=sys.stderr)
+            sys.exit(1)
+        _raw = json.loads(gp.read_text(encoding="utf-8"))
+        # Lap-21: use build_from_json so we get a DiGraph with edge
+        # directions restored from `_src`/`_tgt`. Plain
+        # `json_graph.node_link_graph` returns an undirected Graph
+        # (graph.json carries `directed: False` even though the data is
+        # directionally tagged), which broke `resolve_focus`'s lap-20c
+        # dotted Class.method walk via `G.successors` — undirected
+        # Graphs don't have that method.
+        from graphify.build import build_from_json
+        G = build_from_json(_raw, directed=True)
+        # Filter the graph to EXTRACTED edges by default — INFERRED edges
+        # produce string-match shortcuts (path through a docstring fragment
+        # rather than a real call) that mislead more than they help.
+        if not include_inferred:
+            edges_to_drop = [(u, v) for u, v, d in G.edges(data=True)
+                             if d.get("confidence") and d["confidence"] != "EXTRACTED"]
+            G = G.copy()
+            G.remove_edges_from(edges_to_drop)
+        # Use navigate's resolver so `path` shares the same `@<label>` /
+        # plain-label syntax, NFC/prefix/substring/fuzzy ranking, and
+        # public-over-rationale preference. Without this `path` would land
+        # on rationale comments first because they tie on substring score.
+        idx = label_index(G)
+        def _resolve(label: str) -> tuple[str | None, list[str], str]:
+            chosen, candidates, match_type, _alts = resolve_focus(G, idx, label)
+            return chosen, candidates, match_type
+        src_nid, src_cands, src_match = _resolve(source_label)
+        tgt_nid, tgt_cands, tgt_match = _resolve(target_label)
+        from graphify.resolve import _is_archived_path
+        for who, label, nid, cands in (("source", source_label, src_nid, src_cands),
+                                        ("target", target_label, tgt_nid, tgt_cands)):
+            if nid is None:
+                if cands:
+                    print(f"{who} '{label}' is ambiguous ({len(cands)} matches). qualify with the source path: e.g. `tools/foo.py/{label}` or `tools/foo/{label}` (extension optional). leading `_` on private symbols works either way. or re-call with one of the node IDs below — IDs bypass label resolution. pick from below:", file=sys.stderr)
+                    for c in cands[:5]:
+                        attrs = G.nodes[c]
+                        src = attrs.get("source_file") or ""
+                        loc = attrs.get("source_location") or ""
+                        archived = " [archived]" if _is_archived_path(src) else ""
+                        suffix = f"  — {src}{':' + loc if loc else ''}{archived}" if src else ""
+                        # Lap-10: surface node ID so the agent can re-call
+                        # `path <id> <id>` and bypass label resolution. Path
+                        # is one-shot (no [N] interactive pick like navigate),
+                        # so IDs are the only way to pin a specific candidate
+                        # when path-qualification can't disambiguate further.
+                        print(f"  - {attrs.get('label', c)}  [id: {c}]{suffix}", file=sys.stderr)
+                else:
+                    print(f"No node matching '{label}' found.", file=sys.stderr)
+                sys.exit(1)
+        # Auto-detect: when both endpoints are symbol nodes, drop the
+        # file-graph edges (contains/imports) before pathing. Without
+        # this, `path "kg/compile-v2.ts/compile" "embeddingGenerate"`
+        # returned `compile() → compile-v2.ts → engine-core.ts → ...`
+        # — a contains/imports chain dressed as a call path. compile()
+        # does not transitively call the target via that route. When
+        # either endpoint IS a file node, the user is asking about
+        # the file graph, so we keep those edges.
+        src_is_file = _is_file_node(G, src_nid)
+        tgt_is_file = _is_file_node(G, tgt_nid)
+        symbol_to_symbol = not (src_is_file or tgt_is_file)
+        FILE_RELS = {"contains", "imports"}
+        # Lap-7: `type_ref` and `rationale_for` aren't call-graph reachability.
+        # A path through `compile() --type_ref→ DecodeEngine --type_ref→ ...`
+        # walks parameter type signatures, which is "literally connected" but
+        # not "compile() reaches X by calling/using it". Block by default;
+        # `--edges all` opts back in.
+        NON_REACH_RELS = {"type_ref", "rationale_for"}
+        # Lap-8: `calls` mode for "execution-relevant" reachability — only
+        # walks call/method/inheritance edges. The complement of this set is
+        # blocked. Reporter case: `path "compile-v2" "embeddingGenerate"`
+        # under `reach` routed compile-v2 --imports→ engine-core --contains→
+        # f32ToF16Array --calls→ embeddingGenerate, which is graph distance
+        # but reads as a call chain. `calls` keeps only call-graph proper.
+        CALL_RELS = {"calls", "method", "impl_of", "inherits"}
+        if edge_mode == "all":
+            blocked: set[str] = set()
+        elif edge_mode == "calls":
+            # Block everything outside the call-graph proper. Compute lazily
+            # from the actual graph so we don't have to enumerate every
+            # relation type that might exist.
+            all_rels = {d.get("relation") for _, _, d in G.edges(data=True)
+                        if d.get("relation")}
+            blocked = all_rels - CALL_RELS
+        elif symbol_to_symbol:
+            blocked = FILE_RELS | NON_REACH_RELS
+        else:
+            # File involved: contains/imports stay (the user is asking about
+            # the file graph), but type-ref/rationale paths are still noise.
+            blocked = NON_REACH_RELS
+        # Mutate weights to make blocked edges effectively unreachable
+        # rather than removing them — keeps the graph object intact for any
+        # downstream reuse and lets a fallback try via-file routing if
+        # shortest_path fails.
+        for u, v, d in G.edges(data=True):
+            rel = d.get("relation")
+            if rel in blocked:
+                d["_path_weight"] = 1000.0
+            elif (not symbol_to_symbol) and rel == "contains":
+                # Weight `contains` higher than semantic edges so the
+                # call/method chain still beats class→file→class ties
+                # (the original Lap-2 weighting).
+                d["_path_weight"] = 10.0
+            else:
+                d["_path_weight"] = 1.0
+        try:
+            path_nodes = _nx.shortest_path(G, src_nid, tgt_nid, weight="_path_weight")
+            # If the path traversed any blocked edge (file-graph or
+            # non-reachability), shortest_path still found it but at
+            # ≥1000 cost per blocked hop. Treat that as "no semantic
+            # path" and fall through to the descriptive fallback. Without
+            # this, a type_ref-only chain reports as a real path.
+            via_blocked = blocked and any(
+                G.edges[path_nodes[i], path_nodes[i + 1]].get("relation") in blocked
+                for i in range(len(path_nodes) - 1)
+            )
+            if via_blocked:
+                raise _nx.NetworkXNoPath  # treat as no semantic path
+        except (_nx.NetworkXNoPath, _nx.NodeNotFound):
+            if blocked:
+                # Retry with all edges allowed so we can tell the user
+                # what (if anything) connects them at all.
+                for u, v, d in G.edges(data=True):
+                    d["_path_weight"] = (
+                        10.0 if d.get("relation") == "contains" else 1.0
+                    )
+                try:
+                    via = _nx.shortest_path(G, src_nid, tgt_nid, weight="_path_weight")
+                    rels = [G.edges[via[i], via[i + 1]].get("relation", "")
+                            for i in range(len(via) - 1)]
+                    blocked_rels = {r for r in rels if r in blocked}
+                    if blocked_rels & FILE_RELS:
+                        note_kind = "co-location/imports"
+                    elif blocked_rels & NON_REACH_RELS:
+                        note_kind = "type-ref/rationale (no call/use chain)"
+                    else:
+                        note_kind = "structural"
+                    note = f" (only {note_kind} connects them — pass `--edges all` to see it)"
+                    print(f"No semantic path between '{source_label}' and "
+                          f"'{target_label}'.{note}")
+                    print(f"  via {','.join(sorted(blocked_rels)) or 'mixed'} ({len(via) - 1} hops): "
+                          f"{' → '.join(G.nodes[n].get('label', n) for n in via)}")
+                    sys.exit(0)
+                except (_nx.NetworkXNoPath, _nx.NodeNotFound):
+                    pass
+            hint = "" if include_inferred else " (try --include-inferred to widen)"
+            print(f"No path found between '{source_label}' and '{target_label}'.{hint}")
+            sys.exit(0)
+        hops = len(path_nodes) - 1
+        relations: list[str] = []
+        segments = []
+        for i in range(len(path_nodes) - 1):
+            u, v = path_nodes[i], path_nodes[i + 1]
+            edata = G.edges[u, v]
+            rel = edata.get("relation", "")
+            relations.append(rel)
+            conf = edata.get("confidence", "")
+            conf_str = f" [{conf}]" if conf else ""
+            if i == 0:
+                segments.append(G.nodes[u].get("label", u))
+            segments.append(f"--{rel}{conf_str}--> {G.nodes[v].get('label', v)}")
+        annotation = ""
+        if hops >= 2 and all(r == "contains" for r in relations):
+            annotation = "  (co-located only — these nodes share a parent file but have no semantic call/use edge between them)"
+        elif hops >= 2 and all(r in ("contains", "method") for r in relations):
+            annotation = "  (structural-only path: contains/method — no direct call edge between endpoints)"
+        # Lap-20 field-report fix: a path that traverses the file-import
+        # graph is graph-connected but not a call chain. Default
+        # `--edges reach` keeps file-import edges in (some users do want the
+        # file-graph view), but the rendered output reads as a multi-hop
+        # call path. Cheap hint: tell the agent the path is mostly
+        # file-imports and `--edges calls` would constrain to the runtime
+        # call graph. NOT a default change — the existing default stays.
+        # Lap-20b: loosen from "all imports_from" to "majority imports_from
+        # plus optional terminal contains/method", since a real-world all-
+        # imports chain typically lands on the target symbol via a final
+        # `contains` edge from a file node — that whole shape still has no
+        # runtime call meaning.
+        import_edges = sum(1 for r in relations if r in ("imports", "imports_from"))
+        terminal_structural_only = (
+            relations
+            and relations[-1] in ("contains", "method")
+            and all(r in ("imports", "imports_from") for r in relations[:-1])
+        )
+        # Trigger the hint only when the path is dominated by file-level
+        # imports — at least 2 import edges OR every edge is an import.
+        # A short 2-hop `imports + contains` chain (a single import landing
+        # on a symbol via its file) is not the failure mode the field
+        # report flagged; the dangerous case is a multi-hop import
+        # traversal that READS as a call path.
+        mostly_imports = hops >= 2 and (
+            (import_edges == hops)
+            or (import_edges >= 2 and terminal_structural_only)
+            or (hops >= 3 and import_edges >= hops - 1)
+        )
+        if mostly_imports and edge_mode != "calls":
+            annotation = ("  hint: try --edges calls — path traverses "
+                          "file-level imports, may not represent semantic "
+                          "call flow")
+        print(f"Shortest path ({hops} hops):\n  " + " ".join(segments))
+        if annotation:
+            print(annotation)
+
+    elif cmd == "explain":
+        if any(a in ("-h", "--help") for a in sys.argv[2:]):
+            _print_subcmd_help("explain")
+            return
+        if len(sys.argv) < 3:
+            print("Usage: graphify explain \"<node>\" [--graph path] [--include-inferred] [--limit N]", file=sys.stderr)
+            sys.exit(1)
+        from graphify.resolve import resolve_focus, label_index
+        from networkx.readwrite import json_graph
+        label = sys.argv[2]
+        graph_path = "graphify-out/graph.json"
+        include_inferred = False  # default: AST ground truth only, matching navigate
+        limit = 20
+        args = sys.argv[3:]
+        i = 0
+        while i < len(args):
+            a = args[i]
+            if a == "--graph" and i + 1 < len(args):
+                graph_path = args[i + 1]; i += 2
+            elif a == "--include-inferred":
+                include_inferred = True; i += 1
+            elif a == "--limit" and i + 1 < len(args):
+                limit = int(args[i + 1]); i += 2
+            elif a.startswith("--limit="):
+                limit = int(a.split("=", 1)[1]); i += 1
+            else:
+                i += 1
+        gp = Path(graph_path).resolve()
+        if not gp.exists():
+            print(f"error: graph file not found: {gp}", file=sys.stderr)
+            sys.exit(1)
+        _raw = json.loads(gp.read_text(encoding="utf-8"))
+        from graphify.build import build_from_json
+        # Lap-21: build_from_json restores edge direction from _src/_tgt
+        # — see the path-cmd comment for why node_link_graph isn't safe.
+        G = build_from_json(_raw, directed=True)
+        # Use navigate's resolver so explain accepts both `@<label>` and
+        # plain `<label>` and shares the prefix/substring/fuzzy ranking.
+        idx = label_index(G)
+        nid, candidates, match_type, _alts = resolve_focus(G, idx, label)
+        if nid is None:
+            if candidates:
+                from graphify.resolve import _is_archived_path
+                print(f"'{label}' is ambiguous ({len(candidates)} matches). qualify with the source path: e.g. `tools/foo.py/{label}` or `tools/foo/{label}` (extension optional). leading `_` on private symbols works either way. or re-call with a node ID below to bypass label resolution. pick from below:", file=sys.stderr)
+                for c in candidates[:5]:
+                    attrs = G.nodes[c]
+                    src = attrs.get("source_file") or ""
+                    loc = attrs.get("source_location") or ""
+                    archived = " [archived]" if _is_archived_path(src) else ""
+                    suffix = f"  — {src}{':' + loc if loc else ''}{archived}" if src else ""
+                    print(f"  - {attrs.get('label', c)}  [id: {c}]{suffix}", file=sys.stderr)
+            else:
+                print(f"No node matching '{label}' found.")
+            sys.exit(0 if not candidates else 1)
+        d = G.nodes[nid]
+        from graphify.analyze import _is_file_node
+        is_file = _is_file_node(G, nid)
+        print(f"Node: {d.get('label', nid)}")
+        print(f"  ID:        {nid}")
+        print(f"  Source:    {d.get('source_file', '')} {d.get('source_location', '')}".rstrip())
+        print(f"  Type:      {d.get('file_type', '')}")
+        print(f"  Community: {d.get('community', '')}")
+        print(f"  Degree:    {G.degree(nid)}")
+        if is_file:
+            # Lap-16 TS field-report friction 5: file-node `explain` was an
+            # unfiltered import dump that easily hit thousands of tokens.
+            # Replace it with a structural summary: counts by relation,
+            # top contains-children by degree, and import targets grouped
+            # so the agent gets orientation, not a fan-out wall.
+            from collections import Counter
+            DG = G if G.is_directed() else None
+            outgoing = []
+            for nb in G.neighbors(nid):
+                e = G.edges[nid, nb]
+                if not include_inferred and e.get("confidence") != "EXTRACTED":
+                    continue
+                outgoing.append((nb, e))
+            rel_count = Counter(e.get("relation", "") for _nb, e in outgoing)
+            contains_kids = [nb for nb, e in outgoing if e.get("relation") == "contains"]
+            import_targets = [nb for nb, e in outgoing
+                              if e.get("relation") in ("imports", "imports_from")]
+            non_struct = [nb for nb, e in outgoing
+                          if e.get("relation") not in ("contains", "method",
+                                                       "imports", "imports_from")]
+            print(f"\nStructure ({len(outgoing)} extracted edges):")
+            print(f"  Relations: " + ", ".join(f"{r}:{c}"
+                  for r, c in rel_count.most_common()))
+            if contains_kids:
+                top = sorted(contains_kids,
+                             key=lambda x: -G.degree(x))[:min(limit, 10)]
+                print(f"\nTop decls by degree (of {len(contains_kids)}):")
+                for nb in top:
+                    print(f"  --> {G.nodes[nb].get('label', nb)}  d={G.degree(nb)}")
+            if import_targets:
+                # Bucket: external module stubs vs internal file targets.
+                ext = [nb for nb in import_targets
+                       if G.nodes[nb].get("file_type") == "external"]
+                internal = [nb for nb in import_targets
+                            if G.nodes[nb].get("file_type") != "external"]
+                print(f"\nImports: {len(import_targets)} total — "
+                      f"{len(ext)} external, {len(internal)} internal")
+                # Sample top-fanout external imports so the agent sees what
+                # the file pulls from third-party land without listing all.
+                if ext:
+                    sample = sorted(ext, key=lambda x: -G.degree(x))[:5]
+                    print("  external (top-fanout): " +
+                          ", ".join(G.nodes[nb].get("label", nb) for nb in sample))
+            if non_struct:
+                print(f"\nNon-structural edges: {len(non_struct)} "
+                      f"(use `navigate @<file> out` to enumerate)")
+            return
+        neighbors = list(G.neighbors(nid))
+        # Filter by confidence (matching navigate's default) and sort
+        # EXTRACTED-first so the trustworthy edges aren't buried under
+        # bulk-tagged INFERRED noise.
+        def _edge_sort_key(nb):
+            e = G.edges[nid, nb]
+            ext = 0 if e.get("confidence") == "EXTRACTED" else 1
+            return (ext, -G.degree(nb))
+        neighbors_filtered = [
+            nb for nb in neighbors
+            if include_inferred or G.edges[nid, nb].get("confidence") == "EXTRACTED"
+        ]
+        dropped = len(neighbors) - len(neighbors_filtered)
+        if neighbors_filtered:
+            header = f"\nConnections ({len(neighbors_filtered)})"
+            if dropped > 0:
+                header += f" — {dropped} INFERRED hidden, --include-inferred to show"
+            print(header + ":")
+            sorted_nbrs = sorted(neighbors_filtered, key=_edge_sort_key)
+            # Lap-16 TS field-report friction 4: explain printed 20 identical
+            # `stagedDecode() [type_ref] [EXTRACTED]` lines. Group adjacent
+            # rows that share (label, relation, confidence) into a single
+            # collapsed entry once the run hits the threshold. Mirrors
+            # navigate's listing-collapse but operates on edge-tuples
+            # instead of node-summaries because explain renders edges, not
+            # nodes.
+            from graphify.navigate import _DUPE_COLLAPSE_THRESHOLD
+            def _row(nb):
+                e = G.edges[nid, nb]
+                return (G.nodes[nb].get("label", nb),
+                        e.get("relation", ""), e.get("confidence", ""))
+            collapsed_rows: list[tuple[str, str, str, int]] = []
+            i_idx = 0
+            while i_idx < len(sorted_nbrs):
+                key_row = _row(sorted_nbrs[i_idx])
+                j_idx = i_idx + 1
+                while j_idx < len(sorted_nbrs) and _row(sorted_nbrs[j_idx]) == key_row:
+                    j_idx += 1
+                count = j_idx - i_idx
+                collapsed_rows.append((*key_row, count))
+                i_idx = j_idx
+            prev_extracted: bool | None = None
+            boundary_inserted = False
+            shown = 0  # rendered lines so far
+            covered = 0  # underlying edges covered by rendered output
+            for label_, rel, conf, count in collapsed_rows:
+                if shown >= limit:
+                    break
+                is_ext = conf == "EXTRACTED"
+                if (not boundary_inserted and prev_extracted is True and not is_ext):
+                    print("  ── inferred below ──")
+                    boundary_inserted = True
+                prev_extracted = is_ext
+                # explain renders edges, not nodes — duplicates here are
+                # always graph artifacts (two edges with identical
+                # label/rel/conf). The listing-collapse threshold (≥5) makes
+                # sense for navigate's pivot listings where you want to see a
+                # few same-label rows; in explain even a count of 2 is just
+                # noise. Collapse anything ≥2 as `×N`.
+                if count >= 2:
+                    print(f"  --> {label_} [{rel}] [{conf}]  ×{count}")
+                    shown += 1
+                    covered += count
+                else:
+                    if shown < limit:
+                        print(f"  --> {label_} [{rel}] [{conf}]")
+                        shown += 1
+                        covered += 1
+            if covered < len(neighbors_filtered):
+                print(f"  ... and {len(neighbors_filtered) - covered} more")
+        elif dropped > 0:
+            print(f"\nNo EXTRACTED edges. {dropped} INFERRED edges hidden (use --include-inferred).")
+
+    elif cmd == "summarize":
+        # Lap-21 (Gemini #3): synthesize a one-call architectural overview
+        # from data the graph already carries — community hubs, entry
+        # points, edge composition, language mix, freshness. The agent
+        # lands with a primer instead of having to run shape on a guess
+        # first.
+        if any(a in ("-h", "--help") for a in sys.argv[2:]):
+            _print_subcmd_help("summarize")
+            return
+        from graphify.navigate import DEFAULT_GRAPH_PATH, load_graph
+        from collections import Counter as _Counter
+        graph_path = DEFAULT_GRAPH_PATH
+        args = sys.argv[2:]
+        i = 0
+        while i < len(args):
+            a = args[i]
+            if a == "--graph" and i + 1 < len(args):
+                graph_path = args[i + 1]; i += 2
+            elif a.startswith("--graph="):
+                graph_path = a.split("=", 1)[1]; i += 1
+            else:
+                i += 1
+        gp = Path(graph_path)
+        # cli_auto_build candidate: load_graph auto-builds when missing.
+        G, communities = load_graph(gp)
+
+        # Top-line stats.
+        n_nodes = G.number_of_nodes()
+        n_edges = G.number_of_edges()
+        n_communities = len(communities)
+        unique_files = {a.get("source_file") for _, a in G.nodes(data=True)
+                        if a.get("source_file")}
+        n_files = len(unique_files)
+
+        # Top communities by member count, label = hub.
+        comm_labels = G.graph.get("community_labels") or {}
+        comm_sizes = sorted(communities.items(),
+                             key=lambda kv: -len(kv[1]))[:5]
+        # Cross-file entry points: top fns by non-structural in-edges
+        # from a different source_file. Skip method-shape labels
+        # (`.foo()`) — those are member calls (`.get`, `.append`,
+        # `.set`, `.items`) that swamp real entry-point ranking; the
+        # entry point of a class is the class itself, not its methods.
+        from graphify.navigate import _STRUCTURAL
+        entry_pts: list[tuple[str, int, str]] = []
+        for nid, attrs in G.nodes(data=True):
+            label = attrs.get("label", "")
+            if not (isinstance(label, str) and label.endswith("()")):
+                continue
+            if label.startswith("."):
+                continue
+            # Require an actual source location — primitives bound to
+            # globals (`str`, `dict`) leak in as nodes without source.
+            if not attrs.get("source_file"):
+                continue
+            sf = attrs.get("source_file") or ""
+            ext_in = 0
+            for u in G.predecessors(nid):
+                ufile = G.nodes[u].get("source_file") or ""
+                if not ufile or ufile == sf:
+                    continue
+                if G.edges[u, nid].get("relation") in _STRUCTURAL:
+                    continue
+                ext_in += 1
+            if ext_in > 0:
+                entry_pts.append((label, ext_in, sf))
+        entry_pts.sort(key=lambda t: (-t[1], t[0]))
+        top_entries = entry_pts[:5]
+        # Edge composition.
+        rel_counts: _Counter = _Counter()
+        for _, _, d in G.edges(data=True):
+            rel_counts[d.get("relation") or "<unset>"] += 1
+        # Language mix by extension.
+        ext_counts: _Counter = _Counter()
+        for sf in unique_files:
+            if not sf:
+                continue
+            from pathlib import Path as _Path
+            ext = _Path(sf).suffix.lower() or "<no-ext>"
+            ext_counts[ext] += 1
+
+        print(f"  graphify summarize: {gp}")
+        print(f"  {n_nodes} nodes · {n_edges} edges · {n_communities} communities · "
+              f"{n_files} files")
+        if comm_sizes:
+            print()
+            print("  Top communities (by hub):")
+            for cid, members in comm_sizes:
+                hub_label = comm_labels.get(cid, "?")
+                print(f"    c{cid:<3} {hub_label:<32} {len(members)} members")
+        if top_entries:
+            print()
+            print("  Entry points (cross-file callers):")
+            for lab, n, _sf in top_entries:
+                print(f"    {lab:<36} ×{n}")
+        if rel_counts:
+            print()
+            total_rel = sum(rel_counts.values())
+            top_rels = rel_counts.most_common(5)
+            mix = " · ".join(f"{r} {c*100//total_rel}%" for r, c in top_rels)
+            print(f"  Edge mix: {mix}")
+        if ext_counts:
+            top_exts = ext_counts.most_common(5)
+            mix = " · ".join(f"{ext} ({c})" for ext, c in top_exts)
+            print(f"  Languages: {mix}")
+        banner = G.graph.get("_freshness_banner")
+        if banner:
+            print()
+            print(f"  {banner.strip()}")
+
+    elif cmd == "changed":
+        if any(a in ("-h", "--help") for a in sys.argv[2:]):
+            _print_subcmd_help("changed")
+            return
+        # Lap-3 wishlist #1: surface nodes added/modified/removed since a
+        # reference point (git ref or graph extract). After commits the
+        # agent wants to navigate to the diff, not blind-search for new
+        # symbols.
+        ref: str | None = None
+        graph_path = "graphify-out/graph.json"
+        args = sys.argv[2:]
+        i = 0
+        while i < len(args):
+            a = args[i]
+            if a == "--graph" and i + 1 < len(args):
+                graph_path = args[i + 1]; i += 2
+            elif a.startswith("--graph="):
+                graph_path = a.split("=", 1)[1]; i += 1
+            elif a in ("--since-commit", "--since") and i + 1 < len(args):
+                # Lap-21 polish: discoverable named flag for the positional
+                # ref. The positional is still supported for back-compat.
+                ref = args[i + 1]; i += 2
+            elif a.startswith("--since-commit="):
+                ref = a.split("=", 1)[1]; i += 1
+            elif a.startswith("--since="):
+                ref = a.split("=", 1)[1]; i += 1
+            elif a.startswith("--"):
+                i += 1
+            else:
+                ref = a; i += 1
+        gp = Path(graph_path).resolve()
+        if not gp.exists():
+            print(f"error: graph file not found: {gp}", file=sys.stderr)
+            sys.exit(1)
+        from collections import defaultdict
+        from graphify.build import build_from_json
+        _raw = json.loads(gp.read_text(encoding="utf-8"))
+        G = build_from_json(_raw, directed=True)
+        # Build resolved-path → [node_ids] index from the graph.
+        file_to_nodes: dict[str, list[str]] = defaultdict(list)
+        for nid, attrs in G.nodes(data=True):
+            sf = attrs.get("source_file")
+            if not sf:
+                continue
+            try:
+                key = str(Path(sf).resolve())
+            except OSError:
+                key = str(sf)
+            file_to_nodes[key].append(nid)
+        root = Path(".").resolve()
+        if ref:
+            import subprocess
+            try:
+                res = subprocess.run(
+                    ["git", "diff", "--name-only", ref],
+                    cwd=str(root), capture_output=True, text=True, timeout=15,
+                )
+                if res.returncode != 0:
+                    print(f"git diff failed: {res.stderr.strip()}", file=sys.stderr)
+                    sys.exit(1)
+                changed_files = [p.strip() for p in res.stdout.splitlines() if p.strip()]
+            except (subprocess.TimeoutExpired, FileNotFoundError):
+                print("git not available or timed out", file=sys.stderr)
+                sys.exit(1)
+            since_label = f"vs {ref}"
+        else:
+            from graphify.detect import CODE_EXTENSIONS
+            import os as _os
+            graph_mtime = gp.stat().st_mtime
+            # Heavy directories that almost never contain user code we want
+            # to track. Pruning at the directory level (vs per-file filter)
+            # is the difference between ~60s and <2s on repos with large
+            # vendored trees (lap-11 friction report). os.walk lets us
+            # mutate `dirnames` in place to skip whole subtrees.
+            _SKIP_DIRS = {
+                "node_modules", "target", "build", "dist", "out", "vendor",
+                "venv", ".venv", "env", ".env",
+                "__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache",
+                ".git", "graphify-out",
+                "coverage", ".coverage", ".tox", ".nox",
+                "bower_components", "jspm_packages",
+                ".next", ".nuxt", ".turbo", ".cache",
+            }
+            changed_files = []
+            for dirpath, dirnames, filenames in _os.walk(str(root), topdown=True):
+                # Mutate dirnames in place so os.walk skips these subtrees.
+                # Also skip dot-prefixed dirs (preserves the previous
+                # behavior of pruning hidden dirs at any depth).
+                dirnames[:] = [d for d in dirnames
+                               if d not in _SKIP_DIRS and not d.startswith(".")]
+                for fn in filenames:
+                    # Cheap suffix gate first — vast majority of files
+                    # in even a pruned tree aren't code.
+                    if "." not in fn:
+                        continue
+                    suf = fn[fn.rfind("."):].lower()
+                    if suf not in CODE_EXTENSIONS:
+                        continue
+                    f = Path(dirpath) / fn
+                    try:
+                        if f.stat().st_mtime > graph_mtime:
+                            changed_files.append(str(f.relative_to(root)))
+                    except OSError:
+                        continue
+            since_label = "since graph extract"
+        # Bucket files relative to the graph's known set.
+        modified: list[tuple[str, list[str]]] = []
+        added: list[str] = []
+        seen_resolved: set[str] = set()
+        for rel in changed_files:
+            full = (root / rel).resolve()
+            seen_resolved.add(str(full))
+            if str(full) in file_to_nodes and full.exists():
+                modified.append((rel, file_to_nodes[str(full)]))
+            elif full.exists():
+                added.append(rel)
+        removed: list[tuple[str, list[str]]] = []
+        for resolved, nids in file_to_nodes.items():
+            if not Path(resolved).exists():
+                try:
+                    pretty = str(Path(resolved).relative_to(root))
+                except ValueError:
+                    pretty = resolved
+                removed.append((pretty, nids))
+        if not (modified or added or removed):
+            print(f"changed {since_label}: no code files changed.")
+        else:
+            print(f"changed {since_label}: "
+                  f"{len(modified)} modified · {len(added)} added · {len(removed)} removed")
+            for rel, nids in sorted(modified):
+                labels = [G.nodes[n].get("label", n) for n in nids[:5]]
+                more = f" +{len(nids)-5}" if len(nids) > 5 else ""
+                print(f"  M {rel}  ({len(nids)} nodes: {', '.join(labels)}{more})")
+            for rel in sorted(added):
+                print(f"  A {rel}  (not in graph — `graphify update .` to index)")
+            for rel, nids in sorted(removed):
+                labels = [G.nodes[n].get("label", n) for n in nids[:5]]
+                more = f" +{len(nids)-5}" if len(nids) > 5 else ""
+                print(f"  D {rel}  ({len(nids)} stale nodes: {', '.join(labels)}{more})")
+            if added or removed:
+                print("  re-run `graphify update .` to refresh added/removed nodes.")
+            if modified:
+                print("  jump: `graphify navigate \"@<label>\"` for any modified node.")
+
+    elif cmd == "peek":
+        # One-shot body read. Resolves a target like navigate's `@<label>`
+        # (full prefix/substring/fuzzy + path-qualifier ladder), dumps the
+        # body, touches no cursor / no session / no recent-paths log.
+        # Pairs with `read` (the in-session flow) — `peek` is for
+        # "what does this 20-line function do?" without committing to
+        # a navigation chain.
+        # Lap-21 #2 (sub-agent head-to-head): when `peek <Class>` resolves
+        # to a class node, switch to a curated dump — class header +
+        # each method's signature + N body lines — instead of dumping
+        # the entire class body. Saves the 5-call walk to find/peek
+        # individual methods.
+        if any(a in ("-h", "--help") for a in sys.argv[2:]):
+            _print_subcmd_help("peek")
+            return
+        from graphify.navigate import (
+            DEFAULT_GRAPH_PATH, load_graph,
+            _read_body_full, _render_body_text, _read_body_preview,
+        )
+        from graphify.resolve import label_index, resolve_focus
+        from graphify.analyze import _is_file_node
+        args = sys.argv[2:]
+        graph_path = DEFAULT_GRAPH_PATH
+        max_lines = 200
+        bodies = 3       # lines per method when peeking a class
+        method_limit = 12  # cap on methods shown in curated dump
+        md = False
+        target: str | None = None
+        i = 0
+        while i < len(args):
+            a = args[i]
+            if a == "--graph" and i + 1 < len(args):
+                graph_path = args[i + 1]; i += 2
+            elif a.startswith("--graph="):
+                graph_path = a.split("=", 1)[1]; i += 1
+            elif a == "--lines" and i + 1 < len(args):
+                max_lines = max(1, int(args[i + 1])); i += 2
+            elif a.startswith("--lines="):
+                max_lines = max(1, int(a.split("=", 1)[1])); i += 1
+            elif a == "--bodies" and i + 1 < len(args):
+                bodies = max(0, int(args[i + 1])); i += 2
+            elif a.startswith("--bodies="):
+                bodies = max(0, int(a.split("=", 1)[1])); i += 1
+            elif a == "--md":
+                md = True; i += 1
+            elif target is None:
+                target = a; i += 1
+            else:
+                # Multiple positional args isn't currently meaningful; treat
+                # the first as the target and ignore the rest with a warning
+                # rather than silently dropping them.
+                print(f"warning: ignoring extra arg `{a}`. peek takes a single target.",
+                      file=sys.stderr)
+                i += 1
+        if not target:
+            print("Usage: graphify peek <symbol> [--lines N] [--md] [--graph PATH]",
+                  file=sys.stderr)
+            sys.exit(1)
+        gp = Path(graph_path)
+        # cli_auto_build candidate: load_graph auto-builds when missing.
+        G, _comm = load_graph(gp)
+        idx = label_index(G)
+        chosen, candidates, match_type, _alts = resolve_focus(G, idx, target)
+        if not chosen:
+            if candidates:
+                # Multiple matches — print a short disambig list so the
+                # caller can re-run with a more specific target. We
+                # don't run a full disambig listing here because peek
+                # is one-shot; resolution is the agent's job.
+                print(f"ambiguous `{target}` ({len(candidates)} matches). "
+                      f"qualify with @<dir>/<file>/<symbol>:", file=sys.stderr)
+                for nid in candidates[:8]:
+                    a = G.nodes[nid]
+                    sf = a.get("source_file", "?")
+                    loc = a.get("source_location", "")
+                    label = a.get("label", nid)
+                    print(f"  {label}  {sf}{':' + loc[1:] if loc.startswith('L') else ''}",
+                          file=sys.stderr)
+                if len(candidates) > 8:
+                    print(f"  +{len(candidates) - 8} more", file=sys.stderr)
+                sys.exit(1)
+            print(f"no node matches `{target}`.", file=sys.stderr)
+            sys.exit(1)
+        if match_type and match_type != "exact":
+            chosen_label = G.nodes[chosen].get("label", chosen)
+            print(f"# matched `{target}` → {chosen_label} ({match_type})")
+        nattrs = G.nodes[chosen]
+        sf = nattrs.get("source_file")
+        loc = nattrs.get("source_location")
+        node_kind = nattrs.get("node_kind") or ""
+
+        # Lap-21 #2: curated dump for classes. Land on the class header
+        # + each method's sig + first N body lines. The agent gets a
+        # one-call orientation instead of:
+        #   1. peek Class            (gets a 200-line body wall)
+        #   2. navigate @Class methods   (lists method ids)
+        #   3. peek Class.method_a   (4-5 times, one per method)
+        # Reuses _read_body_preview for per-method body windows.
+        if node_kind in ("class", "interface") and sf and loc:
+            label = nattrs.get("label", chosen)
+            # Walk the class's methods via successor edges (`method` or
+            # `contains`). Sort by start-line so the dump reads top-to-
+            # bottom in source order — matches an agent reading the file.
+            method_ids: list[str] = []
+            for v in G.successors(chosen):
+                rel = G.edges[chosen, v].get("relation") or ""
+                if rel not in ("method", "contains"):
+                    continue
+                v_kind = G.nodes[v].get("node_kind") or ""
+                v_label = G.nodes[v].get("label", "")
+                # Functions/methods only — skip nested classes, types, etc.
+                if v_kind in ("class", "interface", "type_alias"):
+                    continue
+                if not (v_label.endswith("()") or v_kind in
+                        ("method", "impl_method", "iface_method", "function")):
+                    continue
+                method_ids.append(v)
+
+            def _start_line(nid: str) -> int:
+                vloc = G.nodes[nid].get("source_location") or ""
+                if vloc.startswith("L"):
+                    try:
+                        return int(vloc[1:].split("-", 1)[0].split(":", 1)[0])
+                    except ValueError:
+                        return 1 << 30
+                return 1 << 30
+            method_ids.sort(key=_start_line)
+
+            # Print header.
+            loc_short = loc[1:] if loc.startswith("L") else loc
+            kind_word = "class" if node_kind == "class" else "interface"
+            print(f"  peek {kind_word} @{label}  {sf}:{loc_short}  "
+                  f"({len(method_ids)} method(s))")
+            # Class header line — first line of class body, single line.
+            class_head, _ln, _trunc = _read_body_full(
+                sf, loc, max_lines=1, flat=True
+            )
+            if class_head:
+                print(f"  {class_head[0].strip()}")
+
+            shown = method_ids[:method_limit]
+            for idx, mid in enumerate(shown, 1):
+                m = G.nodes[mid]
+                m_label = m.get("label", mid) or mid
+                m_loc = m.get("source_location") or ""
+                m_loc_short = m_loc[1:] if m_loc.startswith("L") else ""
+                # Strip leading dot for display since we already announced
+                # "class Foo" — `.foo()` reads as `foo()` in this scope.
+                disp = m_label.lstrip(".") if m_label.startswith(".") else m_label
+                preview = _read_body_preview(
+                    m.get("source_file") or sf, m_loc, n=max(1, bodies + 1)
+                )
+                print(f"    [{idx}] {disp}  L{m_loc_short}" if m_loc_short
+                      else f"    [{idx}] {disp}")
+                # First entry is the signature line; stripped to one line.
+                # Indent body lines so the per-method block reads as a unit.
+                for j, line in enumerate(preview or []):
+                    if j == 0:
+                        # _read_body_preview already returns the header.
+                        # Skip if it just repeats the label-only sig (rare;
+                        # body_preview falls back when source unreadable).
+                        if line.strip().startswith("def ") or line.strip().startswith(
+                            ("async def ", "function ", "static ", "public ", "private ", "protected ", "export ", "constructor")
+                        ) or "(" in line:
+                            print(f"        {line.strip()}")
+                            continue
+                    print(f"        {line.rstrip()}")
+            more = len(method_ids) - len(shown)
+            if more > 0:
+                print(f"    +{more} more — `peek {label}.<method>` for individual bodies")
+            return
+
+        is_file = _is_file_node(G, chosen)
+        body, ln, trunc = _read_body_full(sf, loc, max_lines=max_lines, flat=is_file)
+        data = {
+            "type": "body",
+            "label": nattrs.get("label", chosen),
+            "source_file": sf,
+            "source_location": loc,
+            "lines": body,
+            "start_line": ln,
+            "truncated": trunc,
+        }
+        print(_render_body_text(data, md=md))
+
+    elif cmd == "locate":
+        # Lap-21 (R3 sub-agent feedback): multi-symbol file:line lookup,
+        # no body. R3-A's graphify agent ran 3 separate navigates to
+        # find the line ranges of 3 GeometryAnalyzer methods — locate
+        # collapses that to one call. Resolution mirrors peek's
+        # (full prefix/substring/fuzzy ladder + path qualifier) so an
+        # agent reaches for the same disambiguation forms it already
+        # uses on peek/navigate. Best-effort batch: a missed or ambig
+        # symbol prints a per-row note but doesn't fail the whole call;
+        # exit 1 only when every symbol misses.
+        if any(a in ("-h", "--help") for a in sys.argv[2:]):
+            _print_subcmd_help("locate")
+            return
+        from graphify.navigate import DEFAULT_GRAPH_PATH, load_graph
+        from graphify.resolve import label_index, resolve_focus
+        args = sys.argv[2:]
+        graph_path = DEFAULT_GRAPH_PATH
+        targets: list[str] = []
+        i = 0
+        while i < len(args):
+            a = args[i]
+            if a == "--graph" and i + 1 < len(args):
+                graph_path = args[i + 1]; i += 2
+            elif a.startswith("--graph="):
+                graph_path = a.split("=", 1)[1]; i += 1
+            else:
+                targets.append(a); i += 1
+        if not targets:
+            print("Usage: graphify locate <symbol> [<symbol> ...] [--graph PATH]",
+                  file=sys.stderr)
+            sys.exit(1)
+        gp = Path(graph_path)
+        # cli_auto_build candidate: load_graph auto-builds when missing.
+        G, _comm = load_graph(gp)
+        idx = label_index(G)
+
+        def _fmt_loc(loc: str) -> str:
+            # Mirror peek's ambig-list convention: `L42-89` → `42-89`.
+            return loc[1:] if isinstance(loc, str) and loc.startswith("L") else (loc or "?")
+
+        print(f"locate: {len(targets)} target{'s' if len(targets) != 1 else ''}")
+        hits = 0
+        for t in targets:
+            chosen, candidates, match_type, _alts = resolve_focus(G, idx, t)
+            if chosen:
+                hits += 1
+                a = G.nodes[chosen]
+                label = a.get("label", chosen)
+                sf = a.get("source_file") or "?"
+                loc = a.get("source_location") or ""
+                tag = f" ({match_type})" if match_type and match_type != "exact" else ""
+                print(f"  {label:<32} {sf}:{_fmt_loc(loc)}{tag}")
+            elif candidates:
+                # Surface up to 3 candidate locations so the agent can
+                # re-issue locate with a path-qualifier without an extra
+                # navigate call. The `qualify with` hint names the form.
+                print(f"  {t:<32} ambiguous ({len(candidates)}) — "
+                      f"qualify with @<dir>/<file>/<sym>")
+                for nid in candidates[:3]:
+                    a = G.nodes[nid]
+                    sf = a.get("source_file") or "?"
+                    loc = a.get("source_location") or ""
+                    print(f"      → {sf}:{_fmt_loc(loc)}")
+                if len(candidates) > 3:
+                    print(f"      → +{len(candidates) - 3} more")
+            else:
+                print(f"  {t:<32} not found")
+        if hits == 0:
+            sys.exit(1)
+
+    elif cmd == "doc":
+        # One-shot rationale dump. Field-report wish: "I had to pivot from
+        # `sector_transition_entropy` → method → docstring manually." `doc`
+        # collapses that to a single call: resolve symbol, walk
+        # rationale_for edges, dump signature + docstrings.
+        if any(a in ("-h", "--help") for a in sys.argv[2:]):
+            _print_subcmd_help("doc")
+            return
+        from graphify.navigate import (
+            DEFAULT_GRAPH_PATH, load_graph,
+            doc_node, _render_doc_text,
+        )
+        from graphify.resolve import label_index, resolve_focus
+        args = sys.argv[2:]
+        graph_path = DEFAULT_GRAPH_PATH
+        max_lines = 40
+        md = False
+        fmt = "text"
+        target: str | None = None
+        i = 0
+        while i < len(args):
+            a = args[i]
+            if a == "--graph" and i + 1 < len(args):
+                graph_path = args[i + 1]; i += 2
+            elif a.startswith("--graph="):
+                graph_path = a.split("=", 1)[1]; i += 1
+            elif a == "--lines" and i + 1 < len(args):
+                max_lines = max(1, int(args[i + 1])); i += 2
+            elif a.startswith("--lines="):
+                max_lines = max(1, int(a.split("=", 1)[1])); i += 1
+            elif a == "--md":
+                md = True; i += 1
+            elif a == "--json":
+                fmt = "json"; i += 1
+            elif target is None:
+                target = a; i += 1
+            else:
+                print(f"warning: ignoring extra arg `{a}`. doc takes a single target.",
+                      file=sys.stderr)
+                i += 1
+        if not target:
+            print("Usage: graphify doc <symbol> [--lines N] [--md] [--json] [--graph PATH]",
+                  file=sys.stderr)
+            sys.exit(1)
+        gp = Path(graph_path)
+        # cli_auto_build candidate: load_graph auto-builds when missing.
+        G, _comm = load_graph(gp)
+        idx = label_index(G)
+        chosen, candidates, match_type, _alts = resolve_focus(G, idx, target)
+        if not chosen:
+            if candidates:
+                print(f"ambiguous `{target}` ({len(candidates)} matches). "
+                      f"qualify with @<dir>/<file>/<symbol>:", file=sys.stderr)
+                for nid in candidates[:8]:
+                    a = G.nodes[nid]
+                    sf = a.get("source_file", "?")
+                    loc = a.get("source_location", "")
+                    label = a.get("label", nid)
+                    print(f"  {label}  {sf}{':' + loc[1:] if loc.startswith('L') else ''}",
+                          file=sys.stderr)
+                if len(candidates) > 8:
+                    print(f"  +{len(candidates) - 8} more", file=sys.stderr)
+                sys.exit(1)
+            print(f"no node matches `{target}`.", file=sys.stderr)
+            sys.exit(1)
+        if match_type and match_type != "exact":
+            chosen_label = G.nodes[chosen].get("label", chosen)
+            print(f"# matched `{target}` → {chosen_label} ({match_type})")
+        data = doc_node(G, chosen, max_rationale_lines=max_lines)
+        if fmt == "json":
+            print(json.dumps(data))
+        else:
+            print(_render_doc_text(data, md=md))
+
+    elif cmd == "shape":
+        # File-shape summary: "N classes, M fns, K consts, X imports,
+        # longest fn=foo() (200 ln)". Equivalent of `wc -l + ctags --list`
+        # for orientation. Read-only one-shot — no cursor, no session.
+        if any(a in ("-h", "--help") for a in sys.argv[2:]):
+            _print_subcmd_help("shape")
+            return
+        from graphify.navigate import (
+            DEFAULT_GRAPH_PATH, load_graph,
+            shape_file, _render_shape_text,
+        )
+        from graphify.resolve import label_index, resolve_focus
+        from graphify.analyze import _is_file_node
+        args = sys.argv[2:]
+        graph_path = DEFAULT_GRAPH_PATH
+        target: str | None = None
+        fmt = "text"
+        # Default 8: a one-screen summary keeps shape useful as a cold-start
+        # primitive. `--limit N` widens; `--all` returns the full lists.
+        shape_limit: int | None = 8
+        i = 0
+        while i < len(args):
+            a = args[i]
+            if a == "--graph" and i + 1 < len(args):
+                graph_path = args[i + 1]; i += 2
+            elif a.startswith("--graph="):
+                graph_path = a.split("=", 1)[1]; i += 1
+            elif a == "--json":
+                fmt = "json"; i += 1
+            elif a == "--all":
+                shape_limit = None; i += 1
+            elif a == "--limit" and i + 1 < len(args):
+                shape_limit = max(1, int(args[i + 1])); i += 2
+            elif a.startswith("--limit="):
+                shape_limit = max(1, int(a.split("=", 1)[1])); i += 1
+            elif target is None:
+                target = a; i += 1
+            else:
+                print(f"warning: ignoring extra arg `{a}`. shape takes a single target.",
+                      file=sys.stderr)
+                i += 1
+        if not target:
+            print("Usage: graphify shape <file> [--limit N | --all] [--json] [--graph PATH]",
+                  file=sys.stderr)
+            sys.exit(1)
+        gp = Path(graph_path)
+        # cli_auto_build candidate: load_graph auto-builds when missing.
+        G, _comm = load_graph(gp)
+        idx = label_index(G)
+        chosen, candidates, match_type, _alts = resolve_focus(G, idx, target)
+        if not chosen:
+            if candidates:
+                print(f"ambiguous `{target}` ({len(candidates)} matches). "
+                      f"qualify with @<dir>/<file>:", file=sys.stderr)
+                for nid in candidates[:8]:
+                    a = G.nodes[nid]
+                    sf = a.get("source_file", "?")
+                    print(f"  {a.get('label', nid)}  {sf}", file=sys.stderr)
+                sys.exit(1)
+            print(f"no node matches `{target}`.", file=sys.stderr)
+            sys.exit(1)
+        if not _is_file_node(G, chosen):
+            # `shape` only makes sense on a file. If the agent landed on
+            # a class/fn, redirect to the file containing it.
+            sf = G.nodes[chosen].get("source_file")
+            print(f"error: `{target}` resolved to {G.nodes[chosen].get('label', chosen)} "
+                  f"(not a file). try `graphify shape \"@{sf}\"` if you meant the file.",
+                  file=sys.stderr)
+            sys.exit(1)
+        data = shape_file(G, chosen, limit=shape_limit)
+        if fmt == "json":
+            print(json.dumps(data))
+        else:
+            print(_render_shape_text(data))
+
+    elif cmd == "search":
+        # Body-text search across nodes. Walks each non-archived code-file,
+        # greps for the pattern, attributes each match line to the deepest
+        # enclosing node so the agent gets back symbol context (label,
+        # community, degree) instead of naked file:line tuples. Eliminates
+        # the grep fallback for "where does this string appear in code".
+        if any(a in ("-h", "--help") for a in sys.argv[2:]):
+            _print_subcmd_help("search")
+            return
+        from graphify.navigate import (
+            DEFAULT_GRAPH_PATH, load_graph, search_bodies, _render_search_text,
+        )
+        args = sys.argv[2:]
+        graph_path = DEFAULT_GRAPH_PATH
+        pattern: str | None = None
+        kind = "code"
+        archived_mode = "no"
+        limit = 50
+        # Default 1 line of pre/post context: a single match line on its own
+        # rarely disambiguates definition vs call vs string literal vs comment.
+        # The field-report from another Claude flagged --context 0 (the prior
+        # default) as forcing a follow-up `peek` per hit. --context 0 still
+        # disables context for callers who explicitly want minimal output.
+        context = 1
+        by_symbol = False
+        md = False
+        fmt = "text"
+        i = 0
+        while i < len(args):
+            a = args[i]
+            if a == "--graph" and i + 1 < len(args):
+                graph_path = args[i + 1]; i += 2
+            elif a.startswith("--graph="):
+                graph_path = a.split("=", 1)[1]; i += 1
+            elif a == "--kind" and i + 1 < len(args):
+                kind = args[i + 1]; i += 2
+            elif a.startswith("--kind="):
+                kind = a.split("=", 1)[1]; i += 1
+            elif a == "--no-archived":
+                archived_mode = "no"; i += 1
+            elif a == "--archived-only":
+                archived_mode = "only"; i += 1
+            elif a == "--all-archived":
+                archived_mode = "all"; i += 1
+            elif a == "--limit" and i + 1 < len(args):
+                limit = max(1, int(args[i + 1])); i += 2
+            elif a.startswith("--limit="):
+                limit = max(1, int(a.split("=", 1)[1])); i += 1
+            elif a == "--context" and i + 1 < len(args):
+                context = max(0, int(args[i + 1])); i += 2
+            elif a.startswith("--context="):
+                context = max(0, int(a.split("=", 1)[1])); i += 1
+            elif a == "--by-symbol":
+                by_symbol = True; i += 1
+            elif a == "--md":
+                md = True; i += 1
+            elif a == "--json":
+                fmt = "json"; i += 1
+            elif pattern is None:
+                pattern = a; i += 1
+            else:
+                # `graphify search foo bar` — concatenate as alternation? No,
+                # safer to error out. The user can quote the regex if they
+                # need spaces.
+                print(f"warning: ignoring extra arg `{a}`. search takes a single pattern.",
+                      file=sys.stderr)
+                i += 1
+        if not pattern:
+            print("Usage: graphify search <pattern> [--kind code|rationale|all] "
+                  "[--limit N] [--context N] [--by-symbol] [--md] [--json] "
+                  "[--no-archived|--archived-only|--all-archived] [--graph PATH]",
+                  file=sys.stderr)
+            sys.exit(1)
+        if kind not in ("code", "rationale", "all"):
+            print(f"error: --kind must be one of code|rationale|all (got `{kind}`)",
+                  file=sys.stderr)
+            sys.exit(1)
+        gp = Path(graph_path)
+        # cli_auto_build candidate: load_graph auto-builds when missing.
+        G, _comm = load_graph(gp)
+        data = search_bodies(G, pattern, kind=kind,
+                              archived_mode=archived_mode,
+                              limit=limit, context=context,
+                              by_symbol=by_symbol)
+        if fmt == "json":
+            print(json.dumps(data))
+        else:
+            print(_render_search_text(data, md=md))
+
+    elif cmd == "add":
+        if len(sys.argv) < 3:
+            print("Usage: graphify add <url> [--author Name] [--contributor Name] [--dir ./raw]", file=sys.stderr)
+            sys.exit(1)
+        from graphify.ingest import ingest as _ingest
+        url = sys.argv[2]
+        author: str | None = None
+        contributor: str | None = None
+        target_dir = Path("raw")
+        args = sys.argv[3:]
+        i = 0
+        while i < len(args):
+            if args[i] == "--author" and i + 1 < len(args):
+                author = args[i + 1]; i += 2
+            elif args[i] == "--contributor" and i + 1 < len(args):
+                contributor = args[i + 1]; i += 2
+            elif args[i] == "--dir" and i + 1 < len(args):
+                target_dir = Path(args[i + 1]); i += 2
+            else:
+                i += 1
+        try:
+            saved = _ingest(url, target_dir, author=author, contributor=contributor)
+            print(f"Saved to {saved}")
+            print("Run /graphify --update in your AI assistant to update the graph.")
+        except Exception as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            sys.exit(1)
+
+    elif cmd == "watch":
+        watch_path = Path(sys.argv[2]) if len(sys.argv) > 2 else Path(".")
+        if not watch_path.exists():
+            print(f"error: path not found: {watch_path}", file=sys.stderr)
+            sys.exit(1)
+        from graphify.watch import watch as _watch
+        try:
+            _watch(watch_path)
+        except ImportError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            sys.exit(1)
+
+    elif cmd == "cluster-only":
+        watch_path = Path(sys.argv[2]) if len(sys.argv) > 2 else Path(".")
+        graph_json = watch_path / "graphify-out" / "graph.json"
+        if not graph_json.exists():
+            print(f"error: no graph found at {graph_json} — run /graphify first", file=sys.stderr)
+            sys.exit(1)
+        from networkx.readwrite import json_graph as _jg
+        from graphify.build import build_from_json
+        from graphify.cluster import cluster, score_all
+        from graphify.analyze import god_nodes, surprising_connections, suggest_questions
+        from graphify.report import generate
+        from graphify.export import to_json, to_html
+        print("Loading existing graph...")
+        _raw = json.loads(graph_json.read_text(encoding="utf-8"))
+        G = build_from_json(_raw)
+        print(f"Graph: {G.number_of_nodes()} nodes, {G.number_of_edges()} edges")
+        print("Re-clustering...")
+        communities = cluster(G)
+        cohesion = score_all(G, communities)
+        gods = god_nodes(G)
+        surprises = surprising_connections(G, communities)
+        labels = {cid: f"Community {cid}" for cid in communities}
+        questions = suggest_questions(G, communities, labels)
+        tokens = {"input": 0, "output": 0}
+        report = generate(G, communities, cohesion, labels, gods, surprises,
+                          {"warning": "cluster-only mode — file stats not available"},
+                          tokens, str(watch_path), suggested_questions=questions)
+        out = watch_path / "graphify-out"
+        (out / "GRAPH_REPORT.md").write_text(report, encoding="utf-8")
+        to_json(G, communities, str(out / "graph.json"))
+        to_html(G, communities, str(out / "graph.html"), community_labels=labels or None)
+        print(f"Done — {len(communities)} communities. GRAPH_REPORT.md, graph.json and graph.html updated.")
+
+    elif cmd == "update":
+        watch_path = Path(sys.argv[2]) if len(sys.argv) > 2 else Path(".")
+        if not watch_path.exists():
+            print(f"error: path not found: {watch_path}", file=sys.stderr)
+            sys.exit(1)
+        from graphify.watch import _rebuild_code
+        print(f"Re-extracting code files in {watch_path} (no LLM needed)...")
+        ok = _rebuild_code(watch_path)
+        if ok:
+            print("Code graph updated. For doc/paper/image changes run /graphify --update in your AI assistant.")
+        else:
+            print("Nothing to update or rebuild failed — check output above.", file=sys.stderr)
+            sys.exit(1)
+
+    elif cmd == "navigate" or cmd == "nav":
+        from graphify.navigate import navigate, DEFAULT_GRAPH_PATH, LIST_LIMIT
+        # Parse: --graph PATH, --session <id>, --no-session, --json|--format json,
+        # --include-inferred, --extracted-only (no-op alias for back-compat),
+        # --min-confidence FLOAT, --legend, --no-ops-hint, --limit N.
+        # Remaining args = op chain.
+        args = sys.argv[2:]
+        graph_path: str | None = None
+        session: str | bool = True  # True = ephemeral with auto-id
+        fmt = "text"
+        extracted_only = True   # default: AST ground truth only
+        min_confidence: float | None = None
+        show_legend = False
+        show_ops_hint = False
+        # `None` means "use navigate()'s defaults" (which differ per pivot:
+        # standard listings get LIST_LIMIT, `coc` gets the smaller
+        # COC_LIST_LIMIT_DEFAULT). Setting an int here bypasses both.
+        limit: int | None = None
+        kinds: set[str] | None = None
+        node_kinds: set[str] | None = None  # --node-kind filter on node_kind attr
+        bodies: int | None = None
+        depth: int = 1
+        archived_mode: str = "all"  # --no-archived → "no" / --archived-only → "only"
+        include_files: bool = False  # --include-files turns coc back on for file hubs
+        code_only: bool = False  # --code-only filters rationale nodes from coc
+        collapse_dupes: bool = True   # --no-collapse expands dupe-label groups
+        explain_cost: bool = False    # --explain-cost short-circuits pivots to size preview
+        md: bool = False              # --md wraps labels and src:line in markdown links
+        transitive: bool = False      # --transitive routes script-leaf out through contains
+        show_session: str | None = None  # --show-session <id> renders saved cursor without mutating it
+        quiet_hints: bool = False  # --quiet-hints suppresses all hint lines
+        i = 0
+        ops: list[str] = []
+        # `--help` / `-h` mid-args takes precedence over op parsing — without
+        # this the `else: ops.append(a)` branch swallows it as a navigate op.
+        if any(a in ("-h", "--help") for a in args):
+            _print_subcmd_help("navigate")
+            return
+        while i < len(args):
+            a = args[i]
+            if a == "--graph" and i + 1 < len(args):
+                graph_path = args[i + 1]; i += 2
+            elif a.startswith("--graph="):
+                graph_path = a.split("=", 1)[1]; i += 1
+            elif a == "--session" and i + 1 < len(args):
+                session = args[i + 1]; i += 2
+            elif a.startswith("--session="):
+                session = a.split("=", 1)[1]; i += 1
+            elif a == "--no-session":
+                session = False; i += 1
+            elif a in ("--json",):
+                fmt = "json"; i += 1
+            elif a == "--format" and i + 1 < len(args):
+                fmt = args[i + 1]; i += 2
+            elif a.startswith("--format="):
+                fmt = a.split("=", 1)[1]; i += 1
+            elif a == "--include-inferred":
+                extracted_only = False; i += 1
+            elif a == "--extracted-only":
+                # back-compat alias: was the opt-in flag, is now the default
+                extracted_only = True; i += 1
+            elif a == "--min-confidence" and i + 1 < len(args):
+                min_confidence = float(args[i + 1]); i += 2
+            elif a.startswith("--min-confidence="):
+                min_confidence = float(a.split("=", 1)[1]); i += 1
+            elif a == "--limit" and i + 1 < len(args):
+                limit = int(args[i + 1]); i += 2
+            elif a.startswith("--limit="):
+                limit = int(a.split("=", 1)[1]); i += 1
+            elif a == "--kind" and i + 1 < len(args):
+                kinds = {k.strip() for k in args[i + 1].split(",") if k.strip()}
+                i += 2
+            elif a.startswith("--kind="):
+                kinds = {k.strip() for k in a.split("=", 1)[1].split(",") if k.strip()}
+                i += 1
+            elif a == "--node-kind" and i + 1 < len(args):
+                node_kinds = {k.strip() for k in args[i + 1].split(",") if k.strip()}
+                i += 2
+            elif a.startswith("--node-kind="):
+                node_kinds = {k.strip() for k in a.split("=", 1)[1].split(",") if k.strip()}
+                i += 1
+            elif a == "--bodies" and i + 1 < len(args):
+                bodies = int(args[i + 1]); i += 2
+            elif a.startswith("--bodies="):
+                bodies = int(a.split("=", 1)[1]); i += 1
+            elif a == "--depth" and i + 1 < len(args):
+                depth = max(1, int(args[i + 1])); i += 2
+            elif a.startswith("--depth="):
+                depth = max(1, int(a.split("=", 1)[1])); i += 1
+            elif a == "--legend":
+                show_legend = True; i += 1
+            elif a == "--ops-hint":
+                show_ops_hint = True; i += 1
+            elif a == "--no-ops-hint":
+                # back-compat no-op: was the opt-out flag, is now the default.
+                show_ops_hint = False; i += 1
+            elif a == "--no-archived":
+                archived_mode = "no"; i += 1
+            elif a == "--archived-only":
+                archived_mode = "only"; i += 1
+            elif a == "--include-files":
+                include_files = True; i += 1
+            elif a == "--code-only":
+                code_only = True; i += 1
+            elif a == "--no-collapse":
+                collapse_dupes = False; i += 1
+            elif a == "--explain-cost":
+                explain_cost = True; i += 1
+            elif a == "--md":
+                md = True; i += 1
+            elif a == "--transitive":
+                transitive = True; i += 1
+            elif a == "--show-session" and i + 1 < len(args):
+                show_session = args[i + 1]; i += 2
+            elif a.startswith("--show-session="):
+                show_session = a.split("=", 1)[1]; i += 1
+            elif a == "--quiet-hints":
+                quiet_hints = True; i += 1
+            else:
+                ops.append(a); i += 1
+        out = navigate(
+            ops,
+            graph_path=graph_path or DEFAULT_GRAPH_PATH,
+            session=session,
+            fmt=fmt,
+            extracted_only=extracted_only,
+            min_confidence=min_confidence,
+            show_legend=show_legend,
+            show_ops_hint=show_ops_hint,
+            limit=limit,
+            kinds=kinds,
+            node_kinds=node_kinds,
+            bodies=bodies,
+            depth=depth,
+            archived_mode=archived_mode,
+            include_files=include_files,
+            code_only=code_only,
+            collapse_dupes=collapse_dupes,
+            explain_cost=explain_cost,
+            md=md,
+            transitive=transitive,
+            show_session=show_session,
+            quiet_hints=quiet_hints,
+        )
+        print(out)
+
+    elif cmd == "diff":
+        if len(sys.argv) < 4:
+            print("Usage: graphify diff <old-graph.json> <new-graph.json>", file=sys.stderr)
+            sys.exit(1)
+        old_path = Path(sys.argv[2]).resolve()
+        new_path = Path(sys.argv[3]).resolve()
+        for p in (old_path, new_path):
+            if not p.exists():
+                print(f"error: file not found: {p}", file=sys.stderr)
+                sys.exit(1)
+            if p.suffix != ".json":
+                print(f"error: expected a .json file: {p}", file=sys.stderr)
+                sys.exit(1)
+        try:
+            import networkx as _nx
+            from networkx.readwrite import json_graph as _jg
+            def _load_graph(p: Path) -> _nx.Graph:
+                raw = json.loads(p.read_text(encoding="utf-8"))
+                try:
+                    return _jg.node_link_graph(raw, edges="links")
+                except TypeError:
+                    return _jg.node_link_graph(raw)
+            G_old = _load_graph(old_path)
+            G_new = _load_graph(new_path)
+        except Exception as exc:
+            print(f"error: could not load graphs: {exc}", file=sys.stderr)
+            sys.exit(1)
+        from graphify.analyze import graph_diff as _graph_diff
+        diff = _graph_diff(G_old, G_new)
+        print(f"Summary: {diff['summary']}")
+        if diff["new_nodes"]:
+            print(f"\nNew nodes ({len(diff['new_nodes'])}):")
+            for n in diff["new_nodes"]:
+                print(f"  + {n['label']} ({n['id']})")
+        if diff["removed_nodes"]:
+            print(f"\nRemoved nodes ({len(diff['removed_nodes'])}):")
+            for n in diff["removed_nodes"]:
+                print(f"  - {n['label']} ({n['id']})")
+        if diff["new_edges"]:
+            print(f"\nNew edges ({len(diff['new_edges'])}):")
+            for e in diff["new_edges"]:
+                print(f"  + {e['source']} --[{e['relation']}]--> {e['target']}")
+        if diff["removed_edges"]:
+            print(f"\nRemoved edges ({len(diff['removed_edges'])}):")
+            for e in diff["removed_edges"]:
+                print(f"  - {e['source']} --[{e['relation']}]--> {e['target']}")
+    elif cmd == "benchmark":
+        from graphify.benchmark import run_benchmark, print_benchmark
+        graph_path = sys.argv[2] if len(sys.argv) > 2 else "graphify-out/graph.json"
+        # Try to load corpus_words from detect output
+        corpus_words = None
+        detect_path = Path(".graphify_detect.json")
+        if detect_path.exists():
+            try:
+                detect_data = json.loads(detect_path.read_text(encoding="utf-8"))
+                corpus_words = detect_data.get("total_words")
+            except Exception:
+                pass
+        result = run_benchmark(graph_path, corpus_words=corpus_words)
+        print_benchmark(result)
+    else:
+        print(f"error: unknown command '{cmd}'", file=sys.stderr)
+        print("Run 'graphify --help' for usage.", file=sys.stderr)
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
