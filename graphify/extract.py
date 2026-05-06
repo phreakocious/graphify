@@ -18,9 +18,15 @@ from .cache import load_cached, save_cached
 #          re-extract of every file cached under the unversioned scheme,
 #          which had quietly hidden lap-12 cross-language / interface-property /
 #          closure-method work on any file whose contents hadn't changed.
+#   "v2" — lap-20 TS object-literal method extraction + accurate fn end-line
+#          (`source_location: L<start>-<end>`). Without a bump, `graphify update`
+#          on an existing graph keeps the old per-file cache entries, so users
+#          see the OLD shape (no `config.run` nodes, single-line `L<n>`) even
+#          after pulling the new code. Field-reported by TS Claude orienting on
+#          zero-tvm — re-extraction looked like a no-op.
 # Note: lap-15's phantom-node resolution runs at MERGE time over the
 # combined per-file results, so it fires on cached output too — no bump.
-AST_CACHE_VERSION = "v1"
+AST_CACHE_VERSION = "v2"
 
 
 # AST node types that represent a member-expression callee
