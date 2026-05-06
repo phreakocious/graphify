@@ -4341,24 +4341,21 @@ def navigate(ops: list[str] | str, *,
 
     # Persist cursor only when a future call could plausibly resume it —
     # same gate that decides whether the session id is printed below.
-    # One-shot focus calls with no chain depth and no explicit --session
-    # used to leave the cursor as write-once garbage swept 30 minutes
-    # later. Lap-13 field-report fix: skip the write entirely so
-    # `.navigate/` only accumulates resumable sessions.
+    # Cursor save / session-id print: every persist-eligible call writes
+    # cursor and prints the session id, so agents can chain across
+    # separate CLI invocations by passing `--session <id>` on the next
+    # call. Lap-22 meta-harness field-report fix: previously this was
+    # gated on `can_resume` (history >= 1, queued ops, or explicit
+    # --session), which meant a bare first focus didn't persist and
+    # didn't print a session id — so an agent who *wanted* to chain
+    # had no id to pass on the second call. _sweep_stale already
+    # cleans up orphan cursors, and the disk cost is ~1 KB/call. The
+    # session-id line is one row of text; agents who don't chain
+    # ignore it.
     #
     # Lap-15: the save deferred until AFTER render so renderer-side
     # cursor mutations (hints_emitted bookkeeping, future bits) get
-    # persisted with the rest of the cursor state. Previously save ran
-    # before render and the per-session hint dedup never carried across
-    # calls because the appended hint keys never reached disk.
-    can_resume = (
-        session_id is not None
-        and (
-            (isinstance(session, str) and bool(session))  # explicit --session
-            or bool(cursor.queued_ops)                    # chain paused, must resume
-            or len(cursor.history) >= 1                   # walked > 1 step
-        )
-    )
+    # persisted with the rest of the cursor state.
 
     # Log surfaced source paths so the PreToolUse hook can suppress its
     # "scout cheaper" nudge on files this session just navigated to.
@@ -4410,17 +4407,17 @@ def navigate(ops: list[str] | str, *,
     else:
         parts.append(json.dumps(last_data, default=str))
 
-    # Only print the session id when chaining is plausibly useful (same
-    # `can_resume` gate computed above for the cursor write — keeping
-    # the two in lockstep means a printed id always corresponds to a
-    # persisted cursor and vice versa).
-    if can_resume:
+    # Print the session id so the agent has something to pass to
+    # `--session` on the next call if they want to chain. Always
+    # printed when session_id is set (i.e. session is not False);
+    # see lap-22 comment block above for the rationale.
+    if session_id is not None:
         parts.append(f"  session: {session_id}  (resume with --session {session_id})")
 
     # Persist cursor AFTER render so renderer-side mutations (hints_emitted)
     # land on disk. This must run after the body of work that might mutate
     # cursor state but before returning the result.
-    if persist and can_resume:
+    if persist and session_id is not None:
         cursor.save(_cursor_path(gpath, session_id))
 
     return "\n".join(parts)

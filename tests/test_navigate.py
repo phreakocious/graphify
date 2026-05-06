@@ -374,9 +374,13 @@ def test_inferred_locality_outranks_collision_noise(tmp_path, monkeypatch):
     )
 
 
-def test_session_id_suppressed_on_one_shot(tmp_path, monkeypatch):
-    """Lap-6 friction 9: default ephemeral one-shots shouldn't print the
-    session id — chain-resumption affordance was the most-cited noise."""
+def test_session_id_printed_on_every_persist_call(tmp_path, monkeypatch):
+    """Lap-22 meta-harness field-report fix (reverses lap-6 friction 9):
+    agents running `graphify navigate` across separate CLI invocations
+    couldn't chain because the first call (a bare focus, history=0) used
+    to suppress the session id, leaving them with nothing to pass to
+    `--session` on the second call. Print the id every time persist
+    is on so chain-resumption is always available."""
     import json as _json
     from graphify.navigate import navigate
     nodes = [
@@ -388,12 +392,15 @@ def test_session_id_suppressed_on_one_shot(tmp_path, monkeypatch):
     (graph_dir / "graph.json").write_text(_json.dumps(
         {"nodes": nodes, "links": []}), encoding="utf-8")
     monkeypatch.chdir(tmp_path)
-    # Default session=True, single focus op, no chain → id should NOT print
+    # Default session=True, single focus op → id IS printed (was suppressed pre-lap-22)
     out = navigate(["@alpha"], session=True, fmt="text")
-    assert "session:" not in out, f"id leaked on one-shot:\n{out}"
-    # Explicit session DOES print so the agent confirms the id
+    assert "session:" in out, f"id missing on one-shot, agent has no way to chain:\n{out}"
+    # Explicit session also prints
     out2 = navigate(["@alpha"], session="myid", fmt="text")
     assert "session: myid" in out2
+    # session=False (machine pipelines) suppresses entirely
+    out3 = navigate(["@alpha"], session=False, fmt="text")
+    assert "session:" not in out3, f"session=False should suppress:\n{out3}"
 
 
 def test_siblings_on_file_returns_n_a(tmp_path, monkeypatch):
@@ -3139,12 +3146,11 @@ def test_disambig_listing_suppresses_files_table(tmp_path, monkeypatch):
     )
 
 
-def test_one_shot_focus_does_not_persist_cursor(tmp_path, monkeypatch):
-    """Lap-13 field-report fix: a one-shot `@<label>` focus with no chain
-    depth and no explicit --session shouldn't write a cursor file —
-    the printed session id was suppressed in lap-12 but the cursor file
-    was still written and only swept 30 minutes later. Persist gate
-    now mirrors the print gate."""
+def test_one_shot_focus_persists_cursor(tmp_path, monkeypatch):
+    """Lap-22 meta-harness field-report (reverses lap-13): a one-shot
+    focus DOES write a cursor and DOES print the session id, so an
+    agent who wants to chain on the next CLI invocation has an id to
+    pass to `--session`. _sweep_stale handles cleanup of orphans."""
     from graphify.navigate import navigate
     nodes = [
         {"id": "f", "label": "foo()", "file_type": "code",
@@ -3153,17 +3159,15 @@ def test_one_shot_focus_does_not_persist_cursor(tmp_path, monkeypatch):
     _write_graph(tmp_path / "graphify-out", nodes, [])
     monkeypatch.chdir(tmp_path)
     out = navigate(["@foo()"], fmt="text")  # default session=True
-    # No `session:` line printed (one-shot focus, no chain)…
-    assert "session:" not in out, (
-        f"one-shot focus shouldn't print session id:\n{out}"
+    # Session id IS printed so the agent can pass it to --session.
+    assert "session:" in out, (
+        f"one-shot focus should print session id for chain-resumption:\n{out}"
     )
-    # …and no cursor file written.
+    # Cursor file IS written.
     nav_dir = tmp_path / "graphify-out" / ".navigate"
-    if nav_dir.exists():
-        files = list(nav_dir.glob("*.json"))
-        assert not files, (
-            f"one-shot focus should not write cursor files, got: {files}"
-        )
+    assert nav_dir.exists(), f"navigate dir missing: {nav_dir}"
+    files = list(nav_dir.glob("*.json"))
+    assert files, "expected at least one persisted cursor"
 
 
 def test_label_index_dedups_same_label_and_nid(tmp_path):
