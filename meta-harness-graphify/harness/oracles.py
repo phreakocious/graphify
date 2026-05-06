@@ -62,10 +62,36 @@ def file_contains_all(*, repo_dir: Path, path: str, substrings: list[str]) -> Or
     )
 
 
+def all_of(*, repo_dir: Path, oracles: list[dict]) -> OracleResult:
+    """Composite oracle for multi-step session tasks: run each sub-oracle,
+    pass iff every sub-oracle passes. The `detail` field returns a per-step
+    PASS/FAIL breakdown so the run log surfaces which step(s) failed
+    even when overall passed=False — important for session benchmarks
+    where partial completion still tells you about where the chain
+    broke down."""
+    passed_all = True
+    details: list[str] = []
+    for i, sub in enumerate(oracles, 1):
+        kind = sub.get("kind")
+        args = sub.get("args", {})
+        if not kind:
+            return OracleResult(
+                passed=False,
+                detail=f"all_of: step {i} missing 'kind'",
+            )
+        result = run_oracle(kind=kind, repo_dir=repo_dir, args=args)
+        marker = "PASS" if result.passed else "FAIL"
+        details.append(f"step {i} ({kind}): {marker} — {result.detail[:200]}")
+        if not result.passed:
+            passed_all = False
+    return OracleResult(passed=passed_all, detail="\n".join(details))
+
+
 _DISPATCH = {
     "pytest_passes": pytest_passes,
     "file_contains": file_contains,
     "file_contains_all": file_contains_all,
+    "all_of": all_of,
 }
 
 

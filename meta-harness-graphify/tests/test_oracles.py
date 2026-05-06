@@ -2,7 +2,7 @@ from pathlib import Path
 
 import pytest
 
-from harness.oracles import file_contains, file_contains_all, pytest_passes, run_oracle
+from harness.oracles import all_of, file_contains, file_contains_all, pytest_passes, run_oracle
 
 FIXTURES = Path(__file__).parent / "fixtures" / "oracle"
 
@@ -81,3 +81,51 @@ def test_file_contains_all_handles_missing_file():
         substrings=["anything"],
     )
     assert not result.passed
+
+
+def test_all_of_passes_when_every_step_passes():
+    """Composite oracle for session/multi-step tasks. Pass = every
+    sub-oracle passes."""
+    result = all_of(
+        repo_dir=FIXTURES,
+        oracles=[
+            {"kind": "file_contains", "args": {"path": "sample_file.txt", "substring": "hello"}},
+            {"kind": "file_contains_all", "args": {"path": "sample_file.txt", "substrings": ["quick brown"]}},
+        ],
+    )
+    assert result.passed
+    # Per-step PASS markers in detail so logs surface what worked.
+    assert "step 1" in result.detail and "PASS" in result.detail
+    assert "step 2" in result.detail and "PASS" in result.detail
+
+
+def test_all_of_fails_when_any_step_fails():
+    """If any sub-oracle fails, the composite fails — but the detail
+    still names which step(s) broke down."""
+    result = all_of(
+        repo_dir=FIXTURES,
+        oracles=[
+            {"kind": "file_contains", "args": {"path": "sample_file.txt", "substring": "hello"}},
+            {"kind": "file_contains", "args": {"path": "sample_file.txt", "substring": "definitely-not-here"}},
+        ],
+    )
+    assert not result.passed
+    assert "step 2" in result.detail and "FAIL" in result.detail
+    # Step 1 still ran and is reported as PASS — useful for diagnosing
+    # where in the chain things broke.
+    assert "step 1" in result.detail and "PASS" in result.detail
+
+
+def test_all_of_dispatches_via_run_oracle():
+    """all_of must be reachable via the kind-dispatch path so it can be
+    declared as a Task's oracle_kind."""
+    result = run_oracle(
+        kind="all_of",
+        repo_dir=FIXTURES,
+        args={
+            "oracles": [
+                {"kind": "file_contains", "args": {"path": "sample_file.txt", "substring": "hello"}},
+            ],
+        },
+    )
+    assert result.passed
