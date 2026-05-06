@@ -3607,7 +3607,16 @@ def navigate(ops: list[str] | str, *,
         elif t == "frontier":
             cur = ld.get("current") or {}
             label = cur.get("label", "?") if cur else "?"
-            chain_summary.append(f"{op_str}→@{label}")
+            # Lap-21 polish: drop the redundant resolution arrow when the
+            # input @-key is identical (modulo trailing `()`) to the
+            # resolved label. `@Cursor→@Cursor` carried no information;
+            # `@compile→@compile_v2()` still does.
+            bare = op_str[1:] if op_str.startswith("@") else op_str
+            label_bare = label.rstrip("()") if isinstance(label, str) else ""
+            if bare and (bare == label or bare == label_bare):
+                chain_summary.append(op_str)
+            else:
+                chain_summary.append(f"{op_str}→@{label}")
         elif t == "error":
             chain_summary.append(f"{op_str}!err")
         elif t == "status":

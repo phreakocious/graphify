@@ -2236,6 +2236,44 @@ def test_frontier_header_disambiguates_focus_from_community(tmp_path, monkeypatc
     )
 
 
+def test_chain_summary_drops_redundant_resolution_arrow(tmp_path, monkeypatch):
+    """Lap-21 polish: chain trace `@Cursor→@Cursor → methods(3)` repeats
+    itself when the input matches the resolved label. Drop the
+    resolution arrow (`@Cursor`) but keep the original input visible.
+    Distinct labels (e.g. `@Cursor.pop` → `.pop()`) keep the arrow."""
+    from graphify.navigate import navigate
+    nodes = [
+        {"id": "n_cls", "label": "Cursor", "file_type": "code",
+         "source_file": "a.py", "source_location": "L1",
+         "node_kind": "class"},
+        {"id": "n_pop", "label": ".pop()", "file_type": "code",
+         "source_file": "a.py", "source_location": "L5",
+         "node_kind": "impl_method"},
+    ]
+    links = [
+        {"source": "n_cls", "target": "n_pop", "relation": "method",
+         "confidence": "EXTRACTED"},
+    ]
+    _write_graph(tmp_path / "graphify-out", nodes, links)
+    monkeypatch.chdir(tmp_path)
+    # Identical input/label: redundant arrow should be dropped.
+    out_same = navigate(["@Cursor", "methods"], session=False, fmt="text")
+    chain = next((ln for ln in out_same.splitlines()
+                   if ln.lstrip().startswith("chain:")), "")
+    assert "@Cursor → methods" in chain, f"chain should show condensed arrow:\n{out_same}"
+    assert "@Cursor→@Cursor" not in chain, (
+        f"redundant resolution arrow should be dropped:\n{out_same}"
+    )
+
+    # Class.method form: input differs from resolved label, arrow stays.
+    out_diff = navigate(["@Cursor.pop", "in"], session=False, fmt="text")
+    chain2 = next((ln for ln in out_diff.splitlines()
+                    if ln.lstrip().startswith("chain:")), "")
+    assert "@Cursor.pop→@" in chain2, (
+        f"resolution arrow should be kept when input differs from label:\n{out_diff}"
+    )
+
+
 def test_method_no_callers_hints_at_wu(tmp_path, monkeypatch):
     """Lap-21 #2: when a function/method has 0 EXTRACTED callers and 0
     INFERRED to widen to, but lives under a class that itself has
