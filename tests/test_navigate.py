@@ -2236,6 +2236,48 @@ def test_frontier_header_disambiguates_focus_from_community(tmp_path, monkeypatc
     )
 
 
+def test_method_no_callers_hints_at_wu(tmp_path, monkeypatch):
+    """Lap-21 #2: when a function/method has 0 EXTRACTED callers and 0
+    INFERRED to widen to, but lives under a class that itself has
+    callers, hint at `wu` for name-mention discovery — the canonical
+    typed-receiver-dispatch case (TS-Claude's
+    `engine.embeddingGenerate(...)` from 18 files)."""
+    from graphify.navigate import navigate
+    nodes = [
+        {"id": "engine_class", "label": "Engine", "file_type": "code",
+         "source_file": "engine.ts", "source_location": "L1",
+         "node_kind": "class"},
+        {"id": "method", "label": "embeddingGenerate()", "file_type": "code",
+         "source_file": "engine.ts", "source_location": "L5",
+         "node_kind": "method"},
+        # Caller files import Engine but no calls edge lands on the method.
+        {"id": "f1", "label": "exp1.ts", "file_type": "code",
+         "source_file": "exp1.ts", "source_location": "L1",
+         "node_kind": "file"},
+        {"id": "f2", "label": "exp2.ts", "file_type": "code",
+         "source_file": "exp2.ts", "source_location": "L1",
+         "node_kind": "file"},
+    ]
+    links = [
+        # The method belongs to the class (structural; doesn't count as `in`).
+        {"source": "engine_class", "target": "method", "relation": "method",
+         "confidence": "EXTRACTED"},
+        # Caller files import the class — gives the class non-zero in,
+        # making the method's parent "referenced" so the hint fires.
+        {"source": "f1", "target": "engine_class", "relation": "imports",
+         "confidence": "EXTRACTED"},
+        {"source": "f2", "target": "engine_class", "relation": "imports",
+         "confidence": "EXTRACTED"},
+    ]
+    _write_graph(tmp_path / "graphify-out", nodes, links)
+    monkeypatch.chdir(tmp_path)
+    out = navigate(["@embeddingGenerate"], session=False, fmt="text")
+    assert "0 direct callers" in out and "wu" in out, (
+        f"method with 0 callers under a referenced parent should hint "
+        f"at wu:\n{out}"
+    )
+
+
 def test_changed_since_commit_flag(tmp_path):
     """Lap-21 polish: `graphify changed --since-commit <ref>` is the
     discoverable form of the positional `changed <ref>` alias. Both

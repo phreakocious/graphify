@@ -1668,6 +1668,33 @@ def _render_frontier_text(data: dict, cursor: Cursor, *, show_ops: bool,
     inf_out = (p['out'].get('drops') or {}).get('inferred', 0)
     is_method_shape = label.startswith(".") and label.endswith("()")
     is_iface = node_kind == "iface_method"
+
+    # Lap-21 #2: typed-receiver dispatch hint. TS-Claude reported
+    # `@embeddingGenerate in` returning empty even though 18 files
+    # called `engine.embeddingGenerate(...)`. Cause: AST extracts a
+    # member-expression on a typed receiver as `imports`/`imports_from`
+    # to the file/class but doesn't synthesize a `calls` edge to the
+    # method body — type info isn't available cheaply. The fallback is
+    # `wu` (where-used = `in` ∪ name-mentions), but agents reach for
+    # `in` first and don't think to switch. When a function/method has
+    # 0 EXTRACTED callers and 0 INFERRED to widen to either, point at
+    # `wu` so the structural-hits view stays in their hands.
+    is_function_kind = node_kind in (
+        "function", "method", "impl_method", "iface_method"
+    ) or (label.endswith("()") and not label.startswith("."))
+    if (is_function_kind
+            and p['in']['count'] == 0
+            and inf_in == 0
+            and not is_iface
+            and p.get('parent', {}).get('count', 0) > 0):
+        _emit_hint(out, "method_no_callers_try_wu",
+            f"  hint: 0 direct callers via AST. If `{label}` is dispatched "
+            f"on a typed receiver (`obj.{label.rstrip('()')}(...)`), the "
+            f"call site lands on a member-expr that AST extraction can't "
+            f"pin to a method body without type info. Try `wu` (where-used) "
+            f"to fold name-mention sites into the result.",
+            cursor, quiet_hints)
+
     if is_method_shape and ((p['in']['count'] == 0 and inf_in >= 1)
                             or (p['out']['count'] == 0 and inf_out >= 1)):
         cause = ("interface method — runtime sites bind to implementations"
