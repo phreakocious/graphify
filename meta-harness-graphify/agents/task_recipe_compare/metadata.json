@@ -1,0 +1,7 @@
+{
+  "candidate_id": "task_recipe_compare",
+  "parent_id": "task_recipe_navigator",
+  "generation": 3,
+  "proposer_notes": "Lap-23: V1 (task_recipe_navigator) plus a single instruction at the top: 'Before each call, name two ways you could answer the current sub-question and pick the cheaper one.' Tests whether explicit self-audit on approach selection improves TTC. Only diff vs V1 is one paragraph at the top.",
+  "created_at": "2026-05-06"
+}
