@@ -2887,6 +2887,98 @@ def shape_file(G: nx.DiGraph, file_nid: str, *,
     }
 
 
+def doc_node(G: nx.DiGraph, nid: str, *, max_rationale_lines: int = 40) -> dict:
+    """Return signature + rationale body for a node — the "what does this mean?"
+    one-shot.
+
+    Reuses the rationale_for edge convention emitted by extractors: rationale
+    nodes hang off the symbol they describe. Walks both directions because
+    extractors disagree on emit-direction (Python AST emits
+    rationale --rationale_for--> symbol; some LLM passes invert it).
+    """
+    attrs = G.nodes[nid]
+    sf = attrs.get("source_file") or ""
+    loc = attrs.get("source_location") or ""
+
+    header_line = ""
+    if sf and loc:
+        body, _ln, _trunc = _read_body_full(sf, loc, max_lines=1, flat=True)
+        if body:
+            header_line = body[0]
+
+    rationale_blocks: list[dict] = []
+    seen: set[str] = set()
+    for u in G.predecessors(nid):
+        e = G.edges[u, nid]
+        if (G.nodes[u].get("file_type") == "rationale"
+                or e.get("relation") == "rationale_for"):
+            if u not in seen:
+                seen.add(u)
+                rationale_blocks.append({"id": u, "node": G.nodes[u]})
+    for v in G.successors(nid):
+        if G.edges[nid, v].get("relation") == "rationale_for":
+            if v not in seen:
+                seen.add(v)
+                rationale_blocks.append({"id": v, "node": G.nodes[v]})
+
+    body_blocks: list[dict] = []
+    for r in rationale_blocks:
+        rsrc = r["node"].get("source_file") or sf
+        rloc = r["node"].get("source_location") or ""
+        body, ln, trunc = _read_body_full(rsrc, rloc,
+                                          max_lines=max_rationale_lines,
+                                          flat=True)
+        body_blocks.append({
+            "label": r["node"].get("label", r["id"]),
+            "source_file": rsrc,
+            "source_location": rloc,
+            "start_line": ln,
+            "lines": body,
+            "truncated": trunc,
+        })
+
+    return {
+        "type": "doc",
+        "label": attrs.get("label", nid),
+        "id": nid,
+        "node_kind": attrs.get("node_kind", ""),
+        "source_file": sf,
+        "source_location": loc,
+        "header": header_line,
+        "rationale": body_blocks,
+    }
+
+
+def _render_doc_text(data: dict, *, md: bool = False) -> str:
+    parts: list[str] = []
+    label = data["label"]
+    sf = data.get("source_file") or ""
+    loc = data.get("source_location") or ""
+    loc_short = loc[1:] if loc.startswith("L") else loc
+    head_label = (f"[{label}]({sf}:{loc_short})"
+                  if md and sf and loc_short else label)
+    kind_str = f" [{data['node_kind']}]" if data.get("node_kind") else ""
+    parts.append(f"  doc @{head_label}{kind_str}  {sf}:{loc_short}".rstrip())
+    if data.get("header"):
+        parts.append(f"    sig: {data['header'].strip()}")
+    rats = data.get("rationale") or []
+    if not rats:
+        parts.append("    no rationale attached. "
+                     "peek for body, navigate for context.")
+        return "\n".join(parts)
+    for i, r in enumerate(rats, 1):
+        rloc = r.get("source_location") or ""
+        rloc_short = rloc[1:] if rloc.startswith("L") else rloc
+        rsrc = r.get("source_file") or ""
+        head = (f"[{r['label']}]({rsrc}:{rloc_short})"
+                if md and rsrc and rloc_short else r['label'])
+        suffix = f"  (truncated, raise with --lines N)" if r.get("truncated") else ""
+        parts.append(f"    [{i}] {head}{suffix}")
+        for line in r.get("lines") or []:
+            parts.append(f"        {line}")
+    return "\n".join(parts)
+
+
 def _render_shape_text(data: dict) -> str:
     """Compact one-screen shape summary: counts + samples + longest fn."""
     parts: list[str] = []

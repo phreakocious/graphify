@@ -2381,6 +2381,76 @@ def test_shape_file_returns_counts_and_longest_fn(tmp_path, monkeypatch):
     assert data["total_lines"] == 200
 
 
+def test_shape_file_limit_and_all(tmp_path, monkeypatch):
+    """`shape_file(..., limit=N)` truncates class_labels/fn_labels to N;
+    `limit=None` returns the full lists. `+N more` is the renderer's job."""
+    from graphify.navigate import shape_file, load_graph
+    sf = str(tmp_path / "big.py")
+    nodes = [{"id": "f", "label": "big.py", "file_type": "code",
+              "source_file": sf, "source_location": "L1"}]
+    for i in range(20):
+        nodes.append({
+            "id": f"c{i}", "label": f"Cls{i}", "file_type": "code",
+            "source_file": sf, "source_location": f"L{i*5+5}",
+            "node_kind": "class",
+        })
+    links = [{"source": "f", "target": f"c{i}", "relation": "contains",
+              "confidence": "EXTRACTED"} for i in range(20)]
+    _write_graph(tmp_path / "graphify-out", nodes, links)
+    (tmp_path / "big.py").write_text("# line\n" * 200)
+    monkeypatch.chdir(tmp_path)
+    G, _comm = load_graph(tmp_path / "graphify-out" / "graph.json")
+    default_limit = shape_file(G, "f")
+    assert len(default_limit["class_labels"]) == 8, default_limit
+    raised = shape_file(G, "f", limit=15)
+    assert len(raised["class_labels"]) == 15, raised
+    full = shape_file(G, "f", limit=None)
+    assert len(full["class_labels"]) == 20, full
+
+
+def test_doc_node_emits_signature_and_rationale(tmp_path, monkeypatch):
+    """`doc_node` walks rationale_for edges and emits sig + docstring(s).
+    Reporter wish: skip the manual symbol → method → docstring pivot."""
+    from graphify.navigate import doc_node, _render_doc_text, load_graph
+    sf = str(tmp_path / "metrics.py")
+    nodes = [
+        {"id": "fn", "label": "compute_metrics()", "file_type": "code",
+         "source_file": sf, "source_location": "L1",
+         "node_kind": "function"},
+        {"id": "rat1", "label": "Compute the metrics for a corpus.",
+         "file_type": "rationale",
+         "source_file": sf, "source_location": "L2"},
+    ]
+    links = [
+        {"source": "rat1", "target": "fn", "relation": "rationale_for",
+         "confidence": "EXTRACTED"},
+    ]
+    _write_graph(tmp_path / "graphify-out", nodes, links)
+    (tmp_path / "metrics.py").write_text(
+        'def compute_metrics(data):\n'
+        '    """Compute the metrics for a corpus.\n'
+        '\n'
+        '    Returns a dict.\n'
+        '    """\n'
+        '    return {}\n'
+    )
+    monkeypatch.chdir(tmp_path)
+    G, _comm = load_graph(tmp_path / "graphify-out" / "graph.json")
+    data = doc_node(G, "fn")
+    assert data["label"] == "compute_metrics()"
+    assert data["header"].startswith("def compute_metrics"), data["header"]
+    assert len(data["rationale"]) == 1, data["rationale"]
+    rendered = _render_doc_text(data)
+    assert "compute_metrics()" in rendered
+    assert "sig: def compute_metrics" in rendered
+    # No-rationale case prints a hint instead of an empty section.
+    G2, _ = load_graph(tmp_path / "graphify-out" / "graph.json")
+    G2.remove_node("rat1")
+    data2 = doc_node(G2, "fn")
+    rendered2 = _render_doc_text(data2)
+    assert "no rationale attached" in rendered2
+
+
 def test_search_bodies_returns_hits_with_symbol_context(tmp_path, monkeypatch):
     """`search_bodies` greps each node's source file and attaches symbol
     context (label, file:line, community, degree) to each match. The

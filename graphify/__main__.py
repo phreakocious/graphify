@@ -65,6 +65,14 @@ _HELP_BLOCKS: dict[str, list[str]] = {
         "    Pairs with `navigate ... read` — use peek when you don't want to commit to a session.",
         "    Accepts `Class.method` and `dir/file/Symbol` qualifiers, same as navigate.",
     ],
+    "doc": [
+        "  doc <symbol>            one-shot signature + docstring/rationale dump — \"what does this metric/method/class mean?\" without pulling the implementation",
+        "    --lines N               max lines per rationale block (default 40)",
+        "    --md                    render labels as `[label](file:line)` markdown links",
+        "    --json                  structured JSON output",
+        "    --graph <path>          path to graph.json (default graphify-out/graph.json)",
+        "    Resolves the same as `peek` (Class.method, path-qualified, fuzzy fallback). When no rationale is attached, the signature still prints + a hint to `peek`/`navigate`.",
+    ],
     "shape": [
         "  shape <file>            file structure summary: N classes / M fns / K consts / X imports / longest fn — orientation without committing to a `contains` pivot",
         "    --limit N               max class/fn names listed in the summary (default 8; the `+N more` tail still surfaces what was truncated)",
@@ -1178,6 +1186,8 @@ def main() -> None:
             print(line)
         for line in _HELP_BLOCKS["peek"]:
             print(line)
+        for line in _HELP_BLOCKS["doc"]:
+            print(line)
         for line in _HELP_BLOCKS["shape"]:
             print(line)
         for line in _HELP_BLOCKS["search"]:
@@ -2256,6 +2266,83 @@ def main() -> None:
             "truncated": trunc,
         }
         print(_render_body_text(data, md=md))
+
+    elif cmd == "doc":
+        # One-shot rationale dump. Field-report wish: "I had to pivot from
+        # `sector_transition_entropy` → method → docstring manually." `doc`
+        # collapses that to a single call: resolve symbol, walk
+        # rationale_for edges, dump signature + docstrings.
+        if any(a in ("-h", "--help") for a in sys.argv[2:]):
+            _print_subcmd_help("doc")
+            return
+        from graphify.navigate import (
+            DEFAULT_GRAPH_PATH, load_graph,
+            doc_node, _render_doc_text,
+        )
+        from graphify.resolve import label_index, resolve_focus
+        args = sys.argv[2:]
+        graph_path = DEFAULT_GRAPH_PATH
+        max_lines = 40
+        md = False
+        fmt = "text"
+        target: str | None = None
+        i = 0
+        while i < len(args):
+            a = args[i]
+            if a == "--graph" and i + 1 < len(args):
+                graph_path = args[i + 1]; i += 2
+            elif a.startswith("--graph="):
+                graph_path = a.split("=", 1)[1]; i += 1
+            elif a == "--lines" and i + 1 < len(args):
+                max_lines = max(1, int(args[i + 1])); i += 2
+            elif a.startswith("--lines="):
+                max_lines = max(1, int(a.split("=", 1)[1])); i += 1
+            elif a == "--md":
+                md = True; i += 1
+            elif a == "--json":
+                fmt = "json"; i += 1
+            elif target is None:
+                target = a; i += 1
+            else:
+                print(f"warning: ignoring extra arg `{a}`. doc takes a single target.",
+                      file=sys.stderr)
+                i += 1
+        if not target:
+            print("Usage: graphify doc <symbol> [--lines N] [--md] [--json] [--graph PATH]",
+                  file=sys.stderr)
+            sys.exit(1)
+        gp = Path(graph_path)
+        if not gp.exists():
+            print(f"error: graph not found at {gp}. run `graphify update <path>` first.",
+                  file=sys.stderr)
+            sys.exit(1)
+        G, _comm = load_graph(gp)
+        idx = label_index(G)
+        chosen, candidates, match_type, _alts = resolve_focus(G, idx, target)
+        if not chosen:
+            if candidates:
+                print(f"ambiguous `{target}` ({len(candidates)} matches). "
+                      f"qualify with @<dir>/<file>/<symbol>:", file=sys.stderr)
+                for nid in candidates[:8]:
+                    a = G.nodes[nid]
+                    sf = a.get("source_file", "?")
+                    loc = a.get("source_location", "")
+                    label = a.get("label", nid)
+                    print(f"  {label}  {sf}{':' + loc[1:] if loc.startswith('L') else ''}",
+                          file=sys.stderr)
+                if len(candidates) > 8:
+                    print(f"  +{len(candidates) - 8} more", file=sys.stderr)
+                sys.exit(1)
+            print(f"no node matches `{target}`.", file=sys.stderr)
+            sys.exit(1)
+        if match_type and match_type != "exact":
+            chosen_label = G.nodes[chosen].get("label", chosen)
+            print(f"# matched `{target}` → {chosen_label} ({match_type})")
+        data = doc_node(G, chosen, max_rationale_lines=max_lines)
+        if fmt == "json":
+            print(json.dumps(data))
+        else:
+            print(_render_doc_text(data, md=md))
 
     elif cmd == "shape":
         # File-shape summary: "N classes, M fns, K consts, X imports,
