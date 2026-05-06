@@ -1,14 +1,44 @@
-# Graphify Navigator (Baseline)
+# Graphify Navigator
 
-You have access to `graphify`, a CLI that exposes a queryable knowledge graph of the working repository's code. Use it as your primary entry point for code navigation — prefer it over read_file / grep when you need to:
+`graphify` is your primary code-navigation surface. It's a queryable knowledge graph of the repository — every function, class, method, and the edges between them — that lets you understand structure, find symbols, and trace call relationships at a fraction of the token cost of `read_file` + `grep`.
 
-- Find a function/class/method by name → `graphify navigate <name>`
-- Walk callers/callees of a symbol → `graphify navigate <name> --edges callers` / `--edges calls`
-- See where a file's symbols are imported → `graphify navigate <path> --imports`
-- Search the graph for a pattern → `graphify search <query>`
+## When graphify wins vs. read_file (R3 calibration)
 
-**First-call hygiene:** before navigating, run `graphify update` once if the graph might be stale. The command is fast.
+- **graphify wins** when ≤2 bodies are needed, structure-only answers (shape, summarize, community-of), cross-file disambiguation of same-name symbols, or who-uses-X / dead-end tracing across the call graph.
+- **read_file wins** when comprehending most of a file's bodies (>~200 ln total) or line-by-line questions (formatting, surrounding context). graphify still primes the right offset — `shape` then targeted `read_file` beats unprimed reading.
+- **graphify ties read_file** at 3-5 medium bodies. Pick by what's already on hand. Don't burn calls scouting for a marginal win.
 
-**When read_file / bash grep is correct:** when graphify returns no match, when you need exact line content of a file you've already located, or when navigating non-code (markdown, configs, data).
+**graphify-first as a primer.** Even on big tasks: a `shape` call (or `navigate @entry`) before any `read_file` primes you with structural pivot data — entry points, callers, hub identity, line ranges. The orientation cost is small; the compounding savings across follow-up calls are large.
 
-**Reading graphify output:** entries are ranked by relevance. The first entry is usually the right one. Hints at the bottom (`→ try this next`) point to follow-up calls that are often higher value than re-running with different args.
+## First-call hygiene
+
+Run `graphify update` once if `graphify-out/graph.json` doesn't exist or might be stale. The command is fast. graphify itself will surface a `!stale` banner if any indexed source file's mtime is newer than the graph — trust it.
+
+## Verb cheat-sheet
+
+| Verb | Use for |
+|------|---------|
+| `graphify navigate "@<label>"` | focus a symbol; frontier shows callers / callees / methods / containers, cursor persists for chains. |
+| `graphify navigate <op>` | apply pivot from current frontier — `in`, `out`, `methods`, `contains`, `coc` (community), `wu` (where-used), `inh`, `siblings`, `dead-ends`, `read`. |
+| `graphify navigate "[N]"` | focus on Nth row of last listing. |
+| `graphify peek "<symbol>"` | one-shot body read, no cursor mutation. Accepts `Class.method`. |
+| `graphify shape "<file>"` | structure summary: N classes / M fns / longest fn / entry points (top fns by external in-edges). Cheaper than reading. |
+| `graphify search "<pattern>"` | body-text grep across all nodes; returns `(label, file:line, container, community, degree)`. |
+| `graphify locate <s1> <s2>...` | multi-symbol file:line lookup in one call. |
+| `graphify path "<A>" "<B>"` | shortest path between two concepts. |
+| `graphify explain "<symbol>"` | one-shot plain-language explanation. |
+| `graphify query "<question>"` | broad BFS context — use *after* navigate has narrowed scope. |
+| `graphify summarize <file/dir>` | aggregate shape + entry points across multiple files. |
+| `graphify changed --since <ref>` | what's changed in graph terms since a git ref. |
+
+## Reading graphify output
+
+- **Per-row metadata**: `· g3d · 482ln` = git-mtime age (3 days) + line count. `!stale` marker = file changed but graph wasn't rebuilt. `[depth≤N]` = transitive walk depth.
+- **Hint footers name the structural cause** when output could be misread — e.g. "0 callers but parent class is referenced — try `wu`". They only fire when a naive read of the output would miss something. Trust them.
+- **Omission counts are never silent**: `+N more`, `+N INFERRED hidden`, `+N hidden via --node-kind`. When you see one, the named flag would unhide. Use `--explain-cost` to preview a listing's byte cost before committing.
+- **First row is usually the right one.** For cross-file same-name symbols, the disambiguation listing returns path-qualified labels (`@graphify/__main__.py/main`); pass the qualified form to lock onto the right one.
+- **Edge confidence**: edges are tagged EXTRACTED (AST-derived, trustworthy), INFERRED (heuristic, gated by `--min-confidence`), or AMBIGUOUS. Default views show only EXTRACTED.
+
+## Skip graphify for
+
+Non-code files (`.json`, `.yaml`, `.toml`, `.csv`, `.md`, `.txt`, `.log`, lockfiles). graphify only indexes source. Use `read_file` directly.

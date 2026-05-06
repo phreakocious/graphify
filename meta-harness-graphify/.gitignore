@@ -12,3 +12,5 @@ dist/
 runs/
 candidates/*/overrides/
 !agents/baseline_navigator/overrides/
+!agents/baseline_minimal/overrides/
+!agents/abl_*/overrides/
