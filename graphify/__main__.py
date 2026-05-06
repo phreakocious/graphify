@@ -1180,6 +1180,19 @@ def main() -> None:
     if len(sys.argv) < 2 or sys.argv[1] in ("-h", "--help"):
         print("Usage: graphify <command>")
         print()
+        # Lap-21 #4 (sub-agent head-to-head): document the win/lose
+        # boundary up front so agents pick correctly without learning
+        # by failure. Shape/symbol-shaped questions and 1-2 small body
+        # peeks beat Read-then-grep; once the answer is "most of a
+        # file", Read is the right tool.
+        print("When to use graphify vs Read:")
+        print("  graphify   structure-only questions, symbol → file:line lookup,")
+        print("             1-2 small body peeks, callers/callees, class shape,")
+        print("             find-where-string-mentioned-in-code")
+        print("  Read       you'll need most of a file (>~200 ln read), or the")
+        print("             question is line-by-line (formatting / surrounding")
+        print("             context that a peek-window misses)")
+        print()
         # Lap-20d (TS-Claude #5): workflow templates retain better than
         # per-flag docs. Lead with the 80% paths so an agent who only
         # reads the first screen of help can already do useful work.
