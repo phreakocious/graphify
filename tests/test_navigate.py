@@ -3002,6 +3002,174 @@ def test_peek_class_emits_curated_dump(tmp_path):
     )
 
 
+def test_expand_brace_multi_peek_helper():
+    """Lap-25 helper: `prefix{a,b,c}suffix` → N targets. Pattern is
+    a peek shortcut for `peek @Class.{m1,m2,m3}`. Only triggers on
+    a balanced brace pair containing a comma."""
+    from graphify.__main__ import _expand_brace_multi_peek
+    # Standard class.method expansion.
+    assert _expand_brace_multi_peek("Worker.{run,stop}") == [
+        "Worker.run", "Worker.stop",
+    ]
+    # @ prefix preserved on each.
+    assert _expand_brace_multi_peek("@C.{a,b,c}") == ["@C.a", "@C.b", "@C.c"]
+    # Whitespace inside braces stripped.
+    assert _expand_brace_multi_peek("@C.{a, b , c}") == ["@C.a", "@C.b", "@C.c"]
+    # No braces — passthrough.
+    assert _expand_brace_multi_peek("Worker.run") == ["Worker.run"]
+    # No comma in braces — passthrough (preserves labels with literal
+    # `{var}` template parts).
+    assert _expand_brace_multi_peek("Worker.{run}") == ["Worker.{run}"]
+    # Unbalanced — passthrough.
+    assert _expand_brace_multi_peek("Worker.{run") == ["Worker.{run"]
+    # Empty parts (trailing comma) dropped.
+    assert _expand_brace_multi_peek("@C.{a,b,}") == ["@C.a", "@C.b"]
+    # Suffix preserved.
+    assert _expand_brace_multi_peek("{a,b}.foo") == ["a.foo", "b.foo"]
+    # Nested braces — punt, passthrough.
+    assert _expand_brace_multi_peek("{a,{b,c}}") == ["{a,{b,c}}"]
+
+
+def test_peek_brace_expands_to_multi_method(tmp_path):
+    """Lap-25: `peek @Class.{m1,m2}` resolves and dumps each method
+    body in one call. V2 trial 1 transcript pattern (peek __init__,
+    peek add_all_geometries — 2 calls) collapses to 1."""
+    import json as _json, subprocess
+    nodes = [
+        {"id": "cls", "label": "Worker", "file_type": "code",
+         "source_file": "worker.py", "source_location": "L1",
+         "node_kind": "class"},
+        {"id": "m_run", "label": "run()", "file_type": "code",
+         "source_file": "worker.py", "source_location": "L2-5",
+         "node_kind": "method"},
+        {"id": "m_stop", "label": "stop()", "file_type": "code",
+         "source_file": "worker.py", "source_location": "L7-10",
+         "node_kind": "method"},
+        # qualified labels too, for `@Worker.run` resolution.
+        {"id": "qm_run", "label": ".run()", "file_type": "code",
+         "source_file": "worker.py", "source_location": "L2-5",
+         "node_kind": "method"},
+        {"id": "qm_stop", "label": ".stop()", "file_type": "code",
+         "source_file": "worker.py", "source_location": "L7-10",
+         "node_kind": "method"},
+    ]
+    links = [
+        {"source": "cls", "target": "qm_run", "relation": "method",
+         "confidence": "EXTRACTED"},
+        {"source": "cls", "target": "qm_stop", "relation": "method",
+         "confidence": "EXTRACTED"},
+    ]
+    graph_dir = tmp_path / "graphify-out"
+    graph_dir.mkdir()
+    (graph_dir / "graph.json").write_text(_json.dumps(
+        {"directed": True, "multigraph": False, "graph": {},
+         "nodes": nodes, "links": links}), encoding="utf-8")
+    (tmp_path / "worker.py").write_text(
+        "class Worker:\n"                       # L1
+        "    def run(self):\n"                  # L2
+        "        self.running = True\n"         # L3
+        "        return self.process()\n"       # L4
+        "    \n"                                # L5
+        "\n"                                    # L6
+        "    def stop(self):\n"                 # L7
+        "        self.running = False\n"        # L8
+        "        self.queue.clear()\n"          # L9
+        "        return None\n"                 # L10
+    )
+    res = subprocess.run(
+        ["graphify", "peek", "Worker.{run,stop}",
+         "--graph", str(graph_dir / "graph.json")],
+        capture_output=True, text=True, cwd=str(tmp_path),
+    )
+    assert res.returncode == 0, f"multi-peek failed:\n{res.stderr}\n{res.stdout}"
+    out = res.stdout
+    # Multi-peek banner naming target count.
+    assert "multi-peek: 2 targets" in out, f"missing multi-peek banner:\n{out}"
+    # Section markers for each target.
+    assert "[1/2] Worker.run" in out, f"missing [1/2] header:\n{out}"
+    assert "[2/2] Worker.stop" in out, f"missing [2/2] header:\n{out}"
+    # Both bodies dumped.
+    assert "self.running = True" in out, f"missing run body:\n{out}"
+    assert "self.running = False" in out, f"missing stop body:\n{out}"
+
+
+def test_peek_brace_partial_miss_continues(tmp_path):
+    """Lap-25: in multi-peek mode, a missing target prints an inline
+    error but doesn't abort. The successful targets render, exit 0.
+    Single-peek mode keeps fail-fast `sys.exit(1)` semantics — only
+    multi mode soft-fails."""
+    import json as _json, subprocess
+    nodes = [
+        {"id": "cls", "label": "Worker", "file_type": "code",
+         "source_file": "worker.py", "source_location": "L1",
+         "node_kind": "class"},
+        {"id": "qm_run", "label": ".run()", "file_type": "code",
+         "source_file": "worker.py", "source_location": "L2-4",
+         "node_kind": "method"},
+    ]
+    links = [
+        {"source": "cls", "target": "qm_run", "relation": "method",
+         "confidence": "EXTRACTED"},
+    ]
+    graph_dir = tmp_path / "graphify-out"
+    graph_dir.mkdir()
+    (graph_dir / "graph.json").write_text(_json.dumps(
+        {"directed": True, "multigraph": False, "graph": {},
+         "nodes": nodes, "links": links}), encoding="utf-8")
+    (tmp_path / "worker.py").write_text(
+        "class Worker:\n"
+        "    def run(self):\n"
+        "        self.running = True\n"
+        "        return None\n"
+    )
+    # `zqqqzzz_nonexistent` is far enough from any label that the
+    # resolver's fuzzy fallback won't pull it onto Worker — gives a
+    # clean miss to test the inline error path.
+    res = subprocess.run(
+        ["graphify", "peek", "{run,zqqqzzz_nonexistent}",
+         "--graph", str(graph_dir / "graph.json")],
+        capture_output=True, text=True, cwd=str(tmp_path),
+    )
+    # Multi mode: at least one target resolved → exit 0.
+    assert res.returncode == 0, (
+        f"multi-peek with one valid target should exit 0, got rc={res.returncode}\n"
+        f"stdout:\n{res.stdout}\nstderr:\n{res.stderr}"
+    )
+    # Valid one renders.
+    assert "self.running = True" in res.stdout, (
+        f"valid target should render:\n{res.stdout}"
+    )
+    # Missing one names itself in the error so the agent can fix the typo.
+    assert "no node matches `zqqqzzz_nonexistent`" in res.stderr, (
+        f"missing target should print named error:\n{res.stderr}"
+    )
+
+
+def test_peek_brace_all_miss_exits_one(tmp_path):
+    """Lap-25: if every target in a multi-peek misses, exit 1 so the
+    agent's caller treats it as failure. Mirror locate's batch
+    semantics (best-effort, fail only when nothing landed)."""
+    import json as _json, subprocess
+    graph_dir = tmp_path / "graphify-out"
+    graph_dir.mkdir()
+    (graph_dir / "graph.json").write_text(_json.dumps(
+        {"directed": True, "multigraph": False, "graph": {},
+         "nodes": [{"id": "x", "label": "x()", "file_type": "code",
+                    "source_file": "x.py", "source_location": "L1"}],
+         "links": []}), encoding="utf-8")
+    (tmp_path / "x.py").write_text("def x():\n    pass\n")
+    # Both names are far from `x()` so fuzzy fallback won't catch.
+    res = subprocess.run(
+        ["graphify", "peek", "{zqqqzzz_a,zqqqzzz_b}",
+         "--graph", str(graph_dir / "graph.json")],
+        capture_output=True, text=True, cwd=str(tmp_path),
+    )
+    assert res.returncode == 1, (
+        f"all-miss multi-peek should exit 1, got rc={res.returncode}\n"
+        f"stdout:\n{res.stdout}\nstderr:\n{res.stderr}"
+    )
+
+
 def test_method_listings_attribute_owning_class(tmp_path, monkeypatch):
     """Lap-21 #1 (sub-agent head-to-head): rows for `.method()`-shape
     nodes show `Class.method()` instead of bare `.method()`. The agent

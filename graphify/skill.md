@@ -1518,6 +1518,7 @@ $(cat graphify-out/.graphify_python) -m graphify peek <symbol> [--lines N] [--md
 - `--lines N` — max body lines (default 200; the indent walker bails at the natural dedent first, so this is a cap).
 - `--md` — wrap focus label as `[label](file:line)` for IDE click-through.
 - Path qualifiers work: `peek tools/foo.py/_classify_file`.
+- **Brace-expand for multi-method dumps**: `peek "@Class.{m1,m2,m3}"` dumps three method bodies in one call. Section header `# [i/N] @Class.mi` separates each body. Misses print inline; exit 1 only when every target misses.
 
 Ambiguous targets print a candidate list to stderr (with file:line each) and exit non-zero — re-run with a more specific qualifier.
 

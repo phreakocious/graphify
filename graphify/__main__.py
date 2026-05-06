@@ -78,6 +78,7 @@ _HELP_BLOCKS: dict[str, list[str]] = {
         "    Pairs with `navigate ... read` — use peek when you don't want to commit to a session.",
         "    Accepts `Class.method` and `dir/file/Symbol` qualifiers, same as navigate.",
         "    On a class node, peek emits a curated dump (class header + each method's sig + N body lines) instead of the full class body — saves the per-method walk.",
+        "    Brace-expand `peek @Class.{m1,m2,m3}` to dump several method bodies in one call (collapses N peek calls — common shape when comprehending a class). Misses print inline; exit 1 only when every target misses.",
     ],
     "locate": [
         "  locate <s1> [<s2> ...]  multi-symbol file:line lookup, no body — find where many things live in one call",
@@ -1183,6 +1184,34 @@ def claude_uninstall(project_dir: Path | None = None) -> None:
         print(f"CLAUDE.md was empty after removal - deleted {target.resolve()}")
 
     _uninstall_claude_hook(project_dir or Path("."))
+
+
+def _expand_brace_multi_peek(target: str) -> list[str]:
+    """Lap-25: expand `prefix{a,b,c}suffix` → multiple targets.
+
+    Lets `peek @Class.{m1,m2,m3}` collapse three peek calls into one —
+    the V2 trial 1 transcript pattern (peek __init__ then peek
+    add_all_geometries on the same class). Supports a single brace
+    group; only triggers when the inner contains a comma so labels
+    with literal `{var}` braces pass through unchanged.
+    """
+    open_idx = target.find("{")
+    if open_idx < 0:
+        return [target]
+    close_idx = target.find("}", open_idx + 1)
+    if close_idx < 0:
+        return [target]
+    inner = target[open_idx + 1:close_idx]
+    if "," not in inner:
+        return [target]
+    if "{" in inner:  # nested groups not supported
+        return [target]
+    parts = [p.strip() for p in inner.split(",") if p.strip()]
+    if not parts:
+        return [target]
+    prefix = target[:open_idx]
+    suffix = target[close_idx + 1:]
+    return [f"{prefix}{p}{suffix}" for p in parts]
 
 
 def main() -> None:
@@ -2867,128 +2896,150 @@ def main() -> None:
             sys.exit(1)
         G, _comm = load_graph(gp)
         idx = label_index(G)
-        chosen, candidates, match_type, _alts = resolve_focus(G, idx, target)
-        if not chosen:
-            if candidates:
-                # Multiple matches — print a short disambig list so the
-                # caller can re-run with a more specific target. We
-                # don't run a full disambig listing here because peek
-                # is one-shot; resolution is the agent's job.
-                print(f"ambiguous `{target}` ({len(candidates)} matches). "
-                      f"qualify with @<dir>/<file>/<symbol>:", file=sys.stderr)
-                for nid in candidates[:8]:
-                    a = G.nodes[nid]
-                    sf = a.get("source_file", "?")
-                    loc = a.get("source_location", "")
-                    label = a.get("label", nid)
-                    print(f"  {label}  {sf}{':' + loc[1:] if loc.startswith('L') else ''}",
-                          file=sys.stderr)
-                if len(candidates) > 8:
-                    print(f"  +{len(candidates) - 8} more", file=sys.stderr)
-                sys.exit(1)
-            print(f"no node matches `{target}`.", file=sys.stderr)
-            sys.exit(1)
-        if match_type and match_type != "exact":
-            chosen_label = G.nodes[chosen].get("label", chosen)
-            print(f"# matched `{target}` → {chosen_label} ({match_type})")
-        nattrs = G.nodes[chosen]
-        sf = nattrs.get("source_file")
-        loc = nattrs.get("source_location")
-        node_kind = nattrs.get("node_kind") or ""
+        # Lap-25: brace-expand `prefix{a,b,c}suffix` into N targets so
+        # `peek @Class.{m1,m2,m3}` collapses three peek calls into one.
+        # Pattern surfaced in V2 trial 1 transcript (peek __init__ then
+        # peek add_all_geometries on GeometryAnalyzer — two separate
+        # calls when the agent already had the class).
+        targets = _expand_brace_multi_peek(target)
+        multi = len(targets) > 1
+        if multi:
+            print(f"# multi-peek: {len(targets)} targets")
+        any_ok = False
+        for ti, t in enumerate(targets):
+            if multi:
+                if ti > 0:
+                    print()
+                print(f"# [{ti+1}/{len(targets)}] {t}")
+            chosen, candidates, match_type, _alts = resolve_focus(G, idx, t)
+            if not chosen:
+                if candidates:
+                    # Multiple matches — print a short disambig list so the
+                    # caller can re-run with a more specific target. We
+                    # don't run a full disambig listing here because peek
+                    # is one-shot; resolution is the agent's job.
+                    print(f"ambiguous `{t}` ({len(candidates)} matches). "
+                          f"qualify with @<dir>/<file>/<symbol>:", file=sys.stderr)
+                    for nid in candidates[:8]:
+                        a = G.nodes[nid]
+                        sf = a.get("source_file", "?")
+                        loc = a.get("source_location", "")
+                        label = a.get("label", nid)
+                        print(f"  {label}  {sf}{':' + loc[1:] if loc.startswith('L') else ''}",
+                              file=sys.stderr)
+                    if len(candidates) > 8:
+                        print(f"  +{len(candidates) - 8} more", file=sys.stderr)
+                else:
+                    print(f"no node matches `{t}`.", file=sys.stderr)
+                if not multi:
+                    sys.exit(1)
+                continue
+            any_ok = True
+            if match_type and match_type != "exact":
+                chosen_label = G.nodes[chosen].get("label", chosen)
+                print(f"# matched `{t}` → {chosen_label} ({match_type})")
+            nattrs = G.nodes[chosen]
+            sf = nattrs.get("source_file")
+            loc = nattrs.get("source_location")
+            node_kind = nattrs.get("node_kind") or ""
 
-        # Lap-21 #2: curated dump for classes. Land on the class header
-        # + each method's sig + first N body lines. The agent gets a
-        # one-call orientation instead of:
-        #   1. peek Class            (gets a 200-line body wall)
-        #   2. navigate @Class methods   (lists method ids)
-        #   3. peek Class.method_a   (4-5 times, one per method)
-        # Reuses _read_body_preview for per-method body windows.
-        if node_kind in ("class", "interface") and sf and loc:
-            label = nattrs.get("label", chosen)
-            # Walk the class's methods via successor edges (`method` or
-            # `contains`). Sort by start-line so the dump reads top-to-
-            # bottom in source order — matches an agent reading the file.
-            method_ids: list[str] = []
-            for v in G.successors(chosen):
-                rel = G.edges[chosen, v].get("relation") or ""
-                if rel not in ("method", "contains"):
-                    continue
-                v_kind = G.nodes[v].get("node_kind") or ""
-                v_label = G.nodes[v].get("label", "")
-                # Functions/methods only — skip nested classes, types, etc.
-                if v_kind in ("class", "interface", "type_alias"):
-                    continue
-                if not (v_label.endswith("()") or v_kind in
-                        ("method", "impl_method", "iface_method", "function")):
-                    continue
-                method_ids.append(v)
+            # Lap-21 #2: curated dump for classes. Land on the class header
+            # + each method's sig + first N body lines. The agent gets a
+            # one-call orientation instead of:
+            #   1. peek Class            (gets a 200-line body wall)
+            #   2. navigate @Class methods   (lists method ids)
+            #   3. peek Class.method_a   (4-5 times, one per method)
+            # Reuses _read_body_preview for per-method body windows.
+            if node_kind in ("class", "interface") and sf and loc:
+                label = nattrs.get("label", chosen)
+                # Walk the class's methods via successor edges (`method` or
+                # `contains`). Sort by start-line so the dump reads top-to-
+                # bottom in source order — matches an agent reading the file.
+                method_ids: list[str] = []
+                for v in G.successors(chosen):
+                    rel = G.edges[chosen, v].get("relation") or ""
+                    if rel not in ("method", "contains"):
+                        continue
+                    v_kind = G.nodes[v].get("node_kind") or ""
+                    v_label = G.nodes[v].get("label", "")
+                    # Functions/methods only — skip nested classes, types, etc.
+                    if v_kind in ("class", "interface", "type_alias"):
+                        continue
+                    if not (v_label.endswith("()") or v_kind in
+                            ("method", "impl_method", "iface_method", "function")):
+                        continue
+                    method_ids.append(v)
 
-            def _start_line(nid: str) -> int:
-                vloc = G.nodes[nid].get("source_location") or ""
-                if vloc.startswith("L"):
-                    try:
-                        return int(vloc[1:].split("-", 1)[0].split(":", 1)[0])
-                    except ValueError:
-                        return 1 << 30
-                return 1 << 30
-            method_ids.sort(key=_start_line)
+                def _start_line(nid: str) -> int:
+                    vloc = G.nodes[nid].get("source_location") or ""
+                    if vloc.startswith("L"):
+                        try:
+                            return int(vloc[1:].split("-", 1)[0].split(":", 1)[0])
+                        except ValueError:
+                            return 1 << 30
+                    return 1 << 30
+                method_ids.sort(key=_start_line)
 
-            # Print header.
-            loc_short = loc[1:] if loc.startswith("L") else loc
-            kind_word = "class" if node_kind == "class" else "interface"
-            print(f"  peek {kind_word} @{label}  {sf}:{loc_short}  "
-                  f"({len(method_ids)} method(s))")
-            # Class header line — first line of class body, single line.
-            class_head, _ln, _trunc = _read_body_full(
-                sf, loc, max_lines=1, flat=True
-            )
-            if class_head:
-                print(f"  {class_head[0].strip()}")
-
-            shown = method_ids[:method_limit]
-            for idx, mid in enumerate(shown, 1):
-                m = G.nodes[mid]
-                m_label = m.get("label", mid) or mid
-                m_loc = m.get("source_location") or ""
-                m_loc_short = m_loc[1:] if m_loc.startswith("L") else ""
-                # Strip leading dot for display since we already announced
-                # "class Foo" — `.foo()` reads as `foo()` in this scope.
-                disp = m_label.lstrip(".") if m_label.startswith(".") else m_label
-                preview = _read_body_preview(
-                    m.get("source_file") or sf, m_loc, n=max(1, bodies + 1)
+                # Print header.
+                loc_short = loc[1:] if loc.startswith("L") else loc
+                kind_word = "class" if node_kind == "class" else "interface"
+                print(f"  peek {kind_word} @{label}  {sf}:{loc_short}  "
+                      f"({len(method_ids)} method(s))")
+                # Class header line — first line of class body, single line.
+                class_head, _ln, _trunc = _read_body_full(
+                    sf, loc, max_lines=1, flat=True
                 )
-                print(f"    [{idx}] {disp}  L{m_loc_short}" if m_loc_short
-                      else f"    [{idx}] {disp}")
-                # First entry is the signature line; stripped to one line.
-                # Indent body lines so the per-method block reads as a unit.
-                for j, line in enumerate(preview or []):
-                    if j == 0:
-                        # _read_body_preview already returns the header.
-                        # Skip if it just repeats the label-only sig (rare;
-                        # body_preview falls back when source unreadable).
-                        if line.strip().startswith("def ") or line.strip().startswith(
-                            ("async def ", "function ", "static ", "public ", "private ", "protected ", "export ", "constructor")
-                        ) or "(" in line:
-                            print(f"        {line.strip()}")
-                            continue
-                    print(f"        {line.rstrip()}")
-            more = len(method_ids) - len(shown)
-            if more > 0:
-                print(f"    +{more} more — `peek {label}.<method>` for individual bodies")
-            return
+                if class_head:
+                    print(f"  {class_head[0].strip()}")
 
-        is_file = _is_file_node(G, chosen)
-        body, ln, trunc = _read_body_full(sf, loc, max_lines=max_lines, flat=is_file)
-        data = {
-            "type": "body",
-            "label": nattrs.get("label", chosen),
-            "source_file": sf,
-            "source_location": loc,
-            "lines": body,
-            "start_line": ln,
-            "truncated": trunc,
-        }
-        print(_render_body_text(data, md=md))
+                shown = method_ids[:method_limit]
+                # Lap-25 rename: inner counter used to be `idx` which
+                # shadowed the outer `idx = label_index(G)` used by
+                # resolve_focus on the next loop iteration in multi mode.
+                for mi, mid in enumerate(shown, 1):
+                    m = G.nodes[mid]
+                    m_label = m.get("label", mid) or mid
+                    m_loc = m.get("source_location") or ""
+                    m_loc_short = m_loc[1:] if m_loc.startswith("L") else ""
+                    # Strip leading dot for display since we already announced
+                    # "class Foo" — `.foo()` reads as `foo()` in this scope.
+                    disp = m_label.lstrip(".") if m_label.startswith(".") else m_label
+                    preview = _read_body_preview(
+                        m.get("source_file") or sf, m_loc, n=max(1, bodies + 1)
+                    )
+                    print(f"    [{mi}] {disp}  L{m_loc_short}" if m_loc_short
+                          else f"    [{mi}] {disp}")
+                    # First entry is the signature line; stripped to one line.
+                    # Indent body lines so the per-method block reads as a unit.
+                    for j, line in enumerate(preview or []):
+                        if j == 0:
+                            # _read_body_preview already returns the header.
+                            # Skip if it just repeats the label-only sig (rare;
+                            # body_preview falls back when source unreadable).
+                            if line.strip().startswith("def ") or line.strip().startswith(
+                                ("async def ", "function ", "static ", "public ", "private ", "protected ", "export ", "constructor")
+                            ) or "(" in line:
+                                print(f"        {line.strip()}")
+                                continue
+                        print(f"        {line.rstrip()}")
+                more = len(method_ids) - len(shown)
+                if more > 0:
+                    print(f"    +{more} more — `peek {label}.<method>` for individual bodies")
+            else:
+                is_file = _is_file_node(G, chosen)
+                body, ln, trunc = _read_body_full(sf, loc, max_lines=max_lines, flat=is_file)
+                data = {
+                    "type": "body",
+                    "label": nattrs.get("label", chosen),
+                    "source_file": sf,
+                    "source_location": loc,
+                    "lines": body,
+                    "start_line": ln,
+                    "truncated": trunc,
+                }
+                print(_render_body_text(data, md=md))
+        if multi and not any_ok:
+            sys.exit(1)
 
     elif cmd == "locate":
         # Lap-21 (R3 sub-agent feedback): multi-symbol file:line lookup,
