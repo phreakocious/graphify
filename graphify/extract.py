@@ -1124,6 +1124,7 @@ def _extract_generic(path: Path, config: LanguageConfig) -> dict:
 
         if node.type in config.call_types:
             callee_name: str | None = None
+            func_node = None  # set by some branches; checked at raw_calls.append
 
             # Special handling per language
             if config.ts_module == "tree_sitter_swift":
