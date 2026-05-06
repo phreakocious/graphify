@@ -2,7 +2,7 @@ from pathlib import Path
 
 import pytest
 
-from harness.oracles import file_contains, pytest_passes, run_oracle
+from harness.oracles import file_contains, file_contains_all, pytest_passes, run_oracle
 
 FIXTURES = Path(__file__).parent / "fixtures" / "oracle"
 
@@ -53,3 +53,31 @@ def test_run_oracle_dispatches_by_kind():
 def test_run_oracle_unknown_kind_raises():
     with pytest.raises(ValueError, match="unknown oracle"):
         run_oracle(kind="banana", repo_dir=FIXTURES, args={})
+
+
+def test_file_contains_all_passes_when_all_present():
+    result = file_contains_all(
+        repo_dir=FIXTURES,
+        path="sample_file.txt",
+        substrings=["quick brown", "hello"],
+    )
+    assert result.passed
+
+
+def test_file_contains_all_fails_when_any_missing():
+    result = file_contains_all(
+        repo_dir=FIXTURES,
+        path="sample_file.txt",
+        substrings=["quick brown", "definitely-not-here"],
+    )
+    assert not result.passed
+    assert "definitely-not-here" in result.detail
+
+
+def test_file_contains_all_handles_missing_file():
+    result = file_contains_all(
+        repo_dir=FIXTURES,
+        path="nonexistent.txt",
+        substrings=["anything"],
+    )
+    assert not result.passed
