@@ -41,7 +41,7 @@ Turn any folder of files into a navigable knowledge graph with community detecti
 /graphify blast "<symbol>"                            # one-shot blast radius — callers + callees side-by-side under ## Callers / ## Callees (refactor planning, cursor-free)
 /graphify summarize "@<Class>"                        # one-shot class summary — signature + method list + cross-file callers + inheritance fused into one call (use for "tell me about this class" tasks instead of falling back to read_file on huge bodies)
 /graphify search "<pattern>"                          # body-text grep across nodes — returns hits with symbol context (label, file:line, container, community, degree)
-/graphify shape "<file>"                              # file structure summary: N classes / M fns / K consts / X imports / longest fn — wc -l + ctags equivalent
+/graphify shape "<file>"                              # file structure summary: N classes / M fns / K consts / X imports / longest fn — fns line stamps `×N` for cross-file callers and pins entry-point fns into the truncated listing (file's API surface visible inline)
 /graphify query "<question>"                          # BFS traversal - broad context (use after navigate narrows scope)
 /graphify query "<question>" --dfs                    # DFS - trace a specific path
 /graphify query "<question>" --budget 1500            # cap answer at N tokens
@@ -1319,7 +1319,7 @@ Op forms:
 ### Sibling subcommands (one-shot, no cursor)
 - `graphify peek "<symbol>"` — body dump. Same resolver ladder as navigate, including `Class.method` and `<dir>/<file>/<symbol>` qualifiers. `--lines N` for cap (default 200), `--md` for clickable label.
 - `graphify search "<pattern>"` — body-text grep with symbol context. `--kind code|rationale|all`, `--context N` for pre/post lines around each match (default 1; pass 0 to disable), `--limit N`. Pattern is a case-insensitive regex; falls back to literal substring on `re.error` (mode surfaced in header). Eliminates the grep fallback for "where does this string appear in code" — every hit comes back with label, file:line, community, degree.
-- `graphify shape "<file>"` — counts of classes, fns, consts, imports + the longest fn by line span. Saves a `contains` pivot for orientation.
+- `graphify shape "<file>"` — counts of classes, fns, consts, imports + the longest fn by line span. Each fn in the listing carries its line range (`L101-123`) and a `×N` marker when it has cross-file callers — the file's API surface is visible inline. Entry-point fns are pinned into the truncated listing even when they fall past `--limit` (default 8), so a public function at the bottom of a 21-fn file is never hidden inside `+N more`. Saves a `contains` pivot for orientation.
 
 ### Output format
 
