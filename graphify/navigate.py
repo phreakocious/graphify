@@ -2725,6 +2725,20 @@ def _render_search_text(data: dict, *, md: bool = False) -> str:
     if files_failed:
         header += f", {files_failed} unreadable"
     header += ")"
+    # Lap-20 field-report fix: when truncation hides >50% of results OR
+    # the hidden count is large in absolute terms, promote a top-of-output
+    # banner. The footer-only `+M more` is easy to miss when scanning
+    # `8 hit(s)` and reading down — the banner reframes the listing as
+    # truncated up front so the agent narrows the regex or raises --limit
+    # before iterating on possibly-irrelevant top matches. Keeps the
+    # footer fallback for mild truncation. `⚠` matches the disambig
+    # `⚠ ambiguous:` glyph for cross-verb consistency.
+    grand_total = total + truncated
+    if truncated and (truncated > 100 or truncated > total):
+        out.append(
+            f"  ⚠ showing {total} of {grand_total} — narrow the regex "
+            f"or use --limit {grand_total} to see more"
+        )
     out.append(header)
 
     # File-letter table when files repeat.

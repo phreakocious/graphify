@@ -2993,3 +2993,94 @@ def test_include_inferred_default_off_silent_no_marker(tmp_path, monkeypatch):
     )
 
 
+
+def test_search_truncation_promotes_top_banner(tmp_path, monkeypatch):
+    """Lap-20 field-report fix #6: when search truncation hides >50% of
+    results, a top-of-output banner with the ⚠ glyph reframes the listing
+    as truncated. Without this the trailing `+M more` is easy to miss when
+    scanning a `8 hit(s)` header."""
+    from graphify.navigate import search_bodies, _render_search_text
+    src = tmp_path / "big.py"
+    # 30 NEEDLE lines; we'll cap at 5 visible → 25 truncated → 25 > 5 (>50%)
+    src.write_text("\n".join(f"x = NEEDLE  # line {i}" for i in range(30)) + "\n",
+                   encoding="utf-8")
+    nodes = [
+        {"id": "f", "label": "big.py", "file_type": "code",
+         "source_file": str(src), "source_location": "L1"},
+    ]
+    _write_graph(tmp_path / "graphify-out", nodes, [])
+    monkeypatch.chdir(tmp_path)
+    import networkx as nx
+    G = nx.DiGraph()
+    for n in nodes:
+        G.add_node(n["id"], **{k: v for k, v in n.items() if k != "id"})
+    data = search_bodies(G, "NEEDLE", limit=5)
+    out = _render_search_text(data)
+    assert "⚠" in out, f"banner glyph missing on heavy truncation:\n{out}"
+    assert "showing 5 of 30" in out, (
+        f"banner should name visible/grand-total ratio:\n{out}"
+    )
+    assert "narrow the regex" in out, (
+        f"banner should suggest narrowing or raising --limit:\n{out}"
+    )
+    # Footer fallback still present (not exclusive).
+    assert "+25 more" in out, (
+        f"footer should remain as fallback:\n{out}"
+    )
+
+
+def test_search_truncation_mild_keeps_only_footer(tmp_path, monkeypatch):
+    """Mild truncation (≤50% AND ≤100 hidden) should keep the
+    existing footer-only behavior — no banner promotion."""
+    from graphify.navigate import search_bodies, _render_search_text
+    src = tmp_path / "mid.py"
+    # 12 hits, limit 10 → 2 truncated → both thresholds (>50%, >100) miss.
+    src.write_text("\n".join(f"x = NEEDLE  # line {i}" for i in range(12)) + "\n",
+                   encoding="utf-8")
+    nodes = [
+        {"id": "f", "label": "mid.py", "file_type": "code",
+         "source_file": str(src), "source_location": "L1"},
+    ]
+    _write_graph(tmp_path / "graphify-out", nodes, [])
+    monkeypatch.chdir(tmp_path)
+    import networkx as nx
+    G = nx.DiGraph()
+    for n in nodes:
+        G.add_node(n["id"], **{k: v for k, v in n.items() if k != "id"})
+    data = search_bodies(G, "NEEDLE", limit=10)
+    out = _render_search_text(data)
+    assert "⚠" not in out, f"banner should NOT fire on mild truncation:\n{out}"
+    assert "+2 more" in out, f"footer should still surface:\n{out}"
+
+
+def test_search_truncation_absolute_threshold_fires(tmp_path, monkeypatch):
+    """Even when truncation hides <50%, an absolute hidden count >100 should
+    promote the banner — large `+M more` numbers warrant the up-front signal
+    even if the visible slice is the majority."""
+    from graphify.navigate import search_bodies, _render_search_text
+    src = tmp_path / "big.py"
+    # 250 hits, limit 200 → 50 visible? No — limit applies to hits returned.
+    # Need >100 truncated AND truncated <= total. So total=200, truncated=101
+    # ⇒ grand_total=301, visible=200. truncated (101) is < total (200) but
+    # >100 abs → banner fires.
+    src.write_text("\n".join(f"x = NEEDLE  # line {i}" for i in range(301)) + "\n",
+                   encoding="utf-8")
+    nodes = [
+        {"id": "f", "label": "big.py", "file_type": "code",
+         "source_file": str(src), "source_location": "L1"},
+    ]
+    _write_graph(tmp_path / "graphify-out", nodes, [])
+    monkeypatch.chdir(tmp_path)
+    import networkx as nx
+    G = nx.DiGraph()
+    for n in nodes:
+        G.add_node(n["id"], **{k: v for k, v in n.items() if k != "id"})
+    data = search_bodies(G, "NEEDLE", limit=200)
+    out = _render_search_text(data)
+    assert "⚠" in out, (
+        f"banner should fire on absolute hidden count >100:\n{out}"
+    )
+    assert "showing 200 of 301" in out, (
+        f"banner should name visible/grand-total ratio:\n{out}"
+    )
+
