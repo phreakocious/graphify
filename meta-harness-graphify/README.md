@@ -34,14 +34,44 @@ Per-rollout transcripts live in `runs/<candidate>__<task>__t<N>/`.
 
 ## What's been measured
 
-| comparison | TTC mean (delta) | pass | notes |
-|---|---|---|---|
-| baseline_minimal vs baseline_navigator | -61.3% (17,923 → 6,940) | 1.0 / 1.0 | calibrated SKILL.md savings on seed_task_001 (compare run 2). Same call count and wall time — the agent does the same plan with cheaper content. |
+**Two head-to-head comparisons + a 5-section ablation matrix on two tasks.**
 
-Headline: **the lap-21 calibration of `baseline_navigator/SKILL.md` (R3
-decision rule, primer framing, full verb table, output conventions)
-saves 61% TTC over the prior 14-line baseline at identical call count
-and pass rate.** See `docs/compare_run2_clean.md` for the writeup.
+### Calibrated vs minimal SKILL.md (head-to-head)
+
+| task | baseline_minimal | baseline_navigator | delta | pass |
+|---|---|---|---|---|
+| 1 (compute_score median) | 17,923 ttc | 6,940 ttc | **-61%** | 1.0 / 1.0 |
+| 2 (caller trace) | 21,603 ttc | 8,010 ttc | **-63%** | 1.0 / 1.0 |
+
+Same call count and wall time on both tasks — the agent does the same
+plan with cheaper content per step. See `docs/compare_run2_clean.md`.
+
+### Ablation matrix — does every section earn its keep?
+
+Each row drops one section of the calibrated baseline_navigator
+SKILL.md; lower number = section is more droppable. **No section
+showed zero effect on either task.**
+
+| section dropped | task 1 cost | task 2 cost | verdict |
+|---|---|---|---|
+| Reading graphify output | +31% | **+88%** | KEEP — biggest effect |
+| First-call hygiene (`graphify update`, `!stale` banner) | +35% | **+67%** (bimodal) | KEEP — insurance |
+| graphify-as-primer paragraph | +13% | **+49%** | KEEP — task-2 critical |
+| R3 decision rule | +8% | **+39%** | KEEP — task-2 critical |
+| Verb table beyond navigate (peek/shape/etc.) | +4% | **+22%** | KEEP — smallest but real |
+
+**Headline: the lap-21 maintainer's calibration matches empirical
+results 5-for-5.** No section in the calibrated SKILL.md is unearned
+token cost. See `docs/ablation_run1_task1.md` and
+`docs/ablation_run2_task2.md` for full writeups.
+
+### Footprint optimization next steps
+
+Section-granularity ablation has hit diminishing returns. To trim
+further would need:
+1. Sub-section ablations within "Reading graphify output" (5 sub-rules)
+2. Per-verb ablations within the verb table
+3. CLI-side optimization (output density of `graphify navigate` etc.)
 
 ## Candidates currently in `agents/`
 
