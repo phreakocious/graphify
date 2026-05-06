@@ -654,9 +654,27 @@ def _node_summary(G: nx.DiGraph, nid: str) -> dict:
     cid = a.get("community")
     labels = (G.graph.get("community_labels") if hasattr(G, "graph") else None) or {}
     hubs = (G.graph.get("community_hubs") if hasattr(G, "graph") else None) or {}
+    label = a.get("label", nid)
+    # Lap-21 #1 (sub-agent head-to-head): when label is method-shape
+    # (`.foo()`), find its owning class via the `method` predecessor
+    # so the renderer can disambiguate `.compute() in Cursor` from
+    # `.compute() in CursorMock` without forcing a `parent` pivot.
+    # Walk both `method` and `contains` since some extractors emit
+    # methods via contains rather than method.
+    owner_class = ""
+    if isinstance(label, str) and label.startswith(".") and label.endswith("()"):
+        for u in G.predecessors(nid):
+            rel = G.edges[u, nid].get("relation") or ""
+            if rel not in ("method", "contains"):
+                continue
+            u_kind = G.nodes[u].get("node_kind") or ""
+            if u_kind in ("class", "interface"):
+                owner_class = G.nodes[u].get("label", "") or ""
+                break
     return {
         "id": nid,
-        "label": a.get("label", nid),
+        "label": label,
+        "owner_class": owner_class,
         "community": cid,
         "community_label": labels.get(cid) if cid is not None else None,
         "is_community_hub": cid is not None and hubs.get(cid) == nid,
@@ -1532,7 +1550,15 @@ def _render_frontier_text(data: dict, cursor: Cursor, *, show_ops: bool,
         kind_tag = " [type]"
     else:
         kind_tag = ""
-    linked_label = _maybe_link(n['label'], n.get('source_file'),
+    # Lap-21 #1: focus header for method-shape labels gets the owner-class
+    # prefix too — `@ Cursor.pop()` reads cleaner than `@ .pop()` and tells
+    # the agent which class without a `parent` pivot.
+    focus_label = n['label']
+    focus_owner = n.get("owner_class") or ""
+    if (focus_owner and isinstance(focus_label, str)
+            and focus_label.startswith(".")):
+        focus_label = f"{focus_owner}{focus_label}"
+    linked_label = _maybe_link(focus_label, n.get('source_file'),
                                 n.get('source_location'), md)
     header = f"@ {linked_label}  · {cstr} · deg={n['degree']} · {src}{ftype_tag}{test_tag}{archived_tag}{kind_tag}{_meta_tag(n)}"
 
@@ -2176,6 +2202,14 @@ def _render_listing_text(data: dict, *, show_ops: bool, md: bool = False) -> str
         if "edge" in item:
             prev_was_extracted = is_extracted
         label = (item.get("label") or item["id"])
+        # Lap-21 #1: prefix `.method()` rows with the owning class so
+        # `.compute()` listings disambiguate Cursor.compute vs
+        # CursorMock.compute without forcing the agent to walk `parent`.
+        # owner_class is set only when label is method-shape and a
+        # class-kind predecessor exists; free functions are unchanged.
+        owner = item.get("owner_class") or ""
+        if owner and isinstance(label, str) and label.startswith("."):
+            label = f"{owner}{label}"
         if len(label) > 44:
             label = label[:43] + "…"
         # md-mode wraps the label as `[label](src:line)`. Truncation happens
@@ -2887,9 +2921,23 @@ def search_bodies(G: nx.DiGraph,
                     ctx_pre.append(lines[k].rstrip("\n"))
                 for k in range(i, min(len(lines), i + context)):
                     ctx_post.append(lines[k].rstrip("\n"))
+            owner_label = owner_attrs.get("label", owner_nid)
+            # Lap-21 #1: stamp owner_class so the renderer can show
+            # `Class.method()` instead of bare `.method()`.
+            owner_class = ""
+            if isinstance(owner_label, str) and owner_label.startswith(".") and owner_label.endswith("()"):
+                for u in G.predecessors(owner_nid):
+                    rel = G.edges[u, owner_nid].get("relation") or ""
+                    if rel not in ("method", "contains"):
+                        continue
+                    u_kind = G.nodes[u].get("node_kind") or ""
+                    if u_kind in ("class", "interface"):
+                        owner_class = G.nodes[u].get("label", "") or ""
+                        break
             hits.append({
                 "id": owner_nid,
-                "label": owner_attrs.get("label", owner_nid),
+                "label": owner_label,
+                "owner_class": owner_class,
                 "source_file": sf,
                 "source_location": owner_attrs.get("source_location"),
                 "match_line": i,
@@ -3036,6 +3084,9 @@ def _render_search_text(data: dict, *, md: bool = False) -> str:
         else:
             loc_str = f"{sf}:{h['match_line']}"
         label = h.get("label") or h["id"]
+        owner = h.get("owner_class") or ""
+        if owner and isinstance(label, str) and label.startswith("."):
+            label = f"{owner}{label}"
         if md:
             label = _maybe_link(label, sf, f"L{h['match_line']}", md)
         # Lap-21 #7: with --by-symbol, append `×N (lines: a,b,c)` so a

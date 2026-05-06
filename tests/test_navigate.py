@@ -2236,6 +2236,65 @@ def test_frontier_header_disambiguates_focus_from_community(tmp_path, monkeypatc
     )
 
 
+def test_method_listings_attribute_owning_class(tmp_path, monkeypatch):
+    """Lap-21 #1 (sub-agent head-to-head): rows for `.method()`-shape
+    nodes show `Class.method()` instead of bare `.method()`. The agent
+    can disambiguate `Cursor.pop` from `CursorMock.pop` without
+    walking the `parent` pivot."""
+    from graphify.navigate import navigate
+    nodes = [
+        {"id": "ca", "label": "Cursor", "file_type": "code",
+         "source_file": "a.py", "source_location": "L1",
+         "node_kind": "class"},
+        {"id": "cb", "label": "CursorMock", "file_type": "code",
+         "source_file": "a.py", "source_location": "L40",
+         "node_kind": "class"},
+        {"id": "ma", "label": ".pop()", "file_type": "code",
+         "source_file": "a.py", "source_location": "L5",
+         "node_kind": "impl_method"},
+        {"id": "mb", "label": ".pop()", "file_type": "code",
+         "source_file": "a.py", "source_location": "L45",
+         "node_kind": "impl_method"},
+        # Free function — should NOT get owner-class prefix.
+        {"id": "free", "label": "compute()", "file_type": "code",
+         "source_file": "b.py", "source_location": "L1",
+         "node_kind": "function"},
+    ]
+    links = [
+        {"source": "ca", "target": "ma", "relation": "method",
+         "confidence": "EXTRACTED"},
+        {"source": "cb", "target": "mb", "relation": "method",
+         "confidence": "EXTRACTED"},
+    ]
+    _write_graph(tmp_path / "graphify-out", nodes, links)
+    monkeypatch.chdir(tmp_path)
+
+    # `@.pop()` triggers a substring listing — both methods show owner.
+    out_disambig = navigate(["@.pop()"], session=False, fmt="text")
+    assert "Cursor.pop()" in out_disambig and "CursorMock.pop()" in out_disambig, (
+        f"both methods should show owner-class prefix:\n{out_disambig}"
+    )
+
+    # Methods pivot on a class — list rows show owner.
+    out_methods = navigate(["@Cursor", "methods"], session=False, fmt="text")
+    assert "Cursor.pop()" in out_methods, (
+        f"methods listing should show owner:\n{out_methods}"
+    )
+
+    # Frontier on a method shows owner in the focus header.
+    out_focus = navigate(["@Cursor.pop"], session=False, fmt="text")
+    header = next((ln for ln in out_focus.splitlines() if ln.startswith("@ ")), "")
+    assert "Cursor.pop()" in header, (
+        f"focus header should carry owner:\n{out_focus}"
+    )
+
+    # Free function (no leading dot) is NOT prefixed.
+    out_free = navigate(["@compute"], session=False, fmt="text")
+    assert "compute()" in out_free and "@ .compute()" not in out_free, (
+        f"free function should not get owner-class prefix:\n{out_free}"
+    )
+
+
 def test_path_loads_digraph_so_dotted_class_method_resolves(tmp_path):
     """Lap-21 regression: `graphify path` was loading via
     `json_graph.node_link_graph` which respects the `directed` field on
