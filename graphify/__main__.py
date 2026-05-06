@@ -67,6 +67,8 @@ _HELP_BLOCKS: dict[str, list[str]] = {
     ],
     "shape": [
         "  shape <file>            file structure summary: N classes / M fns / K consts / X imports / longest fn — orientation without committing to a `contains` pivot",
+        "    --limit N               max class/fn names listed in the summary (default 8; the `+N more` tail still surfaces what was truncated)",
+        "    --all                   list every class/fn name (no truncation; pairs well with `shape large_file.ts --all` when you already know the file is the target)",
         "    --json                  structured JSON output",
         "    --graph <path>          path to graph.json (default graphify-out/graph.json)",
         "    Resolves the same as `peek` (path-qualified, fuzzy fallback). Errors if target isn't a file.",
@@ -78,7 +80,7 @@ _HELP_BLOCKS: dict[str, list[str]] = {
         "    --archived-only         show only matches in archived/legacy code",
         "    --all-archived          include both active and archived",
         "    --limit N               max hits (default 50)",
-        "    --context N             N lines of pre/post context around each match (default 0)",
+        "    --context N             N lines of pre/post context around each match (default 1; pass 0 to disable)",
         "    --md                    label rendered as `[label](file:line)` markdown link",
         "    --json                  structured JSON output",
         "    --graph <path>          path to graph.json (default graphify-out/graph.json)",
@@ -87,6 +89,8 @@ _HELP_BLOCKS: dict[str, list[str]] = {
     "navigate": [
         "  navigate [ops...]       cursor-based graph navigation (LLM-friendly)",
         "    @<label>                focus on a node by label/id (fuzzy fallback for typos)",
+        "    @<Class>.<method>       method-on-class shortcut (`@Runner.compute` resolves to the class's `.compute()` method, not a free function named `compute`)",
+        "    @.<method>()            method-label form — leading dot marks it as a method (matches `.compute()` across classes via substring; pick from disambig if multiple)",
         "    @<dir/file>             path-qualified file resolution (`@tools/foo.py` or `@tools/foo` — extension optional)",
         "    @<dir/file/Symbol>      path-qualified symbol (`@tools/foo.py/_classify_file` — leading `_` works either way)",
         "    in | out | methods | contains    list typed pivots",
@@ -302,42 +306,57 @@ This project has a graphify knowledge graph at `graphify-out/graph.json`. Use it
 
 Before any of these moves, scout the graph first — it's 50–500x cheaper than the alternative:
 
-- **About to `Read` a source-code file you don't already know.** Run `graphify navigate "@<symbol>"` first. The frontier shows you whether the file is a leaf, hub, or router, and what shape of context you actually need.
-- **About to chain `Grep` / `Glob` calls to trace a call graph or find who-uses-X.** That's literally what `graphify navigate` `in`/`out`/`path` are for.
-- **About to implement, change, or debug something in unfamiliar territory.** Map the blast radius first: focus the entry point, run `in` to see callers, decide what's actually load-bearing.
+- **About to `Read` a source-code file you don't already know.** Run `graphify shape "<file>"` for a one-screen summary, or `graphify navigate "@<symbol>"` for the affordance frame. The frontier shows you whether the file is a leaf, hub, or router, and what shape of context you actually need.
+- **About to chain `Grep` / `Glob` calls to trace a call graph or find who-uses-X.** That's literally what `graphify navigate` `in`/`out`/`path` are for. For literal-string lookups across all bodies, `graphify search "<pattern>"` returns hits attributed to nodes (label, file:line, community, degree).
+- **About to read a single function to remind yourself what it does.** `graphify peek "<symbol>"` is a one-shot body dump — no cursor, no session.
+- **About to implement, change, or debug something in unfamiliar territory.** Map the blast radius first: focus the entry point, run `in --depth=2 --kind=calls` to see callers two hops out, decide what's actually load-bearing.
 - **You don't know where to start.** `graphify navigate "@<best-guess-label>"` is a free probe — a hit returns a frontier, a miss returns real names you can grab onto.
 
 **Don't reach for graphify when reading**: `.json` / `.yaml` / `.toml` / `.csv` / `.md` / `.txt` / `.log` / lockfiles / build output / your own memory or scratch files. graphify only indexes source code — for data, configs, prose, and machine output, just `Read` directly.
 
-### Default workflow
-
-Chain ops in a single call — left-to-right, output is the last op's result. When chaining is in flight (a chain paused at disambig, you passed `--session`, or the cursor has walked more than one step) the bottom of the output prints `session: <id>`; pass that id back via `--session <id>` to resume the cursor on a later call. One-shot focus calls stay quiet.
+### Verbs
 
 ```
-graphify navigate "@<symbol>"                    # focus a node, return frontier (~200 tok)
-graphify navigate "@<symbol>" methods            # focus + list methods
-graphify navigate "@<symbol>" methods 6 in       # focus + methods + pick 6th + show callers
-graphify navigate "@<symbol>" --include-inferred # widen to LLM-inferred edges (default: AST only)
-graphify navigate "@<symbol>" --json             # structured JSON for programmatic chaining
-graphify navigate --session <id> in              # resume a prior session, run another op
+graphify navigate "@<symbol>"                       # focus + frontier (~200 tok)
+graphify navigate "@<symbol>" methods 6 in          # chain: focus, list methods, pick 6th, show callers
+graphify peek "<symbol>"                            # one-shot body dump, no cursor
+graphify shape "<file>"                             # N classes / M fns / longest fn — orient without `contains`
+graphify search "<pattern>"                         # body-text grep, hits attributed to symbol
+graphify path "A" "B"                               # reachability between two nodes (~50 tok)
+graphify explain "<symbol>"                         # one-shot summary of one node (~350 tok)
+graphify diff old.json new.json                     # what changed: added/removed nodes/edges
+graphify update .                                   # AST re-extract after edits, no LLM cost
+graphify changed [git-ref]                          # files added/modified since last extract or vs ref
 ```
 
-Pivot ops: `in | out | methods | contains | coc | rat | parent | inh`. Pick from previous listing with `N` or `[N]`. Use `--legend` for the column-key on first invocation. Use `--limit N` to widen listings (default 25). Per-id cursor files mean parallel calls don't race on shared state.
+### Resolution forms (the `@` target)
 
-Use `graphify path "A" "B"` for reachability between two named things (~50 tok). Use `graphify explain "X"` for a one-shot summary of a single node (~350 tok). Use `graphify query "..."` only when the question is genuinely diffuse and you've already narrowed scope — it returns a flat node dump.
+- `@<label>` — by symbol name, fuzzy-fallback for typos.
+- `@<Class>.<method>` — method-on-class shortcut. `@Runner.compute` lands on the method, *not* a free function `compute()`.
+- `@.<method>()` — method-label form (`.compute()`); use when you don't know the owning class. Disambig listing if more than one class has it.
+- `@<dir/file>` or `@<dir/file/Symbol>` — path-qualified. Extension optional; leading `_` works either way.
 
-### After editing code
+### Useful flags on `navigate`
 
-```
-graphify update .
-```
+| flag | when |
+|---|---|
+| `--include-inferred` | widen to LLM-inferred edges (default: AST-only) |
+| `--depth N` | walk N hops via non-structural edges; pairs with `--kind=calls` for blast-radius |
+| `--kind <rel>[,...]` | restrict edges (e.g. `--kind=calls`) |
+| `--bodies N` | first N source lines under each `contains`/`methods` row — catches dead stubs / pass-throughs |
+| `--explain-cost` | preview "would-show N nodes ≈ K bytes" before committing on a big pivot |
+| `--transitive` | from a script-leaf file with no direct out-edges, walk via `contains` and aggregate children's outbound |
+| `--code-only` | filter rationale (docstring) nodes out of `coc` listings |
+| `--md` | render labels and src:line as markdown links for IDE click-through |
+| `--show-session <id>` | peek a saved session's frontier without mutating it (great for parallel exploration) |
+| `--limit N` | raise per-listing cap from 25 |
 
-Re-extracts changed files via AST. No LLM cost. Run after a session of edits to keep the graph current.
+Per-id cursor files mean parallel calls don't race. The session id only prints when chaining is in flight (chain paused at disambig, `--session` was passed, or cursor walked >1 step) — pass it via `--session <id>` to resume.
 
 ### What NOT to do
 
 - Don't read `GRAPH_REPORT.md` end-to-end — it's a 40KB+ overview that costs ~10K tokens and the community-list section is filler in AST-only mode. Use `graphify navigate` instead.
-- Don't run `graphify query` on a question you haven't narrowed yet — it caps at ~2K tokens of flat node listings, mostly noise.
+- Don't run `graphify query` on a question you haven't narrowed yet — it caps at ~2K tokens of flat node listings, mostly noise. Narrow with `navigate` first.
 """
 
 _CLAUDE_MD_MARKER = "## graphify"
@@ -351,39 +370,44 @@ This project has a graphify knowledge graph at `graphify-out/graph.json`. Use it
 
 ### When you should reach for graphify
 
-Before any of these moves, scout the graph first — it's 50–500x cheaper than the alternative:
+Before any of these moves, scout the graph first — it's 50–500x cheaper:
 
-- **About to read a source-code file you don't already know.** Run `graphify navigate "@<symbol>"` first. The frontier shows you whether the file is a leaf, hub, or router.
-- **About to chain greps to trace a call graph or find who-uses-X.** That's what `graphify navigate` `in`/`out`/`path` are for.
-- **About to implement, change, or debug in unfamiliar territory.** Map the blast radius first: focus the entry point, run `in` to see callers.
+- **About to read a source-code file you don't already know.** `graphify shape "<file>"` for a one-screen summary, or `graphify navigate "@<symbol>"` for the affordance frame.
+- **About to chain greps to trace a call graph or find who-uses-X.** That's what `graphify navigate` `in`/`out`/`path` are for. For literal strings: `graphify search "<pattern>"`.
+- **About to read one function.** `graphify peek "<symbol>"` is a one-shot body dump.
+- **About to implement, change, or debug in unfamiliar territory.** Map the blast radius first: focus the entry point, `in --depth=2 --kind=calls`.
 - **You don't know where to start.** `graphify navigate "@<best-guess-label>"` is a free probe.
 
-**Don't reach for graphify when reading**: `.json` / `.yaml` / `.toml` / `.csv` / `.md` / `.txt` / `.log` / lockfiles / build output / your own memory or scratch files. graphify only indexes source code — for data, configs, prose, and machine output, just read directly.
+**Don't reach for graphify when reading**: `.json` / `.yaml` / `.toml` / `.csv` / `.md` / `.txt` / `.log` / lockfiles / build output / scratch files. graphify only indexes source code.
 
-### Default workflow
-
-Chain ops left-to-right; output is the last op's result. When chaining is in flight (chain paused, `--session` passed, or cursor walked >1 step) the output prints `session: <id>`; pass it via `--session <id>` to resume.
+### Verbs
 
 ```
-graphify navigate "@<symbol>" methods 6 in   # focus, list methods, pick 6th, show its callers
-graphify navigate --session <id> back        # resume + ↺ pop history
+graphify navigate "@<symbol>" methods 6 in   # focus, list methods, pick 6th, show callers
+graphify peek "<symbol>"                     # one-shot body dump
+graphify shape "<file>"                      # class/fn/import counts, longest fn
+graphify search "<pattern>"                  # body-text grep, attributed to symbol
+graphify path "A" "B"                        # reachability (~50 tok)
+graphify explain "<symbol>"                  # one-shot node summary (~350 tok)
+graphify update .                            # AST re-extract, no LLM cost
 ```
 
-Pivots: `in | out | methods | contains | coc | rat | parent | inh`. Pick from listing with `N` or `[N]`.
+### Resolution forms (the `@` target)
 
-Use `graphify path "A" "B"` for reachability (~50 tok). Use `graphify explain "X"` for a one-shot node summary (~350 tok). Use `graphify query "..."` only when the question is genuinely diffuse and you've narrowed scope.
+- `@<label>` — by name, fuzzy on typos.
+- `@<Class>.<method>` — method shortcut (`@Runner.compute` resolves to the method, not a free `compute()`).
+- `@.<method>()` — method-label form when you don't know the owning class.
+- `@<dir/file>` or `@<dir/file/Symbol>` — path-qualified.
 
-### After editing code
+### Useful flags on `navigate`
 
-```
-graphify update .
-```
+`--include-inferred` widens to LLM-inferred edges; `--depth N` walks N hops via non-structural edges (`out --depth=2 --kind=calls` for blast-radius); `--bodies N` shows N source lines under each row; `--explain-cost` previews node/byte count before committing; `--code-only` filters rationale nodes from `coc`; `--md` renders labels as markdown links; `--show-session <id>` peeks a saved cursor without mutating it.
 
-AST-only re-extraction, no LLM cost.
+Chain ops left-to-right; output is the last op's result. When chaining is in flight (chain paused, `--session` passed, or cursor walked >1 step) the output prints `session: <id>` — pass it via `--session <id>` to resume.
 
 ### What NOT to do
 
-- Don't read `GRAPH_REPORT.md` end-to-end — it's a 40KB+ overview, ~10K tokens. Use `graphify navigate` instead.
+- Don't read `GRAPH_REPORT.md` end-to-end — ~10K tokens of overview. Use `graphify navigate` instead.
 - Don't run `graphify query` on a question you haven't narrowed yet — flat node dumps, mostly noise.
 """
 
@@ -396,35 +420,40 @@ This project has a graphify knowledge graph at `graphify-out/graph.json`. Use it
 
 ### When you should reach for graphify
 
-Before any of these moves, scout the graph first — it's 50–500x cheaper than the alternative:
+Before any of these moves, scout the graph first — it's 50–500x cheaper:
 
-- **About to read a source-code file you don't already know.** Run `graphify navigate "@<symbol>"` first.
-- **About to chain greps to trace a call graph or find who-uses-X.** That's what `graphify navigate` `in`/`out`/`path` are for.
-- **About to implement, change, or debug in unfamiliar territory.** Map the blast radius first.
+- **About to read a source-code file you don't already know.** `graphify shape "<file>"` for a one-screen summary, or `graphify navigate "@<symbol>"` for the affordance frame.
+- **About to chain greps to trace a call graph or find who-uses-X.** `graphify navigate` `in`/`out`/`path` for symbols, `graphify search "<pattern>"` for literal strings.
+- **About to read one function.** `graphify peek "<symbol>"` is a one-shot body dump.
+- **About to implement, change, or debug in unfamiliar territory.** Map the blast radius: focus + `in --depth=2 --kind=calls`.
 - **You don't know where to start.** `graphify navigate "@<best-guess-label>"` is a free probe.
 
-**Don't reach for graphify when reading**: `.json` / `.yaml` / `.toml` / `.csv` / `.md` / `.txt` / `.log` / lockfiles / build output / your own memory or scratch files. graphify only indexes source code — for data, configs, prose, and machine output, just read directly.
+**Don't reach for graphify when reading**: `.json` / `.yaml` / `.toml` / `.csv` / `.md` / `.txt` / `.log` / lockfiles / build output / scratch files. graphify only indexes source code.
 
-### Default workflow
-
-Chain ops left-to-right; output is the last op's result. When chaining is in flight (chain paused, `--session` passed, or cursor walked >1 step) the output prints `session: <id>`; pass it via `--session <id>` to resume.
+### Verbs
 
 ```
-graphify navigate "@<symbol>" methods 6 in   # focus, list methods, pick 6th, show its callers
-graphify navigate --session <id> back        # resume + ↺ pop history
+graphify navigate "@<symbol>" methods 6 in   # chain: focus, methods, pick 6th, show callers
+graphify peek "<symbol>"                     # one-shot body dump
+graphify shape "<file>"                      # class/fn counts + longest fn
+graphify search "<pattern>"                  # body-text grep, attributed to symbol
+graphify path "A" "B"                        # reachability (~50 tok)
+graphify explain "<symbol>"                  # node summary (~350 tok)
+graphify update .                            # AST re-extract after edits
 ```
 
-Pivots: `in | out | methods | contains | coc | rat | parent | inh`. Pick from listing with `N` or `[N]`.
+### Resolution forms (the `@` target)
 
-Use `graphify path "A" "B"` for reachability (~50 tok). Use `graphify explain "X"` for a one-shot summary (~350 tok). Use `graphify query "..."` only for genuinely diffuse questions after narrowing scope.
+- `@<label>` — by name, fuzzy on typos.
+- `@<Class>.<method>` — method shortcut. `@Runner.compute` lands on the method, not a free `compute()`.
+- `@.<method>()` — method-label form, owner-class agnostic.
+- `@<dir/file>` or `@<dir/file/Symbol>` — path-qualified.
 
-### After editing code
+### Useful flags on `navigate`
 
-```
-graphify update .
-```
+`--include-inferred`, `--depth N` (multi-hop), `--kind <rel>[,...]`, `--bodies N` (preview lines under each row), `--explain-cost` (preview before committing), `--code-only` (filter rationale from `coc`), `--md` (markdown links), `--show-session <id>` (peek without mutating).
 
-AST-only, no LLM cost.
+Chain ops left-to-right; output is the last op's result. When chaining is in flight, the output prints `session: <id>` — pass it via `--session <id>` to resume.
 
 ### What NOT to do
 
@@ -1980,17 +2009,21 @@ def main() -> None:
                     print("  ── inferred below ──")
                     boundary_inserted = True
                 prev_extracted = is_ext
-                if count >= _DUPE_COLLAPSE_THRESHOLD:
+                # explain renders edges, not nodes — duplicates here are
+                # always graph artifacts (two edges with identical
+                # label/rel/conf). The listing-collapse threshold (≥5) makes
+                # sense for navigate's pivot listings where you want to see a
+                # few same-label rows; in explain even a count of 2 is just
+                # noise. Collapse anything ≥2 as `×N`.
+                if count >= 2:
                     print(f"  --> {label_} [{rel}] [{conf}]  ×{count}")
                     shown += 1
                     covered += count
                 else:
-                    # Expand small groups inline, but stop at the line limit.
-                    take = min(count, limit - shown)
-                    for _ in range(take):
+                    if shown < limit:
                         print(f"  --> {label_} [{rel}] [{conf}]")
-                    shown += take
-                    covered += take
+                        shown += 1
+                        covered += 1
             if covered < len(neighbors_filtered):
                 print(f"  ... and {len(neighbors_filtered) - covered} more")
         elif dropped > 0:
@@ -2241,6 +2274,9 @@ def main() -> None:
         graph_path = DEFAULT_GRAPH_PATH
         target: str | None = None
         fmt = "text"
+        # Default 8: a one-screen summary keeps shape useful as a cold-start
+        # primitive. `--limit N` widens; `--all` returns the full lists.
+        shape_limit: int | None = 8
         i = 0
         while i < len(args):
             a = args[i]
@@ -2250,6 +2286,12 @@ def main() -> None:
                 graph_path = a.split("=", 1)[1]; i += 1
             elif a == "--json":
                 fmt = "json"; i += 1
+            elif a == "--all":
+                shape_limit = None; i += 1
+            elif a == "--limit" and i + 1 < len(args):
+                shape_limit = max(1, int(args[i + 1])); i += 2
+            elif a.startswith("--limit="):
+                shape_limit = max(1, int(a.split("=", 1)[1])); i += 1
             elif target is None:
                 target = a; i += 1
             else:
@@ -2257,7 +2299,7 @@ def main() -> None:
                       file=sys.stderr)
                 i += 1
         if not target:
-            print("Usage: graphify shape <file> [--json] [--graph PATH]",
+            print("Usage: graphify shape <file> [--limit N | --all] [--json] [--graph PATH]",
                   file=sys.stderr)
             sys.exit(1)
         gp = Path(graph_path)
@@ -2287,7 +2329,7 @@ def main() -> None:
                   f"(not a file). try `graphify shape \"@{sf}\"` if you meant the file.",
                   file=sys.stderr)
             sys.exit(1)
-        data = shape_file(G, chosen)
+        data = shape_file(G, chosen, limit=shape_limit)
         if fmt == "json":
             print(json.dumps(data))
         else:
@@ -2311,7 +2353,12 @@ def main() -> None:
         kind = "code"
         archived_mode = "no"
         limit = 50
-        context = 0
+        # Default 1 line of pre/post context: a single match line on its own
+        # rarely disambiguates definition vs call vs string literal vs comment.
+        # The field-report from another Claude flagged --context 0 (the prior
+        # default) as forcing a follow-up `peek` per hit. --context 0 still
+        # disables context for callers who explicitly want minimal output.
+        context = 1
         md = False
         fmt = "text"
         i = 0

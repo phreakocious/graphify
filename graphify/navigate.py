@@ -2750,7 +2750,11 @@ def _render_search_text(data: dict, *, md: bool = False) -> str:
 
 # --- file shape summary ----------------------------------------------------
 
-def shape_file(G: nx.DiGraph, file_nid: str) -> dict:
+_SHAPE_DEFAULT_LIMIT = 8
+
+
+def shape_file(G: nx.DiGraph, file_nid: str, *,
+               limit: int | None = _SHAPE_DEFAULT_LIMIT) -> dict:
     """Summarize a file's structure: class/fn/const/import counts + the
     longest top-level function by line span.
 
@@ -2875,8 +2879,11 @@ def shape_file(G: nx.DiGraph, file_nid: str) -> dict:
         "imports": imports,
         "longest_fn": longest_fn,
         "total_lines": total_lines,
-        "class_labels": [G.nodes[n].get("label", n) for n in classes][:8],
-        "fn_labels": [G.nodes[n].get("label", n) for n in fns][:8],
+        # `limit=None` (`--all`) returns the full lists; default 8 keeps the
+        # one-screen summary tight. The `+N more` line in the renderer still
+        # surfaces what was truncated, per the omission-counts rule.
+        "class_labels": [G.nodes[n].get("label", n) for n in classes][:limit] if limit else [G.nodes[n].get("label", n) for n in classes],
+        "fn_labels": [G.nodes[n].get("label", n) for n in fns][:limit] if limit else [G.nodes[n].get("label", n) for n in fns],
     }
 
 
@@ -3212,12 +3219,20 @@ def navigate(ops: list[str] | str, *,
                 if chosen:
                     if match_type and match_type != "exact":
                         chosen_label = G.nodes[chosen].get("label", chosen)
-                        trace.append(f"  > matched `{op_str}` → {chosen_label} ({match_type})")
+                        # Loud prefix when there are plausible alternatives:
+                        # silent-wrong-pick is the real failure mode the agent
+                        # field-reporter flagged. `prefix`+alternates and any
+                        # `fuzzy`/`substring` hit get the warning glyph; a
+                        # clean prefix with no alternates stays quiet.
+                        loud = bool(alternatives) or match_type in ("substring", "fuzzy")
+                        glyph = "⚠ ambiguous:" if loud else ""
+                        head = f"{glyph} matched" if glyph else "matched"
+                        trace.append(f"  > {head} `{op_str}` → {chosen_label} ({match_type})")
                         if alternatives:
                             alt_labels = [G.nodes[a].get("label", a) for a in alternatives]
                             trace.append(
                                 f"  > also near: {', '.join(alt_labels)}  "
-                                f"(pivot with @<label>)"
+                                f"(pivot with @<label> if wrong pick)"
                             )
                     cursor.push(chosen)
                     cursor.last_listing = []

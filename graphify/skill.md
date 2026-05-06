@@ -1316,7 +1316,7 @@ Op forms:
 
 ### Sibling subcommands (one-shot, no cursor)
 - `graphify peek "<symbol>"` — body dump. Same resolver ladder as navigate, including `Class.method` and `<dir>/<file>/<symbol>` qualifiers. `--lines N` for cap (default 200), `--md` for clickable label.
-- `graphify search "<pattern>"` — body-text grep with symbol context. `--kind code|rationale|all`, `--context N` for pre/post lines around each match, `--limit N`. Pattern is a case-insensitive regex; falls back to literal substring on `re.error` (mode surfaced in header). Eliminates the grep fallback for "where does this string appear in code" — every hit comes back with label, file:line, community, degree.
+- `graphify search "<pattern>"` — body-text grep with symbol context. `--kind code|rationale|all`, `--context N` for pre/post lines around each match (default 1; pass 0 to disable), `--limit N`. Pattern is a case-insensitive regex; falls back to literal substring on `re.error` (mode surfaced in header). Eliminates the grep fallback for "where does this string appear in code" — every hit comes back with label, file:line, community, degree.
 - `graphify shape "<file>"` — counts of classes, fns, consts, imports + the longest fn by line span. Saves a `contains` pivot for orientation.
 
 ### Output format
