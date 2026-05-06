@@ -45,6 +45,9 @@ def _load_task(task_id: str):
     if task_id == "seed_task_004":
         from tasks.seed_task_004 import task
         return task()
+    if task_id == "seed_task_005":
+        from tasks.seed_task_005 import task
+        return task()
     raise click.ClickException(f"unknown task: {task_id!r}")
 
 
