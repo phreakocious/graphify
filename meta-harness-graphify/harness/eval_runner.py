@@ -5,9 +5,32 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
-from anthropic import Anthropic
+from anthropic import Anthropic, APIStatusError
 
 from harness.oracles import run_oracle
+
+
+def _create_with_overload_retry(client: Anthropic, *, max_extra_retries: int = 4,
+                                extra_sleep_s: int = 60, **kwargs):
+    """Wrap client.messages.create with an outer retry layer for sustained
+    API overload (HTTP 529). The SDK already retries internally with
+    exponential backoff (~30s at max_retries=6); this wrapper adds a longer
+    cooldown for cases where the API is overloaded for minutes, not seconds.
+
+    Each extra retry sleeps 60s (so 4 retries = 4 minutes of cushion). Any
+    non-overload error raises immediately."""
+    last_exc: Exception | None = None
+    for attempt in range(max_extra_retries + 1):
+        try:
+            return client.messages.create(**kwargs)
+        except APIStatusError as e:
+            if e.status_code != 529:
+                raise
+            last_exc = e
+            if attempt < max_extra_retries:
+                time.sleep(extra_sleep_s)
+    assert last_exc is not None
+    raise last_exc
 from harness.sandbox import Sandbox, snapshot_repo
 from harness.tools import TOOL_DEFINITIONS, TOOL_DISPATCH, ToolContext
 from harness.types import Candidate, OracleResult, RolloutResult, Task, ToolCall
@@ -100,7 +123,8 @@ def run_rollout(
                     final_text = f"[budget_tokens exceeded at iter {iteration}]"
                     break
 
-                resp = client.messages.create(
+                resp = _create_with_overload_retry(
+                    client,
                     model=config.model,
                     max_tokens=4096,
                     system=system_blocks,
