@@ -985,17 +985,23 @@ def _signature_end(lines: list[str], start: int, max_search: int = 40) -> int:
     lines indented far past the body's indent baseline. Without skipping
     them, the body walker fixates on the param-column indent, then
     breaks the moment the actual body dedents past it — capturing only
-    the signature lines and missing the body. Track paren depth across
-    bracket types and consider the header complete once depth ≤ 0
-    after at least one line. No string/comment awareness; bounded by
+    the signature lines and missing the body.
+
+    Tracks ONLY `(` / `)` depth — not `{}` or `[]`. The TS/JS body opens
+    with `{` on the header line (e.g. `function foo(): T {`); counting it
+    as a continuation kept the walker inside the body until matching `}`
+    and silently truncated to args-only. `[]` was once tracked because
+    Python type hints like `Dict[str, int]` can wrap multi-line params,
+    but those brackets are always inside the param parens anyway so
+    paren-only is sufficient. No string/comment awareness; bounded by
     `max_search` so we don't walk forever on malformed input.
     """
     depth = 0
     for i in range(start, min(len(lines), start + max_search)):
         for c in lines[i]:
-            if c in "([{":
+            if c == "(":
                 depth += 1
-            elif c in ")]}":
+            elif c == ")":
                 depth -= 1
         if depth <= 0:
             return i + 1

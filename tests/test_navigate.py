@@ -1813,6 +1813,68 @@ def test_read_walker_handles_multiline_ts_arrow(tmp_path, monkeypatch):
     )
 
 
+def test_read_walker_handles_long_ts_fn_with_multiline_sig(tmp_path):
+    """Lap-21 #1: TS-Claude reported `peek @compile` returning args-only
+    (6 lines) for a 41-line function. Root cause: _signature_end tracked
+    `{`/`}` along with `(`/`)`, so the body-opening `{` kept depth>0 deep
+    into the body. With max_search=40, depth never balanced before the
+    bound, sig_end fell back to start+1, and the body walker fixated
+    body_indent on the param-column. Fix: paren-only depth.
+
+    Test shape: 50-line TS function with multi-line param list + braces
+    in the body (object literals, blocks). Without the fix, sig_end
+    falls back, body_indent locks to 2 (the param column), and the first
+    real body line at indent 2 is captured but the {} blocks at deeper
+    indents aren't — and we cap at the FIRST dedent past 2."""
+    src = (tmp_path / "compile.ts")
+    body_lines = [
+        "function compile(\n",
+        "  spec: Spec,\n",
+        "  opts: Opts,\n",
+        "  flags: Flags,\n",
+        "): Engine {\n",
+    ]
+    # 45 body lines with varying brace nesting, simulating real TS code.
+    for i in range(45):
+        if i % 5 == 0:
+            body_lines.append(f"  const obj{i} = {{ key: {i} }};\n")
+        elif i % 5 == 1:
+            body_lines.append(f"  if (cond{i}) {{\n")
+        elif i % 5 == 2:
+            body_lines.append(f"    doStuff{i}();\n")
+        elif i % 5 == 3:
+            body_lines.append("  }\n")
+        else:
+            body_lines.append(f"  const x{i} = {i};\n")
+    body_lines.append("  return engine;\n")
+    body_lines.append("}\n")
+    body_lines.append("\n")
+    body_lines.append("function other() { return 0; }\n")
+    src.write_text("".join(body_lines), encoding="utf-8")
+
+    from graphify.navigate import _read_body_full, _read_body_preview
+    body, ln, _ = _read_body_full(str(src), "L1", max_lines=200)
+    text = "\n".join(body)
+    assert "const obj0" in text, (
+        f"long TS fn body never reached body lines (sig_end fallback):\n"
+        f"{text[:500]}"
+    )
+    assert "return engine" in text, (
+        f"long TS fn body truncated before return:\n{text[-500:]}"
+    )
+    assert "function other" not in text, (
+        f"walker leaked past closing brace:\n{text[-500:]}"
+    )
+
+    # `peek @compile` => preview of n=3 should show actual body, not args.
+    preview = _read_body_preview(str(src), "L1", n=8)
+    preview_text = "\n".join(preview)
+    assert "const obj0" in preview_text or "if (cond1)" in preview_text, (
+        f"--bodies 3 / peek preview returned args-only for long TS fn:\n"
+        f"{preview_text}"
+    )
+
+
 def test_unknown_op_suggests_at_prefix_on_path_shape(tmp_path, monkeypatch):
     """Path-shaped first arg without `@` prefix should hint at the @-form
     rather than just spitting `unknown op`. Lap-11 friction: agents type
