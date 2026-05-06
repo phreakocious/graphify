@@ -2236,6 +2236,53 @@ def test_frontier_header_disambiguates_focus_from_community(tmp_path, monkeypatc
     )
 
 
+def test_search_by_symbol_collapses_same_symbol_hits(tmp_path, monkeypatch):
+    """Lap-21 #7: TS-Claude reported `search 'stagedDecode'` returning 4
+    hits all attributed to the same `stagedDecode()` function (different
+    line numbers inside its body). With --by-symbol, those collapse to
+    one row carrying `×4 (lines: a,b,c,d)`."""
+    from graphify.navigate import search_bodies, load_graph
+    nodes = [
+        {"id": "f", "label": "engine.ts", "file_type": "code",
+         "source_file": str(tmp_path / "engine.ts"), "source_location": "L1",
+         "community": 0},
+        {"id": "fn", "label": "stagedDecode()", "file_type": "code",
+         "source_file": str(tmp_path / "engine.ts"), "source_location": "L1",
+         "community": 0},
+    ]
+    links = [{"source": "f", "target": "fn", "relation": "contains",
+              "confidence": "EXTRACTED"}]
+    _write_graph(tmp_path / "graphify-out", nodes, links)
+    (tmp_path / "engine.ts").write_text(
+        "function stagedDecode() {\n"
+        "  const stagedDecode_a = 1;\n"
+        "  const stagedDecode_b = 2;\n"
+        "  console.log('stagedDecode running');\n"
+        "  return stagedDecode_a + stagedDecode_b;\n"
+        "}\n"
+    )
+    monkeypatch.chdir(tmp_path)
+    G, _ = load_graph(tmp_path / "graphify-out" / "graph.json")
+    # Default: per-line. Should produce >1 hit.
+    flat = search_bodies(G, "stagedDecode")
+    assert flat["total"] >= 4, f"per-line should produce ≥4 hits: {flat}"
+    # --by-symbol: one row per containing node, with match_count carrying
+    # the multiplicity.
+    grouped = search_bodies(G, "stagedDecode", by_symbol=True)
+    assert grouped["total"] == 1, (
+        f"--by-symbol should collapse to one symbol: {grouped}"
+    )
+    assert grouped["hits"][0]["match_count"] >= 4, (
+        f"match_count should reflect underlying line hits: {grouped}"
+    )
+    assert len(grouped["hits"][0]["match_lines"]) >= 4, (
+        f"match_lines should list the line numbers: {grouped}"
+    )
+    assert grouped["grouped"] == flat["total"] - 1, (
+        f"grouped count should equal collapsed delta: {grouped}"
+    )
+
+
 def test_listing_hides_external_nodes_by_default(tmp_path, monkeypatch):
     """Lap-21 #5: external_module nodes (`numpy`, `kg_compile_v2_compile`)
     are stubs from unresolved imports. They should be hidden from

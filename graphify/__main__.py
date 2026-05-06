@@ -89,6 +89,7 @@ _HELP_BLOCKS: dict[str, list[str]] = {
         "    --all-archived          include both active and archived",
         "    --limit N               max hits (default 50)",
         "    --context N             N lines of pre/post context around each match (default 1; pass 0 to disable)",
+        "    --by-symbol             collapse same-symbol hits — one row per containing node with `×N (lines: ...)` (good for `where is X used?`)",
         "    --md                    label rendered as `[label](file:line)` markdown link",
         "    --json                  structured JSON output",
         "    --graph <path>          path to graph.json (default graphify-out/graph.json)",
@@ -2491,6 +2492,7 @@ def main() -> None:
         # default) as forcing a follow-up `peek` per hit. --context 0 still
         # disables context for callers who explicitly want minimal output.
         context = 1
+        by_symbol = False
         md = False
         fmt = "text"
         i = 0
@@ -2518,6 +2520,8 @@ def main() -> None:
                 context = max(0, int(args[i + 1])); i += 2
             elif a.startswith("--context="):
                 context = max(0, int(a.split("=", 1)[1])); i += 1
+            elif a == "--by-symbol":
+                by_symbol = True; i += 1
             elif a == "--md":
                 md = True; i += 1
             elif a == "--json":
@@ -2533,8 +2537,8 @@ def main() -> None:
                 i += 1
         if not pattern:
             print("Usage: graphify search <pattern> [--kind code|rationale|all] "
-                  "[--limit N] [--context N] [--md] [--json] [--no-archived|"
-                  "--archived-only|--all-archived] [--graph PATH]",
+                  "[--limit N] [--context N] [--by-symbol] [--md] [--json] "
+                  "[--no-archived|--archived-only|--all-archived] [--graph PATH]",
                   file=sys.stderr)
             sys.exit(1)
         if kind not in ("code", "rationale", "all"):
@@ -2549,7 +2553,8 @@ def main() -> None:
         G, _comm = load_graph(gp)
         data = search_bodies(G, pattern, kind=kind,
                               archived_mode=archived_mode,
-                              limit=limit, context=context)
+                              limit=limit, context=context,
+                              by_symbol=by_symbol)
         if fmt == "json":
             print(json.dumps(data))
         else:

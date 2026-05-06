@@ -2712,7 +2712,8 @@ def search_bodies(G: nx.DiGraph,
                   kind: str = "code",
                   archived_mode: str = "no",
                   limit: int = 50,
-                  context: int = 0) -> dict:
+                  context: int = 0,
+                  by_symbol: bool = False) -> dict:
     """Body-text search across all nodes that have source_file + source_location.
 
     Returns hits with the containing node's metadata (label, file:line,
@@ -2731,6 +2732,11 @@ def search_bodies(G: nx.DiGraph,
         only to compute the truncated count.
     `context`: lines of pre/post context around each match line. Default 0
         (just the match line). Up to 3 saves a separate `read` round-trip.
+    `by_symbol`: lap-21 #7. When True, collapse same-symbol hits into a
+        single row with `match_count` + `match_lines`. The default
+        per-line emission is right when you want every site; `--by-symbol`
+        is right when "where is X used?" — e.g. 4 hits all inside
+        `stagedDecode()` should read as 1 symbol with 4 lines.
 
     The pattern is compiled as a case-insensitive regex; on `re.error` we
     fall back to a literal case-insensitive substring match. The mode is
@@ -2825,6 +2831,31 @@ def search_bodies(G: nx.DiGraph,
         return (is_arch, -h["degree"], h["label"])
     hits.sort(key=_rank)
 
+    grouped_total = 0
+    if by_symbol:
+        # Group hits by owner node id, preserving the rank order
+        # established above. The representative per group is the
+        # first-encountered hit (which keeps the smallest match_line
+        # naturally because file scans are line-ascending). Carry
+        # `match_count` + `match_lines` on the representative; the
+        # renderer prints them as `× N` and shows the first few line
+        # numbers as a flag-without-cost orientation aid.
+        by_owner: dict[str, dict] = {}
+        for h in hits:
+            owner = h["id"]
+            if owner not in by_owner:
+                rep = dict(h)
+                rep["match_count"] = 1
+                rep["match_lines"] = [h["match_line"]]
+                by_owner[owner] = rep
+            else:
+                rep = by_owner[owner]
+                rep["match_count"] += 1
+                if len(rep["match_lines"]) < 8:
+                    rep["match_lines"].append(h["match_line"])
+        grouped_total = len(hits) - len(by_owner)
+        hits = list(by_owner.values())
+
     return {
         "type": "search",
         "pattern": pattern,
@@ -2837,6 +2868,8 @@ def search_bodies(G: nx.DiGraph,
         "truncated": truncated_count,
         "files_scanned": files_scanned,
         "files_read_failed": files_read_failed,
+        "by_symbol": by_symbol,
+        "grouped": grouped_total,
     }
 
 
@@ -2856,7 +2889,16 @@ def _render_search_text(data: dict, *, md: bool = False) -> str:
     kind = data["kind"]
 
     out: list[str] = []
-    header = f"  search /{pat}/ ({mode}, kind={kind}): {total} hit(s)"
+    grouped = data.get("grouped", 0)
+    by_symbol = data.get("by_symbol", False)
+    if by_symbol:
+        # `total` post-grouping = symbol count; surface the underlying
+        # line-hit total (= symbols + grouped) so the agent sees both.
+        line_total = total + grouped
+        header = (f"  search /{pat}/ ({mode}, kind={kind}, --by-symbol): "
+                  f"{total} symbol(s) covering {line_total} line(s)")
+    else:
+        header = f"  search /{pat}/ ({mode}, kind={kind}): {total} hit(s)"
     if total == 0:
         if files_scanned == 0:
             return f"{header}  (no files scanned — graph may have no source-located nodes)"
@@ -2919,8 +2961,16 @@ def _render_search_text(data: dict, *, md: bool = False) -> str:
         label = h.get("label") or h["id"]
         if md:
             label = _maybe_link(label, sf, f"L{h['match_line']}", md)
+        # Lap-21 #7: with --by-symbol, append `×N (lines: a,b,c)` so a
+        # row that collapses 4 hits inside one symbol shows that fact.
+        match_count = h.get("match_count", 1)
         line_a = (f"    [{i:>2}] @{label:<40} d={h['degree']:<4} {cstr:<5} "
                   f"{loc_str}{kind_tag}").rstrip()
+        if match_count > 1:
+            mlines = h.get("match_lines") or []
+            preview = ",".join(str(n) for n in mlines[:5])
+            tail = "…" if len(mlines) > 5 or match_count > len(mlines) else ""
+            line_a += f"  ×{match_count} (lines: {preview}{tail})"
         out.append(line_a)
         # Pre-context, then the matched line, then post-context.
         for ctx in h.get("ctx_pre") or []:
