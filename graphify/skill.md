@@ -45,6 +45,7 @@ Turn any folder of files into a navigable knowledge graph with community detecti
 /graphify query "<question>" --budget 1500            # cap answer at N tokens
 /graphify path "AuthModule" "Database"                # shortest path between two concepts
 /graphify explain "SwinTransformer"                   # plain-language explanation of a node (one-shot)
+/graphify diff <old.json> <new.json>                  # what changed between two graph snapshots — added/removed nodes/edges
 ```
 
 ## When to reach for navigate (self-directed routing)
