@@ -30,3 +30,4 @@ markers = [
     "slow: marks tests as slow (run with -m slow)",
 ]
 testpaths = ["tests"]
+norecursedirs = ["fixtures", "fixture_repo_001"]
