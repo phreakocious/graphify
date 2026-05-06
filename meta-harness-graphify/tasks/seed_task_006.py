@@ -67,9 +67,20 @@ def task() -> Task:
                     "kind": "file_contains_all",
                     "args": {
                         "path": "SESS1.md",
+                        # Lap-24 oracle fix: prior version required
+                        # `_compute_signal_metrics` here, but the SESS1
+                        # prompt only asks for "main classes/functions,
+                        # what's exported, and the longest function" —
+                        # nothing about that internal helper. Agents who
+                        # gave a valid orientation summary failed when
+                        # they mentioned classify (the actual export)
+                        # and build_residual_axis (the longest fn) but
+                        # not _compute_signal_metrics. Substrings are
+                        # now derived from what the prompt actually
+                        # demands: the entry point AND the longest fn.
                         "substrings": [
-                            "_compute_signal_metrics",
                             "classify",
+                            "build_residual_axis",
                         ],
                     },
                 },
