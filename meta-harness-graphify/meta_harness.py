@@ -7,12 +7,14 @@ import sys
 from pathlib import Path
 
 import click
+from dotenv import load_dotenv
 
 from harness.eval_runner import RunnerConfig, run_rollout
 from harness.types import Candidate
 
 ROOT = Path(__file__).parent
 DEFAULT_GRAPHIFY_SRC = Path("/Volumes/chonk/projects/graphify")
+load_dotenv(ROOT / ".env")
 
 
 def _load_baseline() -> Candidate:
