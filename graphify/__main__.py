@@ -1550,11 +1550,13 @@ def main() -> None:
         try:
             import json as _json
             import networkx as _nx
+            from graphify.build import build_from_json
             _raw = _json.loads(gp.read_text(encoding="utf-8"))
-            try:
-                G = json_graph.node_link_graph(_raw, edges="links")
-            except TypeError:
-                G = json_graph.node_link_graph(_raw)
+            # Lap-21: build_from_json restores edge direction from
+            # _src/_tgt — node_link_graph yields an undirected Graph
+            # (graph.json carries `directed: False`) and resolve_focus's
+            # lap-20c dotted Class.method walk needs G.successors.
+            G = build_from_json(_raw, directed=True)
         except Exception as exc:
             print(f"error: could not load graph: {exc}", file=sys.stderr)
             sys.exit(1)
@@ -1941,10 +1943,10 @@ def main() -> None:
             print(f"error: graph file not found: {gp}", file=sys.stderr)
             sys.exit(1)
         _raw = json.loads(gp.read_text(encoding="utf-8"))
-        try:
-            G = json_graph.node_link_graph(_raw, edges="links")
-        except TypeError:
-            G = json_graph.node_link_graph(_raw)
+        from graphify.build import build_from_json
+        # Lap-21: build_from_json restores edge direction from _src/_tgt
+        # — see the path-cmd comment for why node_link_graph isn't safe.
+        G = build_from_json(_raw, directed=True)
         # Use navigate's resolver so explain accepts both `@<label>` and
         # plain `<label>` and shares the prefix/substring/fuzzy ranking.
         idx = label_index(G)
