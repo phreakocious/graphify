@@ -1,5 +1,5 @@
 import networkx as nx
-from graphify.navigate import resolve_focus, label_index
+from graphify.resolve import resolve_focus, label_index
 
 
 def _two_files_same_basename():
@@ -305,7 +305,7 @@ def test_archive_pattern_excludes_unrelated_segments():
     Claude reported `src/experiments/cartography-build.ts` (actively in
     development) was being false-flagged. We now only match path segments
     that are nearly-always archive markers."""
-    from graphify.navigate import _is_archived_path
+    from graphify.resolve import _is_archived_path
     # Substring traps must not trigger.
     assert not _is_archived_path("src/kgarchive.py")
     assert not _is_archived_path("src/main.ts")
@@ -729,7 +729,7 @@ def test_resolve_focus_demotes_orphan_in_fuzzy_match(tmp_path):
     length_pad=8). Connected near-matches should beat orphan exact-shape
     matches."""
     import networkx as nx
-    from graphify.navigate import resolve_focus, label_index
+    from graphify.resolve import resolve_focus, label_index
     G = nx.DiGraph()
     # Source class — connected via methods + inh
     G.add_node("real_geo", label="MobiusS3Geometry", file_type="code",
@@ -2066,7 +2066,7 @@ def test_label_index_dedups_same_label_and_nid(tmp_path):
     nid twice — turning `@Atlas` into a spurious disambig. The index
     now tracks per-key membership."""
     import networkx as nx
-    from graphify.navigate import label_index
+    from graphify.resolve import label_index
     G = nx.DiGraph()
     G.add_node("atlas", label="Atlas")
     G.add_node("engine", label="DecodeEngine")

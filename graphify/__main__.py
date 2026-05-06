@@ -1508,7 +1508,7 @@ def main() -> None:
         # term scan that returns generic top-N hits (`.len()`, `.new()`,
         # `.push()`); with anchors it's a deterministic BFS from a
         # concrete node, which is what most users actually want.
-        from graphify.navigate import resolve_focus, label_index
+        from graphify.resolve import resolve_focus, label_index
         anchors_raw = [t for t in question.split() if t.startswith("@") and len(t) > 1]
         anchor_starts: list[str] = []
         if anchors_raw:
@@ -1616,7 +1616,7 @@ def main() -> None:
         if len(sys.argv) < 4:
             print("Usage: graphify path \"<source>\" \"<target>\" [--graph path] [--include-inferred] [--edges all|reach|calls]", file=sys.stderr)
             sys.exit(1)
-        from graphify.navigate import resolve_focus, label_index
+        from graphify.resolve import resolve_focus, label_index
         from graphify.analyze import _is_file_node
         from networkx.readwrite import json_graph
         import networkx as _nx
@@ -1674,7 +1674,7 @@ def main() -> None:
             return chosen, candidates, match_type
         src_nid, src_cands, src_match = _resolve(source_label)
         tgt_nid, tgt_cands, tgt_match = _resolve(target_label)
-        from graphify.navigate import _is_archived_path
+        from graphify.resolve import _is_archived_path
         for who, label, nid, cands in (("source", source_label, src_nid, src_cands),
                                         ("target", target_label, tgt_nid, tgt_cands)):
             if nid is None:
@@ -1822,7 +1822,7 @@ def main() -> None:
         if len(sys.argv) < 3:
             print("Usage: graphify explain \"<node>\" [--graph path] [--include-inferred] [--limit N]", file=sys.stderr)
             sys.exit(1)
-        from graphify.navigate import resolve_focus, label_index
+        from graphify.resolve import resolve_focus, label_index
         from networkx.readwrite import json_graph
         label = sys.argv[2]
         graph_path = "graphify-out/graph.json"
@@ -1857,7 +1857,7 @@ def main() -> None:
         nid, candidates, match_type, _alts = resolve_focus(G, idx, label)
         if nid is None:
             if candidates:
-                from graphify.navigate import _is_archived_path
+                from graphify.resolve import _is_archived_path
                 print(f"'{label}' is ambiguous ({len(candidates)} matches). qualify with the source path: e.g. `tools/foo.py/{label}` or `tools/foo/{label}` (extension optional). leading `_` on private symbols works either way. or re-call with a node ID below to bypass label resolution. pick from below:", file=sys.stderr)
                 for c in candidates[:5]:
                     attrs = G.nodes[c]
@@ -2140,9 +2140,10 @@ def main() -> None:
             _print_subcmd_help("peek")
             return
         from graphify.navigate import (
-            DEFAULT_GRAPH_PATH, load_graph, label_index, resolve_focus,
+            DEFAULT_GRAPH_PATH, load_graph,
             _read_body_full, _render_body_text,
         )
+        from graphify.resolve import label_index, resolve_focus
         from graphify.analyze import _is_file_node
         args = sys.argv[2:]
         graph_path = DEFAULT_GRAPH_PATH
@@ -2230,9 +2231,10 @@ def main() -> None:
             _print_subcmd_help("shape")
             return
         from graphify.navigate import (
-            DEFAULT_GRAPH_PATH, load_graph, label_index, resolve_focus,
+            DEFAULT_GRAPH_PATH, load_graph,
             shape_file, _render_shape_text,
         )
+        from graphify.resolve import label_index, resolve_focus
         from graphify.analyze import _is_file_node
         args = sys.argv[2:]
         graph_path = DEFAULT_GRAPH_PATH
