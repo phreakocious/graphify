@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+*.egg-info/
+build/
+dist/
+.venv/
+.pytest_cache/
+.mypy_cache/
+runs/
+candidates/*/overrides/
+!agents/baseline_navigator/overrides/
+tasks/fixture_repo_001/.git/
