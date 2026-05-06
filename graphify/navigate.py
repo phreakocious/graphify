@@ -869,6 +869,27 @@ def _frontier_data(G: nx.DiGraph, communities: dict[int, list[str]],
                 and G.nodes[v].get("file_type") == "rationale"):
             contains_rationale_count += 1
 
+    # Per-relation incoming counts used to gate impl_of/type_ref hints. The
+    # `interface_kind` / `empty_class_protocol` / `closure_iface_dispatch`
+    # hints used to suggest `in --kind=impl_of` unconditionally on every
+    # interface/iface_method/protocol-class node. On corpora that lean on
+    # structural (duck-typed) implementation rather than explicit `class Foo
+    # implements Bar`, no impl_of edges get extracted, and the hint sends
+    # agents on a wild goose chase. Counting actual incoming impl_of/type_ref
+    # edges per-node lets the hint adapt: suggest impl_of when it'd return
+    # something, fall back to type_ref when that's where the action is.
+    impl_of_in_count = 0
+    type_ref_in_count = 0
+    for u in G.predecessors(nid):
+        e = G.edges[u, nid]
+        if not _passes_confidence(e, extracted_only, min_confidence):
+            continue
+        rel = e.get("relation")
+        if rel == "impl_of":
+            impl_of_in_count += 1
+        elif rel == "type_ref":
+            type_ref_in_count += 1
+
     # Sibling count: union of parents' contained children minus self.
     # Approximate but accurate for the common case of single-parent containment.
     sib_set: set[str] = set()
@@ -925,6 +946,8 @@ def _frontier_data(G: nx.DiGraph, communities: dict[int, list[str]],
         "last_listing_size": len(cursor.last_listing),
         "show_history": show_history,
         "contains_rationale_count": contains_rationale_count,
+        "impl_of_in_count": impl_of_in_count,
+        "type_ref_in_count": type_ref_in_count,
     }
 
 
@@ -1651,10 +1674,16 @@ def _render_frontier_text(data: dict, cursor: Cursor, *, show_ops: bool,
             bits.append(f"0 direct callers but {inf_in} inferred")
         if p['out']['count'] == 0 and inf_out >= 1:
             bits.append(f"0 direct callees but {inf_out} inferred")
+        # Only suggest impl_of when the focused node actually has incoming
+        # impl_of edges. On structurally-typed TS corpora (no explicit
+        # `class Foo implements Bar`), impl_of is rarely emitted, and the
+        # tail "or `in --kind=impl_of`" sends agents at empty results.
+        impl_tail = (" (or `in --kind=impl_of` on interface methods)"
+                     if data.get("impl_of_in_count", 0) > 0 else "")
         msg = (f"  hint: {', '.join(bits)} — {cause}. "
                f"AST drops to inferred on dynamic dispatch. "
-               f"widen with `--include-inferred --min-confidence 0.85` "
-               f"(or `in --kind=impl_of` on interface methods).")
+               f"widen with `--include-inferred --min-confidence 0.85`"
+               f"{impl_tail}.")
         _emit_hint(out, "closure_iface_dispatch", msg, cursor, quiet_hints)
 
     # Module-config: code file focused as a node, 0 contains, file > 50 lines.
@@ -1689,11 +1718,29 @@ def _render_frontier_text(data: dict, cursor: Cursor, *, show_ops: bool,
     # query doesn't waste a turn finding out the hard way. node_kind is
     # already defined at the top of the hint section.
     if node_kind in ("interface", "iface_method"):
-        _emit_hint(out, "interface_kind",
-            "  hint: interface — runtime call sites bind to implementations. "
-            "find them with `in --kind=impl_of`. `methods` lists the contract; "
-            "`inh` shows interface chains.",
-            cursor, quiet_hints)
+        # Adapt the hint to which edge kind actually points to this node.
+        # impl_of requires explicit `implements` in source — many TS corpora
+        # use structural typing instead. type_ref captures parameter/return
+        # type usages and is usually populated for any in-tree type.
+        impl_n = data.get("impl_of_in_count", 0)
+        type_ref_n = data.get("type_ref_in_count", 0)
+        if impl_n > 0:
+            iface_msg = (f"  hint: interface — runtime call sites bind to "
+                         f"implementations. find them with `in --kind=impl_of` "
+                         f"({impl_n}). `methods` lists the contract; `inh` "
+                         f"shows interface chains.")
+        elif type_ref_n > 0:
+            iface_msg = (f"  hint: interface — no explicit `implements` "
+                         f"declarations resolved (structural typing). "
+                         f"`in --kind=type_ref` ({type_ref_n}) shows where "
+                         f"this type is used as a parameter/return/variable "
+                         f"annotation. `methods` lists the contract.")
+        else:
+            iface_msg = (f"  hint: interface — neither `implements` nor "
+                         f"type-annotation usages resolved. consider "
+                         f"`--include-inferred` for LLM-inferred dispatch, "
+                         f"or `methods` to read the contract directly.")
+        _emit_hint(out, "interface_kind", iface_msg, cursor, quiet_hints)
     elif node_kind == "type_alias":
         _emit_hint(out, "type_alias_kind",
             "  hint: type alias — usage sites attach as `type_ref` edges. "
@@ -1710,13 +1757,25 @@ def _render_frontier_text(data: dict, cursor: Cursor, *, show_ops: bool,
     elif (node_kind == "class"
           and p['methods']['count'] == 0
           and p['contains']['count'] == 0):
-        impl_n = p.get('inh', {}).get('count', 0)
-        suffix = (f". `inh` ({impl_n}) shows the parent contract"
-                  if impl_n else "")
+        inh_n = p.get('inh', {}).get('count', 0)
+        impl_of_n = data.get("impl_of_in_count", 0)
+        # Only suggest the lookup directions that actually have edges.
+        # Recommending `in --kind=impl_of` on a corpus with zero impl_of
+        # edges is the same trap the interface_kind hint had.
+        suggestions: list[str] = []
+        if inh_n:
+            suggestions.append(f"`in --kind=inherits` ({inh_n})")
+        if impl_of_n:
+            suggestions.append(f"`in --kind=impl_of` ({impl_of_n})")
+        if suggestions:
+            find_clause = f"find implementers via {' or '.join(suggestions)}"
+        else:
+            find_clause = ("no inherits/impl_of edges resolved — implementers "
+                           "may use structural typing; try "
+                           "`in --kind=type_ref` for type-annotation usages")
         _emit_hint(out, "empty_class_protocol",
             f"  hint: class with no methods/contains — likely a "
-            f"protocol/abstract/marker class. find implementers via "
-            f"`in --kind=inherits` or `in --kind=impl_of`{suffix}; "
+            f"protocol/abstract/marker class. {find_clause}; "
             f"`read` dumps the body inline.",
             cursor, quiet_hints)
 

@@ -1363,7 +1363,7 @@ The `files:` table dedups paths — refer to file `a:368` rather than the full p
 - `+Nxl` — cross-language inferred, always-on (an INFERRED `.ts` → `.py` edge is almost always an LLM-tagger hallucination on a common method name).
 - `+Nkind` / `+Narch` — `--kind` and archived-path filters.
 
-A `.foo()` method showing `↗in(0+5inf)` plus the `interface method — runtime sites bind to implementations` hint is **not dead code** — dispatch through a contract. Widen with `--include-inferred --min-confidence 0.85` or pivot via `in --kind=impl_of`.
+A `.foo()` method showing `↗in(0+5inf)` plus the `interface method — runtime sites bind to implementations` hint is **not dead code** — dispatch through a contract. Widen with `--include-inferred --min-confidence 0.85`. The hint's tail (`in --kind=impl_of` / `in --kind=type_ref`) only appears when those edges actually exist on the focused node — corpora using structural typing won't have explicit `impl_of` edges.
 
 ### Worked example — recon before commitment
 
