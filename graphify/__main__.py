@@ -2446,8 +2446,12 @@ def main() -> None:
         # (`.foo()`) — those are member calls (`.get`, `.append`,
         # `.set`, `.items`) that swamp real entry-point ranking; the
         # entry point of a class is the class itself, not its methods.
+        # Lap-24 (no-arg redesign): also carry source_location so the
+        # entry-point line can render `compare() ×104  src/foo.py:42`
+        # — saves a follow-up `locate`/`navigate` to find where the
+        # function lives.
         from graphify.navigate import _STRUCTURAL
-        entry_pts: list[tuple[str, int, str]] = []
+        entry_pts: list[tuple[str, int, str, str]] = []
         for nid, attrs in G.nodes(data=True):
             label = attrs.get("label", "")
             if not (isinstance(label, str) and label.endswith("()")):
@@ -2459,6 +2463,7 @@ def main() -> None:
             if not attrs.get("source_file"):
                 continue
             sf = attrs.get("source_file") or ""
+            loc = attrs.get("source_location") or ""
             ext_in = 0
             for u in G.predecessors(nid):
                 ufile = G.nodes[u].get("source_file") or ""
@@ -2468,7 +2473,7 @@ def main() -> None:
                     continue
                 ext_in += 1
             if ext_in > 0:
-                entry_pts.append((label, ext_in, sf))
+                entry_pts.append((label, ext_in, sf, loc))
         entry_pts.sort(key=lambda t: (-t[1], t[0]))
         top_entries = entry_pts[:5]
         # Edge composition.
@@ -2496,8 +2501,19 @@ def main() -> None:
         if top_entries:
             print()
             print("  Entry points (cross-file callers):")
-            for lab, n, _sf in top_entries:
-                print(f"    {lab:<36} ×{n}")
+            for lab, n, sf, loc in top_entries:
+                # Render `compare() ×104  src/foo.py:42`. Extract the
+                # start line from the L<a>-<b> source_location format;
+                # fall back to the bare filename when source_location
+                # is missing (graph from older extractor).
+                line = ""
+                if isinstance(loc, str) and loc.startswith("L"):
+                    try:
+                        line = loc[1:].split("-", 1)[0].split(":", 1)[0]
+                    except ValueError:
+                        line = ""
+                where = f"  {sf}{':' + line if line else ''}" if sf else ""
+                print(f"    {lab:<36} ×{n}{where}")
         if rel_counts:
             print()
             total_rel = sum(rel_counts.values())
@@ -2508,6 +2524,19 @@ def main() -> None:
             top_exts = ext_counts.most_common(5)
             mix = " · ".join(f"{ext} ({c})" for ext, c in top_exts)
             print(f"  Languages: {mix}")
+
+        # Lap-24 (no-arg redesign): "Suggested next" footer points the
+        # agent at the busiest file in the repo (top entry point's
+        # source file). Without this, the agent has top-5 entry points
+        # + top-5 hubs but no clear "go here next" — and has to guess
+        # which verb to fire. Single-line suggestion that's
+        # copy-pasteable and lands them on a real API surface.
+        if top_entries:
+            top_lab, _n, top_sf, _loc = top_entries[0]
+            if top_sf:
+                print()
+                print(f"  Suggested next: graphify shape {top_sf}    # `{top_lab}` lives here, top-ranked entry point")
+
         banner = G.graph.get("_freshness_banner")
         if banner:
             print()

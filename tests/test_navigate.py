@@ -2384,10 +2384,64 @@ def test_summarize_emits_overview(tmp_path):
     assert "compile()" in out and "×1" in out, (
         f"entry-points should surface compile():\n{out}"
     )
+    # Lap-24 redesign: entry-points line carries file:line so the agent
+    # doesn't have to follow up with `locate`/`navigate` to find where
+    # the function lives.
+    assert "engine.py:5" in out, (
+        f"entry-points should include file:line of compile():\n{out}"
+    )
     # Edge mix surfaces relations.
     assert "calls" in out, f"edge mix missing:\n{out}"
     # Language count.
     assert ".py" in out, f"language mix missing:\n{out}"
+    # Lap-24 redesign: "Suggested next" footer points the agent at the
+    # top entry-point's file with a copy-pasteable shape command.
+    assert "Suggested next:" in out, f"missing suggested-next footer:\n{out}"
+    assert "graphify shape engine.py" in out, (
+        f"suggested-next should reference the top entry point's file:\n{out}"
+    )
+    assert "compile()" in out, (
+        f"suggested-next should name the top entry point:\n{out}"
+    )
+
+
+def test_summarize_no_entry_points_skips_suggested_next(tmp_path):
+    """Lap-24 redesign: when the graph has zero cross-file callers the
+    "Suggested next" footer should be silent. Otherwise we'd point the
+    agent at a phantom entry point and waste their first call."""
+    import json as _json, subprocess
+    # Single-file graph: file + one self-contained function, no
+    # cross-file edges.
+    nodes = [
+        {"id": "fA", "label": "lib.py", "file_type": "code",
+         "source_file": "lib.py", "source_location": "L1",
+         "node_kind": "file", "community": 0},
+        {"id": "fn", "label": "helper()", "file_type": "code",
+         "source_file": "lib.py", "source_location": "L5",
+         "node_kind": "function", "community": 0},
+    ]
+    links = [
+        {"source": "fA", "target": "fn", "relation": "contains",
+         "confidence": "EXTRACTED"},
+    ]
+    graph_dir = tmp_path / "graphify-out"
+    graph_dir.mkdir()
+    (graph_dir / "graph.json").write_text(_json.dumps(
+        {"directed": True, "multigraph": False,
+         "graph": {}, "nodes": nodes, "links": links}), encoding="utf-8")
+    res = subprocess.run(
+        ["graphify", "summarize",
+         "--graph", str(graph_dir / "graph.json")],
+        capture_output=True, text=True, cwd=str(tmp_path),
+    )
+    assert res.returncode == 0, f"summarize failed:\n{res.stderr}"
+    out = res.stdout
+    assert "Entry points" not in out, (
+        f"no entry points → entry-points block should be silent:\n{out}"
+    )
+    assert "Suggested next" not in out, (
+        f"no entry points → no suggested-next footer:\n{out}"
+    )
 
 
 def test_locate_resolves_multiple_symbols_in_one_call(tmp_path, monkeypatch):
