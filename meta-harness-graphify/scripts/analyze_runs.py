@@ -55,7 +55,10 @@ def parse_tool_calls(transcript_path: Path) -> Counter:
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--task", default="seed_task_001_compute_score_median")
+    ap.add_argument("--task", default="seed_task_001_compute_score_median",
+                    help="task name substring to match (default: seed_task_001)")
+    ap.add_argument("--all-tasks", action="store_true",
+                    help="produce a per-task table for every task with rollouts")
     ap.add_argument("--runs-dir", default="runs")
     args = ap.parse_args()
 
@@ -64,12 +67,34 @@ def main():
         print(f"no runs dir at {runs_dir}", file=sys.stderr)
         sys.exit(1)
 
+    if args.all_tasks:
+        # collect all task ids present in runs/
+        seen_tasks = set()
+        for run_dir in runs_dir.iterdir():
+            if not run_dir.is_dir():
+                continue
+            metrics_path = run_dir / "metrics.json"
+            if not metrics_path.is_file():
+                continue
+            try:
+                d = json.loads(metrics_path.read_text())
+                seen_tasks.add(d.get("task_id", ""))
+            except Exception:
+                continue
+        for task in sorted(seen_tasks):
+            args.task = task
+            _print_task_table(runs_dir, task)
+        return
+    _print_task_table(runs_dir, args.task)
+
+
+def _print_task_table(runs_dir: Path, task: str):
     rollouts: dict[str, list[dict]] = defaultdict(list)
     tool_counts: dict[str, Counter] = defaultdict(Counter)
     for run_dir in sorted(runs_dir.iterdir()):
         if not run_dir.is_dir():
             continue
-        if args.task not in run_dir.name:
+        if task not in run_dir.name:
             continue
         metrics = parse_run_dir(run_dir)
         if metrics is None:
@@ -79,10 +104,10 @@ def main():
         tool_counts[candidate].update(parse_tool_calls(run_dir / "transcript.jsonl"))
 
     if not rollouts:
-        print(f"no rollouts found for task {args.task}", file=sys.stderr)
-        sys.exit(1)
+        print(f"no rollouts found for task {task}", file=sys.stderr)
+        return
 
-    print(f"\n=== task: {args.task} ===\n")
+    print(f"\n=== task: {task} ===\n")
     rows: list[tuple[str, dict]] = []
     for candidate, ms in sorted(rollouts.items()):
         ttcs = [m["tokens_to_completion"] for m in ms if m["tokens_to_completion"] > 0]
