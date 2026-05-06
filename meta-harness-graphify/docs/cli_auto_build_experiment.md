@@ -42,14 +42,26 @@ cli_auto_build's 6 trials. These are real, specific UX issues an agent
 would want fixed — most of them have nothing to do with auto-build:
 
 ### 1. Cursor doesn't persist across CLI invocations (3 trials cited)
-The SKILL says "cursor persists for chains" but it persists only
-within a single Python process. Agents who try
-`graphify navigate "@X" && graphify navigate in` as separate bash
-calls get "no cursor. focus with @<label> first."
+**Update (2026-05-06):** root-caused. graphify's cursor IS persisted
+to disk (`graphify-out/.navigate/<session_id>.json`) but only when
+`can_resume` is true — meaning a bare first focus (`history=0`,
+no queued ops, no explicit `--session`) suppressed both the save
+AND the printed session id. Lap-13 had introduced this gate to
+reduce one-shot noise. Agents who *wanted* to chain across calls
+got nothing to pass to `--session` because the first call didn't
+print one.
+
+**Fixed on navigator branch (commit `ff214ee`):** drop the can_resume
+gate; always print the session id and persist the cursor on every
+persist-eligible call. `_sweep_stale` already cleans up orphan
+cursors at 30 minutes. Tests updated.
 
 > "The cheat-sheet implies 'cursor persists for chains' — it persists
-> *within* a single process, not across shell invocations. Either
-> document this clearly or persist cursor state to disk."
+> *within* a single process, not across shell invocations."
+
+The agent's mental model was right; graphify's actual behavior was
+the surprise. This is exactly the value of the auto-feedback turn —
+caught a real graphify bug the metrics couldn't have surfaced.
 
 ### 2. No one-shot `callers` / `wu` verb (3 trials)
 Agents trying to answer "who calls X" expected a single verb. They got
