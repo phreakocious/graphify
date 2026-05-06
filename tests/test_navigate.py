@@ -3259,3 +3259,104 @@ def test_path_mixed_relations_no_imports_hint(tmp_path):
     assert "--edges calls" not in out or "current path is all" not in out, (
         f"mixed-relation path should NOT trigger imports-only hint:\n{out}"
     )
+
+
+def test_load_graph_emits_stale_banner(tmp_path, capsys):
+    """Lap-20d (TS-Claude #1, "highest leverage"): when any indexed
+    source file is newer than graph.json, load_graph emits a stale
+    banner to stderr. Prevents the silently-stale failure mode where
+    a re-run looks like a no-op even when the user pulled new code."""
+    import json as _json, os, time as _time
+    from graphify.navigate import load_graph
+    src_file = tmp_path / "src.py"
+    src_file.write_text("def x(): pass\n", encoding="utf-8")
+    nodes = [{"id": "x", "label": "x()", "file_type": "code",
+              "source_file": str(src_file), "source_location": "L1"}]
+    graph_dir = tmp_path / "graphify-out"
+    graph_dir.mkdir()
+    graph_file = graph_dir / "graph.json"
+    graph_file.write_text(_json.dumps(
+        {"directed": True, "multigraph": False,
+         "graph": {}, "nodes": nodes, "links": []}), encoding="utf-8")
+    # Make graph "old" by setting its mtime back, then touch source.
+    old = _time.time() - 600  # 10 minutes ago
+    os.utime(graph_file, (old, old))
+    src_file.touch()  # newer than graph
+    capsys.readouterr()  # clear pre-existing
+    G, _ = load_graph(graph_file)
+    captured = capsys.readouterr()
+    assert "stale" in captured.err, (
+        f"stale banner should appear on stderr, got: stderr={captured.err!r}"
+    )
+    assert G.graph.get("_freshness_banner"), "banner should be stamped on G"
+
+
+def test_load_graph_no_banner_when_fresh(tmp_path, capsys):
+    """Lap-20d: when no indexed source file is newer than graph.json,
+    load_graph stays silent."""
+    import json as _json, os, time as _time
+    from graphify.navigate import load_graph
+    src_file = tmp_path / "src.py"
+    src_file.write_text("def x(): pass\n", encoding="utf-8")
+    nodes = [{"id": "x", "label": "x()", "file_type": "code",
+              "source_file": str(src_file), "source_location": "L1"}]
+    graph_dir = tmp_path / "graphify-out"
+    graph_dir.mkdir()
+    graph_file = graph_dir / "graph.json"
+    graph_file.write_text(_json.dumps(
+        {"directed": True, "multigraph": False,
+         "graph": {}, "nodes": nodes, "links": []}), encoding="utf-8")
+    # Make graph clearly newer than any source.
+    future = _time.time() + 60
+    os.utime(graph_file, (future, future))
+    capsys.readouterr()
+    G, _ = load_graph(graph_file)
+    captured = capsys.readouterr()
+    assert "stale" not in captured.err, (
+        f"fresh graph should not emit banner, got: stderr={captured.err!r}"
+    )
+    assert not G.graph.get("_freshness_banner")
+
+
+def test_navigate_dominant_match_suppresses_loud_warning(tmp_path):
+    """Lap-20d (TS-Claude #2): when the chosen match's degree dominates
+    the top alternative by ≥2x, suppress the `⚠ ambiguous:` glyph and
+    the "also near" line. The current behavior fires the warning on
+    every prefix-with-fuzzy-near case (e.g. `analyzePanel()` deg=12 vs
+    fuzzy near `analyzeFoo()` deg=2), training agents to ignore the
+    warning entirely — which defeats its purpose for true ambiguity."""
+    import json as _json, subprocess
+    nodes = [
+        # Dominant target: prefix match with high degree.
+        {"id": "main", "label": "analyzePanel()", "file_type": "code",
+         "source_file": "src/main.ts", "source_location": "L1"},
+        # Many neighbors of main → high degree.
+        *[{"id": f"caller{i}", "label": f"caller{i}()",
+           "file_type": "code",
+           "source_file": "src/caller.ts",
+           "source_location": f"L{i}"} for i in range(8)],
+        # Fuzzy near-miss with low degree → should not trigger loud warning.
+        {"id": "alt", "label": "analyzeFoo()", "file_type": "code",
+         "source_file": "src/alt.ts", "source_location": "L1"},
+    ]
+    links = [{"source": f"caller{i}", "target": "main",
+              "relation": "calls", "confidence": "EXTRACTED"}
+             for i in range(8)]
+    graph_dir = tmp_path / "graphify-out"
+    graph_dir.mkdir()
+    (graph_dir / "graph.json").write_text(_json.dumps(
+        {"directed": True, "multigraph": False,
+         "graph": {}, "nodes": nodes, "links": links}), encoding="utf-8")
+    res = subprocess.run(
+        ["graphify", "navigate", "@analyzePanel",
+         "--graph", str(graph_dir / "graph.json")],
+        capture_output=True, text=True, cwd=str(tmp_path),
+    )
+    out = res.stdout + res.stderr
+    assert "analyzePanel()" in out, f"should match the dominant target:\n{out}"
+    assert "⚠ ambiguous" not in out, (
+        f"dominant prefix match should not emit ⚠ ambiguous:\n{out}"
+    )
+    assert "also near:" not in out, (
+        f"dominant match should suppress 'also near' line:\n{out}"
+    )

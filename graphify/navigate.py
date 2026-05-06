@@ -22,6 +22,7 @@ from __future__ import annotations
 import json
 import re
 import secrets
+import sys
 import time
 import unicodedata
 from collections import defaultdict
@@ -61,12 +62,69 @@ _STRUCTURAL = ("method", "contains", "rationale_for", "inherits")
 
 # --- loading ---------------------------------------------------------------
 
-def load_graph(graph_path: str | Path) -> tuple[nx.DiGraph, dict[int, list[str]]]:
+def _check_graph_freshness(G: nx.DiGraph, graph_path: str | Path) -> str | None:
+    """Compare graph.json mtime against the source files it indexes; return
+    a banner when at least one source file is newer than the graph,
+    `None` when the graph is current.
+
+    Lap-20d (TS-Claude head-to-head report #1, "highest leverage"): the
+    graph is a derived artifact, but every command silently treats it as
+    ground truth. The "NOT FIXED" cycle from lap-20a→20b was caused by
+    exactly this — the user re-ran a command, got the old shape, and
+    concluded the fix didn't work. A freshness banner converts a silent
+    correctness hazard into a visible "rerun update" prompt.
+
+    Walks unique `source_file` paths in the graph (one stat per file,
+    not per node). Misses brand-new files that aren't in the graph yet
+    — `graphify changed` covers those.
+    """
+    try:
+        graph_mtime = Path(graph_path).stat().st_mtime
+    except OSError:
+        return None
+    seen: set[str] = set()
+    newer_count = 0
+    newest_mtime = 0.0
+    for _nid, attrs in G.nodes(data=True):
+        sf = attrs.get("source_file")
+        if not sf or sf in seen:
+            continue
+        seen.add(sf)
+        try:
+            mt = Path(sf).stat().st_mtime
+        except OSError:
+            continue
+        if mt > graph_mtime:
+            newer_count += 1
+            if mt > newest_mtime:
+                newest_mtime = mt
+    if newer_count == 0:
+        return None
+    age = newest_mtime - graph_mtime
+    if age < 60:
+        age_str = f"{int(age)}s"
+    elif age < 3600:
+        age_str = f"{int(age / 60)} min"
+    elif age < 86400:
+        age_str = f"{age / 3600:.1f} hr"
+    else:
+        age_str = f"{age / 86400:.1f} days"
+    return (f"⚠ graph is {age_str} stale ({newer_count} file"
+            f"{'s' if newer_count != 1 else ''} modified since extract). "
+            f"run `graphify update .` for accuracy.")
+
+
+def load_graph(graph_path: str | Path,
+               *, freshness_check: bool = True) -> tuple[nx.DiGraph, dict[int, list[str]]]:
     """Load graph.json as a DiGraph plus a community→[node_ids] map.
 
     Also stamps each community's top-degree node label onto the DiGraph as
     `G.graph['community_labels']` — used by the renderer to print
     `c5=ExoticGeometryFramework` instead of bare `c5`.
+
+    When `freshness_check=True` (default), emit a stale-graph banner to
+    stderr if any indexed source file is newer than graph.json. Pass
+    `freshness_check=False` to suppress (tests, CI, machine pipelines).
     """
     path = Path(graph_path)
     data = json.loads(path.read_text(encoding="utf-8"))
@@ -112,6 +170,11 @@ def load_graph(graph_path: str | Path) -> tuple[nx.DiGraph, dict[int, list[str]]
     # them with a single dict lookup instead of resolving languages on the
     # hot path. Drops surface as `+N cross-lang hidden`.
     _mark_cross_lang_edges(G)
+    if freshness_check:
+        banner = _check_graph_freshness(G, graph_path)
+        if banner:
+            print(banner, file=sys.stderr)
+            G.graph["_freshness_banner"] = banner
     return G, dict(communities)
 
 
@@ -3376,11 +3439,28 @@ def navigate(ops: list[str] | str, *,
                         # field-reporter flagged. `prefix`+alternates and any
                         # `fuzzy`/`substring` hit get the warning glyph; a
                         # clean prefix with no alternates stays quiet.
-                        loud = bool(alternatives) or match_type in ("substring", "fuzzy")
+                        # Lap-20d (TS-Claude #2): when chosen's degree
+                        # dominates the top alternative by ≥2x, the
+                        # alternatives are noise (close-label fuzzies, not
+                        # contenders). Drop the loud glyph AND the "also
+                        # near" line. Today the warning fires on every
+                        # prefix match because get_close_matches is
+                        # liberal; agents learn to filter "⚠ ambiguous"
+                        # and miss the real ones.
+                        chosen_deg = G.in_degree(chosen) + G.out_degree(chosen)
+                        top_alt_deg = max(
+                            (G.in_degree(a) + G.out_degree(a)
+                             for a in alternatives),
+                            default=0,
+                        )
+                        dominant = chosen_deg >= 2 * top_alt_deg + 1 and chosen_deg >= 3
+                        suppress_alts = dominant and match_type == "prefix"
+                        loud = ((bool(alternatives) and not suppress_alts)
+                                or match_type in ("substring", "fuzzy"))
                         glyph = "⚠ ambiguous:" if loud else ""
                         head = f"{glyph} matched" if glyph else "matched"
                         trace.append(f"  > {head} `{op_str}` → {chosen_label} ({match_type})")
-                        if alternatives:
+                        if alternatives and not suppress_alts:
                             alt_labels = [G.nodes[a].get("label", a) for a in alternatives]
                             trace.append(
                                 f"  > also near: {', '.join(alt_labels)}  "
