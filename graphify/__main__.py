@@ -74,6 +74,12 @@ _HELP_BLOCKS: dict[str, list[str]] = {
         "    Accepts `Class.method` and `dir/file/Symbol` qualifiers, same as navigate.",
         "    On a class node, peek emits a curated dump (class header + each method's sig + N body lines) instead of the full class body — saves the per-method walk.",
     ],
+    "locate": [
+        "  locate <s1> [<s2> ...]  multi-symbol file:line lookup, no body — find where many things live in one call",
+        "    --graph <path>          path to graph.json (default graphify-out/graph.json)",
+        "    Resolves each arg the same way `peek` does (Class.method, path-qualified, fuzzy fallback). Output is one row per target with `<label>  <file>:<line-range>`. Ambiguous and missed symbols print a per-row note but don't fail the batch; exit 1 only when every symbol misses.",
+        "    Use when you'd otherwise run 3+ `peek`/`navigate` calls just to find file:line for several symbols you already know by name.",
+    ],
     "doc": [
         "  doc <symbol>            one-shot signature + docstring/rationale dump — \"what does this metric/method/class mean?\" without pulling the implementation",
         "    --lines N               max lines per rationale block (default 40)",
@@ -1193,17 +1199,25 @@ def main() -> None:
         # need most of a file, leading with `graphify shape` (or
         # `navigate @entry`) primes the structural pivots that inform
         # every Read decision that follows.
+        # Lap-21 (R3 sub-agent feedback): sharpen the body-count rule —
+        # graphify wins when ≤2 bodies are needed; body-heavy tasks
+        # (need most of a file) should fall straight to Read once
+        # graphify has primed the file:line targets.
         print("When to use graphify vs Read:")
-        print("  graphify first   always lead with shape/navigate. The structural")
-        print("                   primer — entry points, callers, class shape —")
-        print("                   is cheap and informs every Read that follows.")
-        print("                   On small tasks, graphify often IS the answer")
-        print("                   (1-2 small bodies via `peek`; structure-only")
-        print("                   questions via `shape`/`navigate`).")
-        print("  Read for content once you know what to read. Reach for Read when")
-        print("                   you need most of a file (>~200 ln) or the")
-        print("                   question is line-by-line (formatting,")
-        print("                   surrounding context a peek-window misses).")
+        print("  graphify first   always lead with shape/navigate/summarize.")
+        print("                   The structural primer (entry points, callers,")
+        print("                   class shape, line ranges) is cheap and informs")
+        print("                   every Read that follows.")
+        print("  graphify wins    when you need ≤2 bodies, structure-only answers,")
+        print("                   or who-uses-X tracing across the call graph.")
+        print("                   `peek` for one body, `locate <s1> <s2>...` for")
+        print("                   file:line of several known symbols.")
+        print("  Read wins        when you need most of a file (>~200 ln of body)")
+        print("                   or the question is line-by-line (formatting,")
+        print("                   surrounding context a peek-window misses). Use")
+        print("                   `shape`/`navigate` to find the right offsets, ")
+        print("                   then read with `offset`/`limit` — don't scout")
+        print("                   with peek when you'll end up reading anyway.")
         print()
         # Lap-20d (TS-Claude #5): workflow templates retain better than
         # per-flag docs. Lead with the 80% paths so an agent who only
@@ -1213,6 +1227,7 @@ def main() -> None:
         print("  Orient on a file       graphify shape <file>")
         print("  Read a function body   graphify peek <symbol>")
         print("  Read a class           graphify peek <Class>   (curated: header + per-method sig + body)")
+        print("  Locate many symbols    graphify locate <s1> <s2> ...   (file:line for each, no body)")
         print("  Find callers of X      graphify navigate \"@X\" in")
         print("  Map a class            graphify navigate \"@Class\" methods --bodies 3")
         print("  Find dead methods      graphify navigate \"@Class\" dead-ends")
@@ -1231,6 +1246,8 @@ def main() -> None:
         for line in _HELP_BLOCKS["summarize"]:
             print(line)
         for line in _HELP_BLOCKS["peek"]:
+            print(line)
+        for line in _HELP_BLOCKS["locate"]:
             print(line)
         for line in _HELP_BLOCKS["doc"]:
             print(line)
@@ -2569,6 +2586,79 @@ def main() -> None:
             "truncated": trunc,
         }
         print(_render_body_text(data, md=md))
+
+    elif cmd == "locate":
+        # Lap-21 (R3 sub-agent feedback): multi-symbol file:line lookup,
+        # no body. R3-A's graphify agent ran 3 separate navigates to
+        # find the line ranges of 3 GeometryAnalyzer methods — locate
+        # collapses that to one call. Resolution mirrors peek's
+        # (full prefix/substring/fuzzy ladder + path qualifier) so an
+        # agent reaches for the same disambiguation forms it already
+        # uses on peek/navigate. Best-effort batch: a missed or ambig
+        # symbol prints a per-row note but doesn't fail the whole call;
+        # exit 1 only when every symbol misses.
+        if any(a in ("-h", "--help") for a in sys.argv[2:]):
+            _print_subcmd_help("locate")
+            return
+        from graphify.navigate import DEFAULT_GRAPH_PATH, load_graph
+        from graphify.resolve import label_index, resolve_focus
+        args = sys.argv[2:]
+        graph_path = DEFAULT_GRAPH_PATH
+        targets: list[str] = []
+        i = 0
+        while i < len(args):
+            a = args[i]
+            if a == "--graph" and i + 1 < len(args):
+                graph_path = args[i + 1]; i += 2
+            elif a.startswith("--graph="):
+                graph_path = a.split("=", 1)[1]; i += 1
+            else:
+                targets.append(a); i += 1
+        if not targets:
+            print("Usage: graphify locate <symbol> [<symbol> ...] [--graph PATH]",
+                  file=sys.stderr)
+            sys.exit(1)
+        gp = Path(graph_path)
+        if not gp.exists():
+            print(f"error: graph not found at {gp}. run `graphify update <path>` first.",
+                  file=sys.stderr)
+            sys.exit(1)
+        G, _comm = load_graph(gp)
+        idx = label_index(G)
+
+        def _fmt_loc(loc: str) -> str:
+            # Mirror peek's ambig-list convention: `L42-89` → `42-89`.
+            return loc[1:] if isinstance(loc, str) and loc.startswith("L") else (loc or "?")
+
+        print(f"locate: {len(targets)} target{'s' if len(targets) != 1 else ''}")
+        hits = 0
+        for t in targets:
+            chosen, candidates, match_type, _alts = resolve_focus(G, idx, t)
+            if chosen:
+                hits += 1
+                a = G.nodes[chosen]
+                label = a.get("label", chosen)
+                sf = a.get("source_file") or "?"
+                loc = a.get("source_location") or ""
+                tag = f" ({match_type})" if match_type and match_type != "exact" else ""
+                print(f"  {label:<32} {sf}:{_fmt_loc(loc)}{tag}")
+            elif candidates:
+                # Surface up to 3 candidate locations so the agent can
+                # re-issue locate with a path-qualifier without an extra
+                # navigate call. The `qualify with` hint names the form.
+                print(f"  {t:<32} ambiguous ({len(candidates)}) — "
+                      f"qualify with @<dir>/<file>/<sym>")
+                for nid in candidates[:3]:
+                    a = G.nodes[nid]
+                    sf = a.get("source_file") or "?"
+                    loc = a.get("source_location") or ""
+                    print(f"      → {sf}:{_fmt_loc(loc)}")
+                if len(candidates) > 3:
+                    print(f"      → +{len(candidates) - 3} more")
+            else:
+                print(f"  {t:<32} not found")
+        if hits == 0:
+            sys.exit(1)
 
     elif cmd == "doc":
         # One-shot rationale dump. Field-report wish: "I had to pivot from

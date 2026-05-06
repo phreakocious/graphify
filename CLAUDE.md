@@ -23,8 +23,28 @@ compounding savings across follow-up calls are large.
 
 When you ship a feature here, ask: does this make graphify a better *primer*?
 Surfacing precise line ranges, entry points by external in-edges,
-class-method curated dumps — these all reduce the cost of "graphify first
-even when the task is large."
+class-method curated dumps, multi-symbol `locate` — these all reduce the cost
+of "graphify first even when the task is large."
+
+### Honest decision rule (R3 sub-agent feedback)
+
+The sibling-agent head-to-head test in lap-21 R3 produced this calibration:
+
+- **graphify wins** when ≤2 bodies are needed, structure-only answers
+  (shape/summarize/coc), cross-file disambiguation of same-name symbols,
+  or who-uses-X / dead-end tracing across the call graph.
+- **Read wins** when comprehending most of a file's bodies (>~200 ln total)
+  or line-by-line questions (formatting, surrounding context). graphify still
+  primes the right offset — `shape` then targeted Read beats unprimed Read,
+  and beats peek-as-scout when you'll end up reading the file anyway.
+- **graphify ties Read** when the answer needs 3-5 medium bodies. Either
+  approach works; pick by what's already on hand. Don't burn calls scouting
+  for a marginal win.
+
+The R3 worry that didn't pan out: free-function disambiguation works the
+same as class-method disambiguation (verified against `main` colliding
+across 11 files in this repo). Path-qualified resolution
+(`@graphify/__main__.py/main`) lands cleanly without grep fallback.
 
 ## Token / context preservation
 

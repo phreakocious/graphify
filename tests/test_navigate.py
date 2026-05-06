@@ -2290,6 +2290,146 @@ def test_summarize_emits_overview(tmp_path):
     assert ".py" in out, f"language mix missing:\n{out}"
 
 
+def test_locate_resolves_multiple_symbols_in_one_call(tmp_path, monkeypatch):
+    """Lap-21 (R3 sub-agent feedback): `graphify locate <s1> <s2> ...`
+    returns file:line for many symbols in one call so an agent doesn't
+    fan out to N peeks just to find where things live. R3-A's graphify
+    agent ran 3 separate navigates for 3 GeometryAnalyzer methods —
+    locate collapses that to one call.
+
+    Resolution mirrors peek: full prefix/substring/fuzzy ladder + path
+    qualifier. No bodies — just label + file:line."""
+    import subprocess
+    nodes = [
+        {"id": "f", "label": "analyzer.py", "file_type": "code",
+         "source_file": "analyzer.py", "source_location": "L1",
+         "node_kind": "file"},
+        {"id": "cls", "label": "GeometryAnalyzer", "file_type": "code",
+         "source_file": "analyzer.py", "source_location": "L5-200",
+         "node_kind": "class"},
+        {"id": "m1", "label": ".analyze()", "file_type": "code",
+         "source_file": "analyzer.py", "source_location": "L42-89",
+         "node_kind": "impl_method"},
+        {"id": "m2", "label": ".score()", "file_type": "code",
+         "source_file": "analyzer.py", "source_location": "L91-105",
+         "node_kind": "impl_method"},
+        {"id": "m3", "label": ".report()", "file_type": "code",
+         "source_file": "analyzer.py", "source_location": "L107-130",
+         "node_kind": "impl_method"},
+    ]
+    links = [
+        {"source": "f", "target": "cls", "relation": "contains",
+         "confidence": "EXTRACTED"},
+        {"source": "cls", "target": "m1", "relation": "method",
+         "confidence": "EXTRACTED"},
+        {"source": "cls", "target": "m2", "relation": "method",
+         "confidence": "EXTRACTED"},
+        {"source": "cls", "target": "m3", "relation": "method",
+         "confidence": "EXTRACTED"},
+    ]
+    _write_graph(tmp_path / "graphify-out", nodes, links)
+    monkeypatch.chdir(tmp_path)
+    res = subprocess.run(
+        ["python", "-m", "graphify", "locate",
+         "GeometryAnalyzer.analyze",
+         "GeometryAnalyzer.score",
+         "GeometryAnalyzer.report"],
+        capture_output=True, text=True, cwd=str(tmp_path), timeout=15,
+    )
+    assert res.returncode == 0, f"locate failed: {res.stderr}"
+    out = res.stdout
+    # Each method appears with its file:line range.
+    assert "analyzer.py:42-89" in out, (
+        f"analyze line range missing:\n{out}"
+    )
+    assert "analyzer.py:91-105" in out, (
+        f"score line range missing:\n{out}"
+    )
+    assert "analyzer.py:107-130" in out, (
+        f"report line range missing:\n{out}"
+    )
+
+
+def test_locate_handles_misses_and_ambiguity_without_failing_the_batch(
+        tmp_path, monkeypatch):
+    """A locate batch is best-effort: a missed or ambiguous symbol
+    surfaces a per-symbol note but doesn't poison hits for other args.
+    Exit 0 if at least one symbol resolves; exit 1 only when all miss."""
+    import subprocess
+    nodes = [
+        {"id": "fa", "label": "a.py", "file_type": "code",
+         "source_file": "a.py", "source_location": "L1",
+         "node_kind": "file"},
+        {"id": "fb", "label": "b.py", "file_type": "code",
+         "source_file": "b.py", "source_location": "L1",
+         "node_kind": "file"},
+        # Same-name fns in two files — ambiguous resolution.
+        {"id": "pa", "label": "parse()", "file_type": "code",
+         "source_file": "a.py", "source_location": "L10-20",
+         "node_kind": "function"},
+        {"id": "pb", "label": "parse()", "file_type": "code",
+         "source_file": "b.py", "source_location": "L30-40",
+         "node_kind": "function"},
+        # Unique fn — clean resolution.
+        {"id": "u", "label": "uniquely_named()", "file_type": "code",
+         "source_file": "a.py", "source_location": "L50-60",
+         "node_kind": "function"},
+    ]
+    links = [
+        {"source": "fa", "target": "pa", "relation": "contains",
+         "confidence": "EXTRACTED"},
+        {"source": "fb", "target": "pb", "relation": "contains",
+         "confidence": "EXTRACTED"},
+        {"source": "fa", "target": "u", "relation": "contains",
+         "confidence": "EXTRACTED"},
+    ]
+    _write_graph(tmp_path / "graphify-out", nodes, links)
+    monkeypatch.chdir(tmp_path)
+    res = subprocess.run(
+        ["python", "-m", "graphify", "locate",
+         "uniquely_named",  # hits
+         "parse",           # ambiguous
+         "no_such_symbol"], # miss
+        capture_output=True, text=True, cwd=str(tmp_path), timeout=15,
+    )
+    # Exit 0 because at least one symbol resolved.
+    assert res.returncode == 0, f"locate failed: {res.stderr}"
+    out = res.stdout
+    # Hit line.
+    assert "uniquely_named" in out and "a.py:50-60" in out, (
+        f"clean hit missing:\n{out}"
+    )
+    # Ambiguous line names the cause + suggests qualifier.
+    assert "parse" in out and "ambiguous" in out, (
+        f"ambiguous symbol should be flagged:\n{out}"
+    )
+    # Miss line names the cause.
+    assert "no_such_symbol" in out and "not found" in out, (
+        f"miss should be flagged:\n{out}"
+    )
+
+
+def test_locate_exits_nonzero_when_all_symbols_miss(tmp_path, monkeypatch):
+    """If every requested symbol fails to resolve, exit 1 — the batch
+    was useless, signal that to a shell pipeline."""
+    import subprocess
+    nodes = [
+        {"id": "f", "label": "a.py", "file_type": "code",
+         "source_file": "a.py", "source_location": "L1",
+         "node_kind": "file"},
+    ]
+    _write_graph(tmp_path / "graphify-out", nodes, [])
+    monkeypatch.chdir(tmp_path)
+    res = subprocess.run(
+        ["python", "-m", "graphify", "locate", "ghost1", "ghost2"],
+        capture_output=True, text=True, cwd=str(tmp_path), timeout=15,
+    )
+    assert res.returncode == 1, (
+        f"locate with all-misses should exit 1; got {res.returncode}\n"
+        f"stdout:{res.stdout}\nstderr:{res.stderr}"
+    )
+
+
 def test_dead_ends_pivot_lists_uncalled_methods(tmp_path, monkeypatch):
     """Lap-21 (Gemini #2): `@<focus> dead-ends` lists contained
     function/method children with 0 non-structural in-edges. Surfaces
