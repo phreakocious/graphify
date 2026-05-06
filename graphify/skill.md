@@ -38,6 +38,7 @@ Turn any folder of files into a navigable knowledge graph with community detecti
 /graphify navigate --show-session <id>                # peek a saved session's frontier without mutating the cursor
 /graphify navigate --quiet-hints                      # suppress hint lines (per-session dedup also applies on --session)
 /graphify peek "<symbol>"                             # one-shot body read — resolve, dump body, no session/cursor side-effects (accepts Class.method)
+/graphify blast "<symbol>"                            # one-shot blast radius — callers + callees side-by-side under ## Callers / ## Callees (refactor planning, cursor-free)
 /graphify search "<pattern>"                          # body-text grep across nodes — returns hits with symbol context (label, file:line, container, community, degree)
 /graphify shape "<file>"                              # file structure summary: N classes / M fns / K consts / X imports / longest fn — wc -l + ctags equivalent
 /graphify query "<question>"                          # BFS traversal - broad context (use after navigate narrows scope)
