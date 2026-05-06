@@ -3402,9 +3402,21 @@ def navigate(ops: list[str] | str, *,
                     # was dropped: the listing header below already shows
                     # `@X ambiguous (prefix)` with count + collapse note,
                     # and that's what leads into the action.
-                    pivot_label = (f"@{op_str[1:]} ambiguous"
-                                   if not match_type or match_type == "exact"
-                                   else f"@{op_str[1:]} ambiguous ({match_type})")
+                    if match_type == "no_match_in_file":
+                        # Lap-20b: prefix matched a real file but no
+                        # symbol in it matched the basename. Render a
+                        # clear "<basename> not in <file>" pivot rather
+                        # than the generic ambiguous header. Surface
+                        # which file matched so the agent can compare
+                        # against what they typed.
+                        first_sf = G.nodes[candidates[0]].get("source_file", "") if candidates else ""
+                        _, _, basename_part = op_str[1:].rpartition("/")
+                        pivot_label = (f"`{basename_part}` not in {first_sf}; "
+                                       f"available {len(candidates)}")
+                    else:
+                        pivot_label = (f"@{op_str[1:]} ambiguous"
+                                       if not match_type or match_type == "exact"
+                                       else f"@{op_str[1:]} ambiguous ({match_type})")
                     last_data = _listing_data(G, candidates,
                                               pivot_label, None,
                                               total=len(candidates),

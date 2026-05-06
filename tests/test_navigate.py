@@ -596,6 +596,66 @@ def test_path_qualified_substring_beats_dash_stem_prefix():
     assert match_type == "exact"
 
 
+def test_path_qualified_dotted_suffix_matches_object_method():
+    """Lap-20b: object-literal method nodes have labels like `config.run()`.
+    A user typing `<file>/run` should resolve to that node when the file
+    portion narrows it down. The basename `run` should match the after-
+    dot suffix of `config.run()`. Without this, every TS experiment file's
+    `config.run` falls through to global fuzzy on `/run` queries."""
+    G = nx.DiGraph()
+    G.add_node("file_a", label="multianti.ts", file_type="code",
+               source_file="experiments/ref-id-logit-delta-multianti.ts",
+               source_location="L1", node_kind="file")
+    G.add_node("config_a", label="config", file_type="code",
+               source_file="experiments/ref-id-logit-delta-multianti.ts",
+               source_location="L195")
+    G.add_node("run_a", label="config.run()", file_type="code",
+               source_file="experiments/ref-id-logit-delta-multianti.ts",
+               source_location="L205-503")
+    idx = label_index(G)
+    chosen, _, match_type, _ = resolve_focus(G, idx, "multianti.ts/run")
+    assert chosen == "run_a", (
+        f"`<file>/run` should resolve to `config.run()` via dotted-suffix "
+        f"match; got chosen={chosen!r}"
+    )
+    assert match_type == "exact"
+
+
+def test_path_qualified_no_symbol_lists_files_actual_symbols():
+    """Lap-20b TS-Claude field report: `<file>/<sym>` where the symbol
+    portion misses must list the prefix-matching file's actual symbols
+    rather than fuzzy-jumping to a similar-named file in another
+    directory. Match_type `no_match_in_file` flags the case so navigate
+    can render a clear "<basename> not in <file>" pivot label."""
+    G = nx.DiGraph()
+    G.add_node("file_a", label="multianti.ts", file_type="code",
+               source_file="experiments/ref-id-logit-delta-multianti.ts",
+               source_location="L1", node_kind="file")
+    G.add_node("foo_a", label="foo()", file_type="code",
+               source_file="experiments/ref-id-logit-delta-multianti.ts",
+               source_location="L10")
+    G.add_node("bar_a", label="bar()", file_type="code",
+               source_file="experiments/ref-id-logit-delta-multianti.ts",
+               source_location="L20")
+    # An unrelated file with similar dash-stem name — must NOT win.
+    G.add_node("file_b", label="multi-entity.ts", file_type="code",
+               source_file="src/multi-entity.ts",
+               source_location="L1", node_kind="file")
+    idx = label_index(G)
+    chosen, candidates, match_type, _ = resolve_focus(
+        G, idx, "multianti.ts/nonexistent"
+    )
+    assert chosen is None, (
+        f"missing symbol should not silently resolve; got chosen={chosen!r}"
+    )
+    assert match_type == "no_match_in_file", (
+        f"expected no_match_in_file, got match_type={match_type!r}"
+    )
+    assert set(candidates) == {"foo_a", "bar_a"}, (
+        f"candidates should be the file's symbols, got {candidates}"
+    )
+
+
 def test_rank_prefers_symbol_over_rationale():
     """Lap-7 B3: `@FOO_BAR` was landing on a `[rationale]` docstring node
     instead of the symbol it documented. _rank_match must rank symbol
@@ -3122,7 +3182,7 @@ def test_path_all_imports_emits_calls_hint(tmp_path):
     assert "--edges calls" in out, (
         f"all-imports path should hint at --edges calls:\n{out}"
     )
-    assert "all file-level imports" in out, (
+    assert "file-level imports" in out, (
         f"hint should name the cause:\n{out}"
     )
 

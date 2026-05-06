@@ -374,12 +374,27 @@ def resolve_focus(G: nx.DiGraph, idx: dict[str, list[str]],
             target `_classify_file` was compared verbatim — so the user
             typing the underscore-form (the actual label) silently failed.
             Now both `tools/x.py/_classify_file` and `tools/x.py/classify_file`
-            resolve to the same node."""
+            resolve to the same node.
+
+            Lap-20b: object-literal method nodes have labels like
+            `config.run()`, where the `<owner>.` prefix encodes the
+            binding name. A user typing `<file>/run` should resolve to
+            that node when the file portion narrows it. Accept a
+            dotted-suffix match: if the stripped label contains `.`,
+            also try the after-last-dot suffix against the target.
+            Without this, every TS experiment file's `config.run` fell
+            through to global fuzzy on `/run` queries."""
             stripped = label_norm.rstrip("()").lstrip(".").lstrip("_")
             target_stripped = target.lstrip("_")
-            return (stripped == target
+            if (stripped == target
                     or stripped == target_stripped
-                    or label_norm == target)
+                    or label_norm == target):
+                return True
+            if "." in stripped:
+                suffix = stripped.rsplit(".", 1)[-1]
+                if suffix == target or suffix == target_stripped:
+                    return True
+            return False
 
         def _path_segment_matches(sf: str, segment: str) -> bool:
             """Match `source_file` against a path segment, tolerating
@@ -473,6 +488,36 @@ def resolve_focus(G: nx.DiGraph, idx: dict[str, list[str]],
                         all_nids = [n for sf in top_files for n in sym_files[sf]]
                         all_nids.sort(key=lambda n: _rank_match(G, key, n))
                         return None, all_nids, "exact", []
+
+        # 1d. Negative-case fallback. Lap-20b TS-Claude field report:
+        # `<file>/<sym>` falls through to global fuzzy when symbol portion
+        # misses, landing on a similar-named file in a different directory
+        # (`@multianti.ts/nonexistent` → `multi-entity.ts`). Detect "prefix
+        # resolves confidently to one or more real files, but no node in
+        # those files matches the basename" and surface those files'
+        # actual symbols rather than letting global fuzzy pick a wrong
+        # file. Match_type `no_match_in_file` lets navigate render a
+        # clear pivot label ("`<basename>` not in <file>; available:")
+        # instead of the generic disambig header.
+        if prefix:
+            all_files = {_norm(attrs.get("source_file") or "")
+                         for _nid, attrs in G.nodes(data=True)
+                         if attrs.get("source_file")}
+            ranked = _rank_files_by_prefix([f for f in all_files if f], prefix)
+            if ranked:
+                top_tier = ranked[0][0]
+                if top_tier <= 2:
+                    top_files = {sf for tier, _, sf in ranked if tier == top_tier}
+                    file_symbols: list[str] = []
+                    for nid, attrs in G.nodes(data=True):
+                        sf = _norm(attrs.get("source_file") or "")
+                        if sf in top_files \
+                                and attrs.get("file_type") == "code" \
+                                and attrs.get("node_kind") != "file":
+                            file_symbols.append(nid)
+                    if file_symbols:
+                        file_symbols.sort(key=lambda n: _rank_match(G, key, n))
+                        return None, file_symbols, "no_match_in_file", []
 
     # 1c. dotted Class.method qualifier. `Runner.__init__`, `Klein.compute()`,
     # or `Cell.bar` should resolve to the method node directly. Today the

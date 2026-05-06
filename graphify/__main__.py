@@ -1851,16 +1851,37 @@ def main() -> None:
             annotation = "  (co-located only — these nodes share a parent file but have no semantic call/use edge between them)"
         elif hops >= 2 and all(r in ("contains", "method") for r in relations):
             annotation = "  (structural-only path: contains/method — no direct call edge between endpoints)"
-        # Lap-20 field-report fix: a path consisting entirely of file-level
-        # `imports`/`imports_from` edges is graph-connected but not a call
-        # chain. Default `--edges reach` keeps these in (some users do want
-        # the file-graph view), but the rendered output reads as a 7-hop
-        # call path. Cheap hint: tell the agent the path is purely
+        # Lap-20 field-report fix: a path that traverses the file-import
+        # graph is graph-connected but not a call chain. Default
+        # `--edges reach` keeps file-import edges in (some users do want the
+        # file-graph view), but the rendered output reads as a multi-hop
+        # call path. Cheap hint: tell the agent the path is mostly
         # file-imports and `--edges calls` would constrain to the runtime
         # call graph. NOT a default change — the existing default stays.
-        if (hops >= 2 and edge_mode != "calls"
-                and all(r in ("imports", "imports_from") for r in relations)):
-            annotation = ("  hint: try --edges calls — current path is all "
+        # Lap-20b: loosen from "all imports_from" to "majority imports_from
+        # plus optional terminal contains/method", since a real-world all-
+        # imports chain typically lands on the target symbol via a final
+        # `contains` edge from a file node — that whole shape still has no
+        # runtime call meaning.
+        import_edges = sum(1 for r in relations if r in ("imports", "imports_from"))
+        terminal_structural_only = (
+            relations
+            and relations[-1] in ("contains", "method")
+            and all(r in ("imports", "imports_from") for r in relations[:-1])
+        )
+        # Trigger the hint only when the path is dominated by file-level
+        # imports — at least 2 import edges OR every edge is an import.
+        # A short 2-hop `imports + contains` chain (a single import landing
+        # on a symbol via its file) is not the failure mode the field
+        # report flagged; the dangerous case is a multi-hop import
+        # traversal that READS as a call path.
+        mostly_imports = hops >= 2 and (
+            (import_edges == hops)
+            or (import_edges >= 2 and terminal_structural_only)
+            or (hops >= 3 and import_edges >= hops - 1)
+        )
+        if mostly_imports and edge_mode != "calls":
+            annotation = ("  hint: try --edges calls — path traverses "
                           "file-level imports, may not represent semantic "
                           "call flow")
         print(f"Shortest path ({hops} hops):\n  " + " ".join(segments))
