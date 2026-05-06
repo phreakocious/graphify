@@ -1855,10 +1855,17 @@ def _render_listing_text(data: dict, *, show_ops: bool, md: bool = False) -> str
     # opaque integer noise. If all items share one community, hoist it above
     # the table and drop per-item cN entirely; if items span clusters, the
     # per-item tag stays useful as an "out of cluster" marker.
+    #
+    # Lap-19 fix: when `collapsed > 0`, the surviving rows are first-of-N
+    # representatives, so a single-community claim covers ONE row's cluster
+    # but not the dupes hidden behind it. Field reporter saw `all in c48`
+    # on a `@.compute_metrics` disambig where dupes spanned c5382, c13450,
+    # c2806. Don't lie — relabel as primary-cluster-with-sampled-others.
     cids_seen = [it.get("community") for it in items
                  if it.get("community") not in (None, -1)]
     unique_cids = set(cids_seen)
     multi_community = len(unique_cids) > 1
+    collapsed_for_cluster = data.get("collapsed", 0)
     if len(unique_cids) == 1:
         cid = next(iter(unique_cids))
         clabel = next((it.get("community_label") for it in items
@@ -1868,7 +1875,11 @@ def _render_listing_text(data: dict, *, show_ops: bool, md: bool = False) -> str
         pivot_str = data.get("pivot") or ""
         already_in_header = f"c{cid}" in pivot_str
         if not already_in_header:
-            out.append(f"  all in {cstr}")
+            if collapsed_for_cluster:
+                out.append(f"  primary cluster: {cstr} "
+                           f"(dupes hidden by collapse may span others)")
+            else:
+                out.append(f"  all in {cstr}")
 
     # Lap-9 collapse: surface a single-line note announcing the collapse
     # totals. Per-row dupe rendering happens below in the item loop —
@@ -3334,12 +3345,19 @@ def navigate(ops: list[str] | str, *,
                                                min_confidence=min_confidence,
                                                show_history=show_history)
                 elif candidates:
-                    if match_type and match_type != "exact":
-                        trace.append(f"  > {len(candidates)} {match_type} matches for `{op_str}` — pick [N]")
                     candidates, archived_hidden = _filter_archived_ids(G, candidates, archived_mode)
                     drops = {"archived": archived_hidden} if archived_hidden else None
+                    # Encode match_type in the pivot label so the listing
+                    # header carries it directly. The redundant
+                    # `> N {match_type} matches for X — pick [N]` trace line
+                    # was dropped: the listing header below already shows
+                    # `@X ambiguous (prefix)` with count + collapse note,
+                    # and that's what leads into the action.
+                    pivot_label = (f"@{op_str[1:]} ambiguous"
+                                   if not match_type or match_type == "exact"
+                                   else f"@{op_str[1:]} ambiguous ({match_type})")
                     last_data = _listing_data(G, candidates,
-                                              f"@{op_str[1:]} ambiguous", None,
+                                              pivot_label, None,
                                               total=len(candidates),
                                               sort_label="match relevance",
                                               limit=effective_limit,
