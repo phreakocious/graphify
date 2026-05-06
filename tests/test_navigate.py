@@ -5051,12 +5051,13 @@ def test_summarize_rejects_function_target_with_redirect(tmp_path, monkeypatch):
     assert "peek" in err, f"error should redirect to peek:\n{err}"
 
 
-def test_summarize_rejects_file_target_redirects_to_shape(tmp_path, monkeypatch):
-    """Lap-24: a file target on summarize was getting "peek or blast" as
-    the redirect — wrong verb. The agent who typed `summarize @<file>`
-    (a natural typo for "give me an overview of this file") should land
-    on `shape`, the file-orientation verb. Targeted regression for the
-    redirect logic."""
+def test_summarize_file_target_falls_through_to_shape(tmp_path, monkeypatch):
+    """Lap-24: `graphify summarize <file>` falls through to `shape <file>`
+    instead of erroring out. Empirical case: a session-benchmark agent
+    ran `summarize <file>`, got "Try graphify shape" redirect, then
+    re-ran shape — one wasted call. Agent intent is clear ("summarize
+    this file"); honor it. Header note tells the agent the redirect
+    happened so they can go straight to shape next time."""
     import subprocess
     nodes = [
         {"id": "f", "label": "lib.py", "file_type": "code",
@@ -5076,14 +5077,19 @@ def test_summarize_rejects_file_target_redirects_to_shape(tmp_path, monkeypatch)
         ["python", "-m", "graphify", "summarize", "lib.py"],
         capture_output=True, text=True, cwd=str(tmp_path), timeout=15,
     )
-    assert res.returncode == 1, "should exit non-zero on file target"
-    err = res.stderr
-    assert "not a class" in err, f"error should name the shape mismatch:\n{err}"
-    assert "graphify shape" in err, (
-        f"file target should redirect to shape, not peek/blast:\n{err}"
+    assert res.returncode == 0, (
+        f"file target should succeed via shape fall-through: stderr={res.stderr}"
     )
-    assert "peek" not in err, (
-        f"file target redirect should not mention peek:\n{err}"
+    out = res.stdout
+    assert "redirecting to `graphify shape`" in out, (
+        f"redirect note should fire so agent learns the right verb:\n{out}"
+    )
+    # Shape output is rendered (not an error message).
+    assert "shape @lib.py" in out, (
+        f"file fall-through should emit shape output:\n{out}"
+    )
+    assert "do_work()" in out, (
+        f"shape output should list the file's fns:\n{out}"
     )
 
 

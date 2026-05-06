@@ -2245,14 +2245,28 @@ def main() -> None:
                 # An agent who typed `summarize @foo` for a function should
                 # be redirected to peek/blast instead of getting a generic
                 # error.
-                # Lap-24 fix: file targets were getting "peek or blast" —
-                # wrong verb. The agent who typed `summarize @<file>` (a
-                # natural typo for "give me an overview of this file")
-                # should land on `shape`, the file-orientation verb.
+                # Lap-24 (post-A/B follow-up): file targets fall THROUGH
+                # to `shape`. Empirical from session-benchmark t0
+                # transcript: agent ran `graphify summarize <file>`,
+                # got the redirect message, then re-ran `graphify shape
+                # <file>` — one wasted call. The agent intent is clear
+                # ("summarize this file"); honor it by dispatching into
+                # shape rather than emitting an error. Header note tells
+                # the agent the redirect happened so future calls go
+                # straight to shape.
                 if node_kind == "file":
-                    hint = "shape"
-                elif node_kind in ("function", "method", "impl_method",
-                                   "iface_method"):
+                    from graphify.navigate import (
+                        shape_file, _render_shape_text,
+                    )
+                    from graphify.analyze import _is_file_node
+                    if _is_file_node(G, chosen):
+                        print(f"# `summarize @{label}` is a file target — "
+                              f"redirecting to `graphify shape`.")
+                        data = shape_file(G, chosen)
+                        print(_render_shape_text(data))
+                        return
+                if node_kind in ("function", "method", "impl_method",
+                                 "iface_method"):
                     hint = "peek"
                 else:
                     hint = "peek or blast"
