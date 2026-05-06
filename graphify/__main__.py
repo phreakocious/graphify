@@ -1176,6 +1176,18 @@ def main() -> None:
     if len(sys.argv) < 2 or sys.argv[1] in ("-h", "--help"):
         print("Usage: graphify <command>")
         print()
+        # Lap-20d (TS-Claude #5): workflow templates retain better than
+        # per-flag docs. Lead with the 80% paths so an agent who only
+        # reads the first screen of help can already do useful work.
+        print("Common workflows:")
+        print("  Orient on a file       graphify shape <file>")
+        print("  Read a function body   graphify peek <symbol>")
+        print("  Find callers of X      graphify navigate \"@X\" in")
+        print("  Map a class            graphify navigate \"@Class\" methods --bodies 3")
+        print("  Find a string          graphify search \"<regex>\"")
+        print("  Where does X reach Y?  graphify path \"X\" \"Y\" --edges calls")
+        print("  Stale graph?           graphify changed   (then `graphify update .`)")
+        print()
         print("Commands:")
         print("  install [--platform P]  copy skill to platform config dir (claude|windows|codex|opencode|aider|claw|droid|trae|trae-cn|gemini|cursor|antigravity|hermes|kiro)")
         for line in _HELP_BLOCKS["path"]:
