@@ -1,0 +1,7 @@
+{
+  "candidate_id": "task_recipe_summarize",
+  "parent_id": "task_recipe_navigator",
+  "generation": 4,
+  "proposer_notes": "Lap-23 follow-up: clone of task_recipe_navigator (the lap-23 winner) plus one new recipe row for `graphify summarize @<Class>` — the new class-summary verb shipped to address the cluster-B bimodal failure mode (task_004 Klein, task_005 buildDecodeEngine where agents fall back to read_file because no graphify verb fuses class-level info). Tests whether a class-summary one-shot collapses the read_file failure mode the same way `blast` collapsed the refactor-radius chain in lap-22. Predicted -20-30% TTC on task_004 + task_005.",
+  "created_at": "2026-05-06"
+}
