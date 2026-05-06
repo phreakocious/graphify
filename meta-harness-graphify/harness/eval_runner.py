@@ -74,7 +74,10 @@ def run_rollout(
         {"type": "text", "text": skill_text, "cache_control": {"type": "ephemeral"}},
     ]
 
-    client = Anthropic()
+    # Bump retries to ride out transient 529 (overloaded) and 5xx without
+    # losing the whole rollout. Default is 2; observed 529 storms during
+    # multi-candidate compare runs.
+    client = Anthropic(max_retries=6)
     ctx = ToolContext(repo_dir=sb.target_repo, venv_python=sb.venv_python)
 
     messages: list[dict] = [{"role": "user", "content": task.prompt}]
