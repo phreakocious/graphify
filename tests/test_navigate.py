@@ -2236,6 +2236,49 @@ def test_frontier_header_disambiguates_focus_from_community(tmp_path, monkeypatc
     )
 
 
+def test_dead_ends_pivot_lists_uncalled_methods(tmp_path, monkeypatch):
+    """Lap-21 (Gemini #2): `@<focus> dead-ends` lists contained
+    function/method children with 0 non-structural in-edges. Surfaces
+    candidate dead code in one call."""
+    from graphify.navigate import navigate
+    nodes = [
+        {"id": "f", "label": "lib.py", "file_type": "code",
+         "source_file": "lib.py", "source_location": "L1"},
+        {"id": "alive", "label": "alive_fn()", "file_type": "code",
+         "source_file": "lib.py", "source_location": "L5",
+         "node_kind": "function"},
+        {"id": "dead1", "label": "orphan_one()", "file_type": "code",
+         "source_file": "lib.py", "source_location": "L10",
+         "node_kind": "function"},
+        {"id": "dead2", "label": "orphan_two()",
+         "file_type": "code",
+         "source_file": "lib.py", "source_location": "L20",
+         "node_kind": "function"},
+        {"id": "caller", "label": "user()", "file_type": "code",
+         "source_file": "other.py", "source_location": "L1",
+         "node_kind": "function"},
+    ]
+    links = [
+        {"source": "f", "target": "alive", "relation": "contains",
+         "confidence": "EXTRACTED"},
+        {"source": "f", "target": "dead1", "relation": "contains",
+         "confidence": "EXTRACTED"},
+        {"source": "f", "target": "dead2", "relation": "contains",
+         "confidence": "EXTRACTED"},
+        # caller calls `alive_fn`, leaving the other two as dead-ends.
+        {"source": "caller", "target": "alive", "relation": "calls",
+         "confidence": "EXTRACTED"},
+    ]
+    _write_graph(tmp_path / "graphify-out", nodes, links)
+    monkeypatch.chdir(tmp_path)
+    out = navigate(["@lib.py", "dead-ends"], session=False, fmt="text")
+    assert "orphan_one()" in out, f"first uncalled fn should appear:\n{out}"
+    assert "orphan_two()" in out, f"second uncalled fn should appear:\n{out}"
+    assert "alive_fn()" not in out, (
+        f"called fn should be excluded:\n{out}"
+    )
+
+
 def test_peek_class_emits_curated_dump(tmp_path):
     """Lap-21 #2 (sub-agent head-to-head): `peek <Class>` (no method)
     used to dump the entire class body. With many methods that can be

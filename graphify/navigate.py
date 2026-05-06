@@ -1480,6 +1480,7 @@ LEGEND = (
     "      inh         = inheritance edges (class extends, interface extends)\n"
     "      parent      = structural parent (containing class or file)\n"
     "      siblings    = peers under the same parent (file/class)\n"
+    "      dead-ends   = contained children with 0 non-structural in-edges (candidate dead code)\n"
     "      read [N]    = dump focused node body inline (N caps lines, default 200)\n"
     "      back/reset  = pop history / clear cursor\n"
     "    picks: [N] or N (after a listing) · @<label>=focus a node by label/id"
@@ -1912,7 +1913,7 @@ def _render_frontier_text(data: dict, cursor: Cursor, *, show_ops: bool,
         # `parent → contains --bodies` even when sitting on the function they
         # wanted. The discoverability gap defeated the whole closed-loop intent.
         ops_line = ("  ops: in | out | methods | contains | coc | rat | inh | parent | "
-                    "siblings | callers | callees | dependents | dependencies | read | filter <rgx>")
+                    "siblings | callers | callees | dependents | dependencies | dead-ends | read | filter <rgx>")
         if data.get("show_history"):
             ops_line += " | back | reset"
         ops_line += " | @<label> | [N]"
@@ -2792,6 +2793,61 @@ def _pivot_data(G: nx.DiGraph, communities: dict[int, list[str]],
         pname = f"⊕coc(c{cid}={clabel})" if clabel else f"⊕coc(c{cid})"
         return (pname, members, {}, "degree desc", file_drops)
 
+    if key == "dead_ends":
+        # Lap-21 (Gemini #2): contained children with 0 non-structural
+        # in-edges. The candidate-dead-code pivot. Walks both `method`
+        # and `contains` successors; a method/fn with 0 callers (and
+        # not via a structural edge) is a candidate for removal — or a
+        # test-only utility, or an entry point not yet wired.
+        children = []
+        for v in G.successors(nid):
+            rel = G.edges[nid, v].get("relation") or ""
+            if rel not in ("method", "contains"):
+                continue
+            v_kind = G.nodes[v].get("node_kind") or ""
+            v_label = G.nodes[v].get("label", "")
+            # Function-shaped only — classes/types-as-children have
+            # different "dead" semantics (zero callers ≠ unused class).
+            if not (v_label.endswith("()") or v_kind in
+                    ("method", "impl_method", "iface_method", "function")):
+                continue
+            children.append(v)
+
+        dead_ids: list[str] = []
+        for v in children:
+            n_in = 0
+            for u in G.predecessors(v):
+                rel = G.edges[u, v].get("relation") or ""
+                if rel in _STRUCTURAL:
+                    continue
+                if not _passes_confidence(G.edges[u, v], extracted_only,
+                                          min_confidence):
+                    continue
+                n_in += 1
+            if n_in == 0:
+                dead_ids.append(v)
+        # Sort by source order (file:line) so the listing reads like the
+        # source file, not by an opaque rank.
+        def _sk(v: str) -> tuple[str, int]:
+            a = G.nodes[v]
+            sf2 = a.get("source_file") or ""
+            loc = a.get("source_location") or ""
+            try:
+                line_no = int(loc[1:].split("-", 1)[0].split(":", 1)[0]) if loc.startswith("L") else 0
+            except ValueError:
+                line_no = 0
+            return (sf2, line_no)
+        dead_ids.sort(key=_sk)
+        # Drop summary: how many children we walked, how many were
+        # filtered as "alive" (so the agent sees the surface vs find).
+        alive_count = len(children) - len(dead_ids)
+        drops_dx: dict = {}
+        if alive_count:
+            drops_dx["alive"] = alive_count
+        return ("☠dead-ends", dead_ids, {},
+                "0 non-structural in-edges; source order",
+                drops_dx)
+
     return ("", [], {}, "", {})
 
 
@@ -3496,6 +3552,10 @@ PIVOT_KEYS = {
     # via verbs that map onto coupling rather than graph direction.
     "dependents": "dependents", "deps-up": "dependents",
     "dependencies": "dependencies", "deps": "dependencies", "deps-down": "dependencies",
+    # Lap-21 (Gemini #2): dead-ends — contained children with 0 non-
+    # structural in-edges. Surfaces methods/fns that nothing calls;
+    # candidate dead code or test-only utilities.
+    "dead-ends": "dead_ends", "dead": "dead_ends", "deadends": "dead_ends",
 }
 
 CONTROL_KEYS = {
