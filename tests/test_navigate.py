@@ -2236,6 +2236,72 @@ def test_frontier_header_disambiguates_focus_from_community(tmp_path, monkeypatc
     )
 
 
+def test_transitive_noop_notice_on_file_with_direct_out(tmp_path, monkeypatch):
+    """Lap-21 #6: --transitive silently no-ops when the file already has
+    direct out-edges. Surface a notice so the agent knows the flag did
+    nothing."""
+    import json as _json, subprocess
+    nodes = [
+        {"id": "fileA", "label": "a.ts", "file_type": "code",
+         "source_file": "a.ts", "source_location": "L1"},
+        {"id": "fileB", "label": "b.ts", "file_type": "code",
+         "source_file": "b.ts", "source_location": "L1"},
+        {"id": "child", "label": "child()", "file_type": "code",
+         "source_file": "a.ts", "source_location": "L5"},
+    ]
+    links = [
+        # fileA imports fileB → direct out-edge.
+        {"source": "fileA", "target": "fileB", "relation": "imports_from",
+         "confidence": "EXTRACTED"},
+        {"source": "fileA", "target": "child", "relation": "contains",
+         "confidence": "EXTRACTED"},
+    ]
+    graph_dir = tmp_path / "graphify-out"
+    graph_dir.mkdir()
+    (graph_dir / "graph.json").write_text(_json.dumps(
+        {"directed": True, "multigraph": False,
+         "graph": {}, "nodes": nodes, "links": links}), encoding="utf-8")
+    res = subprocess.run(
+        ["graphify", "navigate", "@a.ts", "out", "--transitive",
+         "--graph", str(graph_dir / "graph.json")],
+        capture_output=True, text=True, cwd=str(tmp_path),
+    )
+    out = res.stdout + res.stderr
+    assert "--transitive: not applied" in out, (
+        f"--transitive on file with direct out should emit notice:\n{out}"
+    )
+
+
+def test_transitive_noop_notice_on_symbol_node(tmp_path, monkeypatch):
+    """Lap-21 #6: --transitive on a non-file focus is a no-op too."""
+    import json as _json, subprocess
+    nodes = [
+        {"id": "fn", "label": "compute()", "file_type": "code",
+         "source_file": "a.ts", "source_location": "L1",
+         "node_kind": "function"},
+        {"id": "callee", "label": "helper()", "file_type": "code",
+         "source_file": "b.ts", "source_location": "L1"},
+    ]
+    links = [
+        {"source": "fn", "target": "callee", "relation": "calls",
+         "confidence": "EXTRACTED"},
+    ]
+    graph_dir = tmp_path / "graphify-out"
+    graph_dir.mkdir()
+    (graph_dir / "graph.json").write_text(_json.dumps(
+        {"directed": True, "multigraph": False,
+         "graph": {}, "nodes": nodes, "links": links}), encoding="utf-8")
+    res = subprocess.run(
+        ["graphify", "navigate", "@compute", "out", "--transitive",
+         "--graph", str(graph_dir / "graph.json")],
+        capture_output=True, text=True, cwd=str(tmp_path),
+    )
+    out = res.stdout + res.stderr
+    assert "--transitive: only applies to file nodes" in out, (
+        f"--transitive on symbol focus should emit notice:\n{out}"
+    )
+
+
 def test_frontier_header_drops_hub_marker_when_focus_is_hub(tmp_path, monkeypatch):
     """Lap-21 polish: when the focused node IS the community's hub,
     `c53 hub:buildDecodeEngine()` restates the focus's own label.

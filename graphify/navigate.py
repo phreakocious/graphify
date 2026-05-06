@@ -2140,6 +2140,11 @@ def _render_listing_text(data: dict, *, show_ops: bool, md: bool = False) -> str
                    f"~{lines - n_decls * 5} inline statements not extracted as nodes "
                    f"(procedural script). `read [N]` dumps the file inline; "
                    f"the cursor already has the path.")
+    # Lap-21 #6: --transitive can silently no-op (focus is a symbol, or a
+    # file with direct out-edges). Surface the reason so agents don't
+    # wonder whether the flag did anything.
+    if drops.get("transitive_noop_reason"):
+        out.append(f"    note: {drops['transitive_noop_reason']}")
     if show_ops:
         out.append("  pick: [N] to focus · @<label> jump")
     return "\n".join(out)
@@ -2329,7 +2334,28 @@ def _pivot_data(G: nx.DiGraph, communities: dict[int, list[str]],
         # normal out path so a file with 0 out and >0 contains routes
         # through; a file with >0 direct out gets normal handling and
         # transitive is a no-op.
-        if transitive and _is_file_node(G, nid):
+        # Lap-21 #6: track whether --transitive was a no-op so the renderer
+        # can surface a notice. The flag silently degrades on (a) symbols,
+        # which already have direct out, and (b) files that already have
+        # direct out-edges. Agents shouldn't have to wonder if the flag
+        # did anything.
+        transitive_noop_reason: str | None = None
+        # Use a stricter check than _is_file_node here (which incorrectly
+        # classifies low-degree function stubs as files via its "single
+        # contains edge" heuristic). For --transitive the question is
+        # specifically "is this a file-as-script-leaf where the call
+        # graph lives one hop deep via contains?" That's strictly
+        # `label == basename(source_file)`.
+        focus_attrs = G.nodes[nid]
+        focus_sf = focus_attrs.get("source_file") or ""
+        focus_label = focus_attrs.get("label", "")
+        is_real_file = bool(focus_sf and focus_label == Path(focus_sf).name)
+        if transitive and not is_real_file:
+            transitive_noop_reason = (
+                "--transitive: only applies to file nodes — focus is a "
+                "symbol; `out` is already its direct outbound edges"
+            )
+        if transitive and is_real_file:
             direct_out = [v for v in G.successors(nid)
                           if G.edges[nid, v].get("relation") not in _STRUCTURAL
                           and _passes_confidence(G.edges[nid, v], extracted_only,
@@ -2338,7 +2364,13 @@ def _pivot_data(G: nx.DiGraph, communities: dict[int, list[str]],
                          if G.edges[nid, v].get("relation") == "contains"
                          and _passes_confidence(G.edges[nid, v], extracted_only,
                                                  min_confidence)]
-            if not direct_out and contained:
+            if direct_out:
+                transitive_noop_reason = (
+                    f"--transitive: not applied — file already has "
+                    f"{len(direct_out)} direct out-edge(s); script-leaf "
+                    f"transitive only fires when out=0"
+                )
+            elif not direct_out and contained:
                 collected: list[str] = []
                 tedge_for: dict[str, dict] = {}
                 seen: set[str] = {nid, *contained}
@@ -2394,6 +2426,8 @@ def _pivot_data(G: nx.DiGraph, communities: dict[int, list[str]],
         kd = _kind_drops(full_semantic_out, kinds)
         if kd:
             drops["by_rel"] = kd
+        if transitive_noop_reason:
+            drops["transitive_noop_reason"] = transitive_noop_reason
         return ("↘out", succs, edge_for, sort_label, drops)
 
     if key == "methods":
