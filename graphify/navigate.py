@@ -1233,50 +1233,53 @@ def _read_body_full(source_file: str | None, source_location: str | None,
     return out, line_no, truncated
 
 
-def _strip_leading_docstring(lines: list[str]) -> tuple[list[str], int]:
-    """Drop a leading docstring or JSDoc block from a function body.
+def _find_leading_docstring_range(lines: list[str]) -> tuple[int, int]:
+    """Locate a leading docstring or JSDoc block in a function body.
 
     Lap-26 field-report fix: an agent who just ran `doc @foo` and follows
     up with `peek @foo` re-reads the same docstring inside the body. The
-    `--no-docstring` flag on peek trims it.
+    `--no-docstring` flag on peek elides it. We return a range (rather
+    than mutating the line list) so the renderer keeps file-absolute
+    line numbers correct on either side of the elision.
 
     Recognizes:
       - Python triple-quoted strings (``\"\"\"`` / ``'''``), single- or
         multi-line, optionally preceded by blank lines after the sig
       - JSDoc/JS comment blocks (`/** ... */`) above the body opener
 
-    Returns (stripped_lines, n_removed). Returns the input unchanged when
-    no recognized block is found at the head of the body.
+    Returns (start_idx, end_idx) — half-open interval into `lines`.
+    Returns (0, 0) when no recognized block is found at the head of
+    the body (renderer treats this as "nothing to elide").
     """
     if len(lines) < 2:
-        return lines, 0
-    head = lines[0]
+        return 0, 0
     rest = lines[1:]
     i = 0
     while i < len(rest) and not rest[i].strip():
         i += 1
     if i >= len(rest):
-        return lines, 0
+        return 0, 0
     s = rest[i].lstrip()
 
     if s.startswith('"""') or s.startswith("'''"):
         delim = s[:3]
         if delim in s[3:]:
-            return [head] + rest[i + 1:], i + 1
+            # Single-line docstring at index (1 + i).
+            return 1 + i, 1 + i + 1
         for j in range(i + 1, len(rest)):
             if delim in rest[j]:
-                return [head] + rest[j + 1:], j + 1
-        return lines, 0
+                return 1 + i, 1 + j + 1
+        return 0, 0
 
     if s.startswith("/**"):
         if "*/" in s[3:]:
-            return [head] + rest[i + 1:], i + 1
+            return 1 + i, 1 + i + 1
         for j in range(i + 1, len(rest)):
             if "*/" in rest[j]:
-                return [head] + rest[j + 1:], j + 1
-        return lines, 0
+                return 1 + i, 1 + j + 1
+        return 0, 0
 
-    return lines, 0
+    return 0, 0
 
 
 def _expand_identifier_casings(name: str) -> tuple[str, list[str]]:
@@ -1593,18 +1596,26 @@ def _render_body_text(data: dict, *, md: bool = False) -> str:
                                 data.get("source_location"), md)
     if not body_lines:
         return f"  read @{linked_label}: no body at {sf}:{ln} (missing source or unparseable location)"
-    header = f"  read @{linked_label}  ({sf}:{ln}, {len(body_lines)} lines"
+    # Lap-26: optional half-open elision range (e.g. peek --no-docstring).
+    # We render the body at file-absolute line numbers; lines inside the
+    # range are replaced by a single marker so the agent sees what was
+    # dropped without losing the line-number anchor on either side.
+    ds_range = data.get("docstring_range") or (0, 0)
+    ds_lo, ds_hi = ds_range
+    docstring_stripped = max(0, ds_hi - ds_lo)
+    visible_count = len(body_lines) - docstring_stripped
+    header = f"  read @{linked_label}  ({sf}:{ln}, {visible_count} lines"
     if truncated:
         header += f" — truncated at {len(body_lines)}, raise with `read N` or focus contained items"
-    # Lap-26: surface the docstring-stripped line count so the rule
-    # "never silent on hidden items" holds. peek --no-docstring sets
-    # this; no other caller currently does.
-    docstring_stripped = data.get("docstring_stripped") or 0
     if docstring_stripped:
         header += f" · −{docstring_stripped} docstring"
     header += ")"
     out = [header]
     for i, raw in enumerate(body_lines):
+        if ds_lo <= i < ds_hi:
+            if i == ds_lo:
+                out.append(f"        ... ({docstring_stripped} docstring lines elided) ...")
+            continue
         out.append(f"  {ln + i:>4}  {raw}")
     return "\n".join(out)
 

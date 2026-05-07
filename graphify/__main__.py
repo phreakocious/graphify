@@ -2920,7 +2920,7 @@ def main() -> None:
         from graphify.navigate import (
             DEFAULT_GRAPH_PATH, load_graph,
             _read_body_full, _render_body_text, _read_body_preview,
-            _strip_leading_docstring,
+            _find_leading_docstring_range,
         )
         from graphify.resolve import label_index, resolve_focus
         from graphify.analyze import _is_file_node
@@ -3173,12 +3173,13 @@ def main() -> None:
                         trunc = False
                 else:
                     body, ln, trunc = _read_body_full(sf, loc, max_lines=max_lines, flat=is_file)
-                # Lap-26: --no-docstring trims a leading docstring/JSDoc
-                # block. Useful after `doc` already showed the rationale.
-                # No-op when the body has no recognized leading block.
-                docstring_stripped = 0
+                # Lap-26: --no-docstring elides a leading docstring/JSDoc
+                # block from the rendered body. We pass the half-open
+                # range to the renderer rather than mutating `body` so
+                # file-absolute line numbers stay correct on both sides.
+                ds_range = (0, 0)
                 if strip_docstring and body:
-                    body, docstring_stripped = _strip_leading_docstring(body)
+                    ds_range = _find_leading_docstring_range(body)
                 data = {
                     "type": "body",
                     "label": nattrs.get("label", chosen),
@@ -3187,7 +3188,7 @@ def main() -> None:
                     "lines": body,
                     "start_line": ln,
                     "truncated": trunc,
-                    "docstring_stripped": docstring_stripped,
+                    "docstring_range": ds_range,
                 }
                 print(_render_body_text(data, md=md))
         if multi and not any_ok:

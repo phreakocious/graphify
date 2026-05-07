@@ -4933,44 +4933,41 @@ def test_doc_rationale_does_not_leak_function_body(tmp_path, monkeypatch):
     assert "Returns the axis array" in rendered
 
 
-def test_strip_leading_docstring_python_multiline():
-    """Lap-26: peek --no-docstring drops the leading triple-quoted block
-    so `peek @foo` doesn't re-show the same docstring `doc @foo` already
-    rendered."""
-    from graphify.navigate import _strip_leading_docstring
+def test_find_leading_docstring_range_python_multiline():
+    """Lap-26: peek --no-docstring elides the leading triple-quoted
+    block via the renderer (preserving file-absolute line numbers)
+    rather than mutating the line list. Helper returns the half-open
+    index range to elide."""
+    from graphify.navigate import _find_leading_docstring_range
     lines = [
-        'def foo(x):',
-        '    """Build the axis from a regime spec.',
-        '',
-        '    Returns the axis array.',
-        '    """',
-        '    return compute(x)',
+        'def foo(x):',                                     # idx 0 — sig (kept)
+        '    """Build the axis from a regime spec.',       # idx 1 — ds open
+        '',                                                # idx 2 — ds blank
+        '    Returns the axis array.',                     # idx 3 — ds body
+        '    """',                                         # idx 4 — ds close
+        '    return compute(x)',                           # idx 5 — body
     ]
-    out, removed = _strip_leading_docstring(lines)
-    assert removed == 4, f"4 docstring lines should drop, got {removed}: {out}"
-    assert out == [
-        'def foo(x):',
-        '    return compute(x)',
-    ], out
+    lo, hi = _find_leading_docstring_range(lines)
+    assert (lo, hi) == (1, 5), (lo, hi)
+    # Half-open: 4 lines elided (indices 1..4).
+    assert hi - lo == 4
 
 
-def test_strip_leading_docstring_python_single_line():
-    """Single-line `\"\"\"foo\"\"\"` docstring drops cleanly."""
-    from graphify.navigate import _strip_leading_docstring
+def test_find_leading_docstring_range_python_single_line():
+    """Single-line `\"\"\"foo\"\"\"` docstring resolves to a 1-line range."""
+    from graphify.navigate import _find_leading_docstring_range
     lines = [
         'def foo(x):',
         '    """One-liner."""',
         '    return x',
     ]
-    out, removed = _strip_leading_docstring(lines)
-    assert removed == 1, f"single-line docstring should drop 1, got {removed}"
-    assert out[0] == 'def foo(x):'
-    assert out[1] == '    return x'
+    lo, hi = _find_leading_docstring_range(lines)
+    assert (lo, hi) == (1, 2), (lo, hi)
 
 
-def test_strip_leading_docstring_jsdoc():
-    """JSDoc `/** */` block is recognized too."""
-    from graphify.navigate import _strip_leading_docstring
+def test_find_leading_docstring_range_jsdoc():
+    """JSDoc `/** */` block recognized."""
+    from graphify.navigate import _find_leading_docstring_range
     lines = [
         'function foo(x) {',
         '  /**',
@@ -4979,22 +4976,49 @@ def test_strip_leading_docstring_jsdoc():
         '  return compute(x);',
         '}',
     ]
-    out, removed = _strip_leading_docstring(lines)
-    assert removed == 3, f"JSDoc block (3 lines) should drop, got {removed}"
-    assert out[0] == 'function foo(x) {'
-    assert out[1] == '  return compute(x);'
+    lo, hi = _find_leading_docstring_range(lines)
+    assert (lo, hi) == (1, 4), (lo, hi)
 
 
-def test_strip_leading_docstring_no_docstring_is_noop():
-    """Body without a leading docstring is returned unchanged."""
-    from graphify.navigate import _strip_leading_docstring
+def test_find_leading_docstring_range_no_docstring_returns_zero():
+    """Body without a leading docstring returns (0, 0) — renderer treats
+    as "nothing to elide"."""
+    from graphify.navigate import _find_leading_docstring_range
     lines = [
         'def foo(x):',
         '    return x + 1',
     ]
-    out, removed = _strip_leading_docstring(lines)
-    assert removed == 0
-    assert out == lines
+    assert _find_leading_docstring_range(lines) == (0, 0)
+
+
+def test_render_body_text_elides_docstring_range_keeps_line_numbers():
+    """The renderer skips lines inside the elision range, prints a
+    marker, and keeps file-absolute line numbers correct on either
+    side of the gap."""
+    from graphify.navigate import _render_body_text
+    body = [
+        'def foo(x):',
+        '    """One-liner."""',
+        '    return x',
+    ]
+    rendered = _render_body_text({
+        "type": "body",
+        "label": "foo()",
+        "source_file": "f.py",
+        "source_location": "L100",
+        "lines": body,
+        "start_line": 100,
+        "truncated": False,
+        "docstring_range": (1, 2),
+    })
+    # Sig stays at line 100.
+    assert "100  def foo(x):" in rendered, rendered
+    # Body resumes at line 102 (NOT 101 — line 101 is the elided docstring).
+    assert "102      return x" in rendered, rendered
+    # Marker is printed.
+    assert "1 docstring lines elided" in rendered or "elided" in rendered, rendered
+    # Header reports the elision count.
+    assert "−1 docstring" in rendered, rendered
 
 
 def test_expand_identifier_casings_emits_all_five_forms():
