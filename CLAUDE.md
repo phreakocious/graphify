@@ -190,3 +190,8 @@ The hierarchy of authority for design decisions:
 
 If a field report contradicts this doc, the field report wins —
 update the doc.
+
+# IMPORTANT: we are dogfooding. friction should be surfaced so it can be addressed!  this is our project's CLAUDE.md contents:
+
+@.claude/graphify.md
+
