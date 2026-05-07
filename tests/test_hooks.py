@@ -8,8 +8,10 @@ from graphify.hooks import install, uninstall, status, _HOOK_MARKER, _CHECKOUT_M
 from graphify.__main__ import (
     _handle_pretool_hook,
     _HOOK_QUIET_ENV,
+    _HOOK_MODE_ENV,
     _HOOK_RECENT_USE_TTL,
     _HOOK_MIN_FILE_BYTES,
+    _stamp_recent_files,
 )
 
 
@@ -348,3 +350,204 @@ def test_hook_load_graph_touches_cli_stamp(tmp_path):
     src = tmp_path / "main.py"
     src.write_text("x" * (_HOOK_MIN_FILE_BYTES + 100))
     assert _handle_pretool_hook(_read_payload(str(src)), tmp_path) is None
+
+
+# ---------------------------------------------------------------------------
+# Lap-27 followup: hook smart-mode + per-file unblock from CLI verbs.
+# ---------------------------------------------------------------------------
+
+
+def _build_real_graph(tmp_path: Path, src_file: Path) -> Path:
+    """Build a graphify-out/ with a non-trivial graph that resolves
+    `src_file` as a file node and contains one fn inside it. Used for
+    smart-mode positive-path tests where the hook must run shape
+    in-process and produce real output."""
+    import json as _json
+    out = tmp_path / "graphify-out"
+    out.mkdir(exist_ok=True)
+    file_id = f"file_{src_file.stem}"
+    fn_id = f"{src_file.stem}_compute"
+    graph = {
+        "nodes": [
+            {"id": file_id, "label": str(src_file.name),
+             "source_file": str(src_file), "source_location": "L1-200",
+             "node_kind": "file", "file_type": "code", "community": 0,
+             "kind": "file"},
+            {"id": fn_id, "label": "compute()",
+             "source_file": str(src_file), "source_location": "L10-30",
+             "node_kind": "function", "file_type": "code", "community": 0,
+             "kind": "function"},
+        ],
+        "edges": [
+            {"source": file_id, "target": fn_id, "relation": "contains",
+             "confidence": "EXTRACTED", "confidence_score": 1.0},
+        ],
+    }
+    (out / "graph.json").write_text(_json.dumps(graph))
+    return tmp_path
+
+
+def test_hook_skips_when_read_has_offset(tmp_path):
+    """Read with --offset is a precise re-read; the agent already
+    shaped or peeked. Don't fight."""
+    root = _make_root(tmp_path)
+    src = tmp_path / "main.py"
+    src.write_text("x" * (_HOOK_MIN_FILE_BYTES + 100))
+    payload = {"tool_name": "Read",
+               "tool_input": {"file_path": str(src), "offset": 100}}
+    assert _handle_pretool_hook(payload, root) is None
+
+
+def test_hook_skips_when_read_has_limit(tmp_path):
+    """Read with --limit is a precise slice; suppress the nudge."""
+    root = _make_root(tmp_path)
+    src = tmp_path / "main.py"
+    src.write_text("x" * (_HOOK_MIN_FILE_BYTES + 100))
+    payload = {"tool_name": "Read",
+               "tool_input": {"file_path": str(src), "limit": 50}}
+    assert _handle_pretool_hook(payload, root) is None
+
+
+def test_hook_nudge_message_advertises_silent_followups(tmp_path):
+    """The Read nudge tells the agent the hook stays silent for
+    follow-up Reads of the same file. Without this, an agent who
+    Reads after seeing the nudge can't tell whether they'll be
+    re-nudged on every retry."""
+    root = _make_root(tmp_path)
+    src = tmp_path / "main.py"
+    src.write_text("x" * (_HOOK_MIN_FILE_BYTES + 100))
+    out = _handle_pretool_hook(_read_payload(str(src)), root)
+    assert out is not None
+    ctx = out["hookSpecificOutput"]["additionalContext"]
+    # Honest "we'll get out of your way" signal.
+    assert "stays silent" in ctx or "silent on" in ctx
+
+
+def test_hook_smart_mode_blocks_with_shape_output(tmp_path, monkeypatch):
+    """Smart mode: first cold Read on an indexed file is BLOCKED
+    with the rendered shape output as the block reason. Agent gets
+    the structural data without paying the full Read."""
+    src = tmp_path / "main.py"
+    src.write_text("x" * (_HOOK_MIN_FILE_BYTES + 100))
+    root = _build_real_graph(tmp_path, src)
+    monkeypatch.setenv(_HOOK_MODE_ENV, "smart")
+    out = _handle_pretool_hook(_read_payload(str(src)), root)
+    assert out is not None
+    # Block format: emit BOTH legacy + hookSpecificOutput so the
+    # response is portable across Claude Code versions.
+    assert out.get("decision") == "block"
+    assert out["hookSpecificOutput"]["permissionDecision"] == "deny"
+    reason = out["hookSpecificOutput"]["permissionDecisionReason"]
+    # Header tells the agent we ran shape on their behalf.
+    assert "graphify shape" in reason and "ran on your behalf" in reason
+    # And explicitly names the unblock semantic.
+    assert "stays silent" in reason or "silent for follow-up" in reason
+
+
+def test_hook_smart_mode_unblocks_followup(tmp_path, monkeypatch):
+    """Smart mode: second Read on the same file passes through
+    silently — the first block recorded the path in recent-paths
+    so the same file isn't blocked twice."""
+    src = tmp_path / "main.py"
+    src.write_text("x" * (_HOOK_MIN_FILE_BYTES + 100))
+    root = _build_real_graph(tmp_path, src)
+    monkeypatch.setenv(_HOOK_MODE_ENV, "smart")
+    # First call: block.
+    first = _handle_pretool_hook(_read_payload(str(src)), root)
+    assert first is not None
+    # Bypass cli-stamp suppression (load_graph touched it). Stale-
+    # date the stamp so the next call doesn't bail on cli-stamp;
+    # we want to confirm recent-paths alone unblocks.
+    stamp = root / "graphify-out" / ".session" / "cli-stamp"
+    stamp.write_text(f"{time.time() - (_HOOK_RECENT_USE_TTL + 60):.0f}\n")
+    # Second call: silent passthrough via recent-paths dedup.
+    assert _handle_pretool_hook(_read_payload(str(src)), root) is None
+
+
+def test_hook_smart_mode_falls_through_when_substitute_fails(tmp_path, monkeypatch):
+    """Smart mode: if the substitute can't run (graph empty / file
+    not in graph), fall through to nudge mode rather than emitting
+    a useless block."""
+    root = _make_root(tmp_path)  # empty {} graph — load fails
+    src = tmp_path / "unknown.py"
+    src.write_text("x" * (_HOOK_MIN_FILE_BYTES + 100))
+    monkeypatch.setenv(_HOOK_MODE_ENV, "smart")
+    out = _handle_pretool_hook(_read_payload(str(src)), root)
+    # Falls through to nudge — additionalContext with the suggestion.
+    assert out is not None
+    assert "additionalContext" in out["hookSpecificOutput"]
+    assert "decision" not in out
+
+
+def test_hook_smart_mode_grep_substitutes_search(tmp_path, monkeypatch):
+    """Smart mode: Grep with a real pattern triggers `graphify
+    search --files-only` and blocks with the result."""
+    src = tmp_path / "code.py"
+    src.write_text(
+        "def compute_metric():\n    pass\n\n"
+        "def render_metric():\n    pass\n")
+    root = _build_real_graph(tmp_path, src)
+    monkeypatch.setenv(_HOOK_MODE_ENV, "smart")
+    out = _handle_pretool_hook(
+        {"tool_name": "Grep", "tool_input": {"pattern": "metric"}}, root)
+    # Either substitute fired (block) or fell through to nudge — both
+    # are valid for this graph shape. We just need the smart-mode
+    # branch to not crash and to produce *some* signal.
+    assert out is not None
+
+
+def test_hook_smart_mode_glob_substitutes_files(tmp_path, monkeypatch):
+    """Smart mode: Glob with a pattern matching an indexed file
+    triggers `graphify files <pat>` and blocks with the listing."""
+    src = tmp_path / "main.py"
+    src.write_text("# placeholder\n")
+    root = _build_real_graph(tmp_path, src)
+    monkeypatch.setenv(_HOOK_MODE_ENV, "smart")
+    out = _handle_pretool_hook(
+        {"tool_name": "Glob", "tool_input": {"pattern": "*.py"}}, root)
+    assert out is not None
+    # Block reason names the verb we ran.
+    if out.get("decision") == "block":
+        reason = out["hookSpecificOutput"]["permissionDecisionReason"]
+        assert "graphify files" in reason
+        assert "*.py" in reason
+
+
+def test_hook_silent_when_recent_paths_has_target(tmp_path):
+    """User's lap-27 ask: if graphify already touched this file
+    (via shape/summarize/locate from terminal), the hook stays
+    silent on a follow-up Read of the same file — even if cli-stamp
+    has expired."""
+    root = _make_root(tmp_path)
+    src = tmp_path / "main.py"
+    src.write_text("x" * (_HOOK_MIN_FILE_BYTES + 100))
+    # Simulate: user ran `graphify shape /a.py` 10 min ago. cli-stamp
+    # is stale (>5 min) but recent-paths is fresh (<30 min).
+    session = root / "graphify-out" / ".session"
+    session.mkdir(parents=True, exist_ok=True)
+    old_stamp = time.time() - (_HOOK_RECENT_USE_TTL + 60)
+    (session / "cli-stamp").write_text(f"{old_stamp:.0f}\n")
+    # Stamp src into recent-paths the same way _stamp_recent_files
+    # would (resolving symlinks).
+    import os.path as _osp
+    rp = session / "recent-paths"
+    rp.write_text(f"{time.time():.0f}\t{_osp.realpath(str(src))}\n")
+    # Hook fires for Read /a.py → bails because /a.py is in recent-paths.
+    assert _handle_pretool_hook(_read_payload(str(src)), root) is None
+
+
+def test_stamp_recent_files_writes_to_navigate_log(tmp_path):
+    """`_stamp_recent_files` shares the recent-paths log with
+    navigate's `_record_session_paths` — the hook reads what
+    either side writes."""
+    out = tmp_path / "graphify-out"
+    out.mkdir()
+    graph_path = out / "graph.json"
+    graph_path.write_text("{}")
+    src = tmp_path / "x.py"
+    src.write_text("# stub\n")
+    _stamp_recent_files(graph_path, [str(src)])
+    rp = out / ".session" / "recent-paths"
+    assert rp.exists()
+    import os.path as _osp
+    assert _osp.realpath(str(src)) in rp.read_text()

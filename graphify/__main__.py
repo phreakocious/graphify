@@ -300,6 +300,16 @@ _SETTINGS_HOOK = {
 # Each gate is conservative (false-positive cheap; one extra silent call is
 # fine) and they stack so a single positive signal kills the nudge.
 _HOOK_QUIET_ENV = "GRAPHIFY_HOOK_QUIET"
+# Lap-27 followup: smart-mode opt-in. When `GRAPHIFY_HOOK_MODE=smart`,
+# the hook runs the graphify verb the agent should have used (shape /
+# search / files) IN-PROCESS and BLOCKS the original Read/Grep/Glob,
+# returning the rendered output as the block reason. The agent gets
+# the structured data it would have asked for next anyway, without
+# paying the bytes for a full file Read. Subsequent calls on the same
+# (tool, target) pass through silently — see the cli-stamp + recent-
+# paths dedup. Default mode is `nudge` (additionalContext only, tool
+# still runs). Anything else (unset / "nudge" / typo) → nudge mode.
+_HOOK_MODE_ENV = "GRAPHIFY_HOOK_MODE"
 # Recent CLI use TTL: how long after a graphify command finishes does the
 # hook stay silent. 5 min keeps the lid on while an agent is actively
 # pivoting; longer would hide the nudge from agents who briefly used
@@ -327,6 +337,114 @@ _HOOK_CODE_EXTS = frozenset({
     ".lua", ".toc", ".zig", ".ps1", ".ex", ".exs", ".m", ".mm",
     ".jl", ".vue", ".svelte", ".dart", ".v", ".sv",
 })
+
+
+def _stamp_recent_files(graph_path: Path, files) -> None:
+    """Write source_files to recent-paths so the PreToolUse hook stays
+    out of the way after a graphify CLI verb has touched these files.
+
+    Lap-27 followup: closes the gap between cli-stamp (5-min global
+    "graphify is in use") and per-file dedup. If an agent runs
+    `graphify shape /a.py` from terminal at minute 0 then Reads /a.py
+    at minute 10, cli-stamp has expired but recent-paths still
+    contains /a.py — hook bails. Best-effort; failures swallowed
+    because absent stamps just mean a possible repeat nudge, not a
+    correctness bug.
+    """
+    try:
+        from graphify.navigate import _record_session_paths
+    except Exception:  # pragma: no cover - defensive
+        return
+    normed: set[str] = set()
+    for sf in files:
+        if not sf:
+            continue
+        try:
+            normed.add(str(Path(sf).resolve()))
+        except OSError:
+            normed.add(str(sf))
+    if not normed:
+        return
+    try:
+        _record_session_paths(graph_path, normed)
+    except Exception:
+        return
+
+
+def _hook_run_substitute(tool: str, fp: str, tool_input: dict,
+                         root: Path) -> str | None:
+    """Smart-mode substitute: run the graphify verb that mirrors `tool`
+    in-process and return the rendered text. Returns None on any error
+    (caller falls through to silent passthrough or nudge).
+
+    Mappings:
+      Read fp        → graphify shape fp   (one-screen file structure)
+      Grep pattern   → graphify search pat (--files-only for cheap output)
+      Glob pattern   → graphify files pat  (file-node listing)
+    """
+    try:
+        graph_path = root / "graphify-out" / "graph.json"
+        if not graph_path.exists() or graph_path.stat().st_size < 32:
+            return None
+        from graphify.navigate import (
+            load_graph, shape_file, _render_shape_text,
+            search_bodies, _render_search_text,
+        )
+        from graphify.resolve import label_index, resolve_focus
+        from graphify.analyze import _is_file_node
+        if tool == "Read":
+            if not fp:
+                return None
+            G, _comm = load_graph(graph_path, freshness_check=False)
+            idx = label_index(G)
+            chosen, _cands, _mt, _alts = resolve_focus(G, idx, fp)
+            if not chosen or not _is_file_node(G, chosen):
+                return None
+            data = shape_file(G, chosen, limit=8)
+            return _render_shape_text(data)
+        if tool == "Grep":
+            pat = (tool_input.get("pattern") or "").strip()
+            if not pat:
+                return None
+            G, _comm = load_graph(graph_path, freshness_check=False)
+            data = search_bodies(G, pat, kind="code", archived_mode="no",
+                                  limit=20, context=1, files_only=True)
+            text = _render_search_text(data)
+            # search_bodies on no-match returns a header-only block;
+            # treat as failure so the agent isn't blocked on an empty
+            # response (their Grep might have hit a different corpus).
+            if not text or "no hits" in text.lower():
+                return None
+            return text
+        if tool == "Glob":
+            pat = (tool_input.get("pattern") or "").strip()
+            if not pat:
+                return None
+            import fnmatch as _fm
+            G, _comm = load_graph(graph_path, freshness_check=False)
+            path_glob = "/" in pat
+            hits: list[str] = []
+            for nid, attrs in G.nodes(data=True):
+                if attrs.get("node_kind") != "file":
+                    continue
+                sf = attrs.get("source_file") or ""
+                if not sf:
+                    continue
+                target = sf if path_glob else sf.rsplit("/", 1)[-1]
+                if _fm.fnmatch(target, pat):
+                    hits.append(sf)
+            if not hits:
+                return None
+            hits.sort()
+            lines = [f"files: {len(hits)} matching `{pat}`"]
+            for sf in hits[:30]:
+                lines.append(f"  {sf}")
+            if len(hits) > 30:
+                lines.append(f"  +{len(hits) - 30} more")
+            return "\n".join(lines)
+    except Exception:
+        return None
+    return None
 
 
 def _handle_pretool_hook(payload: dict, root: Path) -> dict | None:
@@ -386,6 +504,12 @@ def _handle_pretool_hook(payload: dict, root: Path) -> dict | None:
     file_size: int | None = None
 
     if tool == "Read":
+        # Lap-27 followup: precise-Read short-circuit. If the agent
+        # already specified --offset / --limit they're targeting a
+        # known line range — they almost certainly already shaped or
+        # peeked. Don't fight; let the precise Read through.
+        if inp.get("offset") is not None or inp.get("limit") is not None:
+            return None
         ext = _osp.splitext(fp)[1].lower()
         if ext not in _HOOK_CODE_EXTS:
             return None
@@ -426,6 +550,90 @@ def _handle_pretool_hook(payload: dict, root: Path) -> dict | None:
             except OSError:
                 pass
 
+    # Lap-27 followup: smart-mode dispatch. When `GRAPHIFY_HOOK_MODE=smart`,
+    # run the substitute graphify verb in-process and BLOCK the original
+    # tool with the rendered output as the block reason. Agent gets the
+    # structured data it would have asked for next, without paying the
+    # bytes for the original Read/Grep/Glob. Smart-mode falls through
+    # to nudge mode silently if the substitute can't help (no graph,
+    # target not in graph, empty search hits) — don't block the agent
+    # on a bad substitute.
+    mode = (os.environ.get(_HOOK_MODE_ENV) or "nudge").strip().lower()
+    if mode == "smart":
+        sub_text = _hook_run_substitute(tool, fp, inp, root)
+        if sub_text:
+            # Record dedup so the retry passes through. Per-file for
+            # Read; cli-stamp covers Grep/Glob retry within 5 min
+            # (load_graph in the substitute touched it).
+            if tool == "Read" and fp:
+                try:
+                    session_dir.mkdir(parents=True, exist_ok=True)
+                    recent_log = session_dir / "recent-paths"
+                    try:
+                        target = _osp.realpath(fp)
+                    except OSError:
+                        target = fp
+                    existing: list[str] = []
+                    if recent_log.exists():
+                        try:
+                            existing = recent_log.read_text(
+                                encoding="utf-8").splitlines()
+                        except OSError:
+                            existing = []
+                    existing = [
+                        line for line in existing
+                        if line.partition("\t")[2] != target
+                    ]
+                    existing.append(f"{now:.0f}\t{target}")
+                    if len(existing) > 200:
+                        existing = existing[-200:]
+                    recent_log.write_text(
+                        "\n".join(existing) + "\n", encoding="utf-8")
+                except OSError:
+                    pass
+            # Build the smart-mode block message. Tells the agent we
+            # ran the verb on their behalf, shows the output, and
+            # explicitly says the hook will stay out of the way for
+            # follow-up calls — so an honest retry isn't punished.
+            if tool == "Read":
+                size_hint = ""
+                if file_size is not None:
+                    kb = max(1, file_size // 1024)
+                    size_hint = f" ({kb} KB Read)"
+                header = (
+                    f"graphify shape \"{fp}\" ran on your behalf"
+                    f"{size_hint} — output below. Retry your Read "
+                    f"if the body is still needed; the hook stays "
+                    f"silent for follow-up Reads of this file.")
+            elif tool == "Grep":
+                pat = (inp.get("pattern") or "").strip()
+                header = (
+                    f"graphify search \"{pat}\" --files-only ran on "
+                    f"your behalf — output below (symbol-attributed "
+                    f"file list). Retry your Grep if you still need "
+                    f"raw match lines; the hook stays silent for "
+                    f"follow-ups within ~5 min.")
+            else:  # Glob
+                pat = (inp.get("pattern") or "").strip()
+                header = (
+                    f"graphify files \"{pat}\" ran on your behalf — "
+                    f"output below. Retry your Glob if needed; the "
+                    f"hook stays silent for follow-ups within ~5 min.")
+            block_msg = f"{header}\n\n{sub_text}"
+            # Emit BOTH legacy `decision/reason` AND the newer
+            # hookSpecificOutput.permissionDecision form so the block
+            # works across Claude Code versions.
+            return {
+                "decision": "block",
+                "reason": block_msg,
+                "hookSpecificOutput": {
+                    "hookEventName": "PreToolUse",
+                    "permissionDecision": "deny",
+                    "permissionDecisionReason": block_msg,
+                },
+            }
+        # Substitute returned None — fall through to nudge mode below.
+
     # Lap-27 #9 follow-up: tailor the nudge to the tool. We know which
     # verb actually fits the shape of what the agent is about to do —
     # `shape` for a Read (file-level orientation), `search` for a Grep
@@ -448,7 +656,8 @@ def _handle_pretool_hook(payload: dict, root: Path) -> dict | None:
             f"points / line ranges) so the follow-up Read can use "
             f"--offset/--limit instead of dumping the whole file. For a "
             f"single declaration, `graphify peek \"@<symbol>\"` is a "
-            f"cursor-free body dump. See ~/.claude/skills/graphify/SKILL.md."
+            f"cursor-free body dump. (Hook stays silent on follow-up "
+            f"Reads of this file.) See ~/.claude/skills/graphify/SKILL.md."
         )
     elif tool == "Grep":
         pat = (inp.get("pattern") or "").strip()
@@ -2932,6 +3141,12 @@ def main() -> None:
                     cmore = len(child_ids) - len(child_labels)
                     suffix = f" (+{cmore} more)" if cmore > 0 else ""
                     print(f"  children: {cstr}{suffix}")
+            # Lap-27 followup: stamp the class's source_file into recent-
+            # paths so a follow-up Read of the class's file is a quiet
+            # passthrough on the PreToolUse hook.
+            sf_chosen = G.nodes[chosen].get("source_file")
+            if sf_chosen:
+                _stamp_recent_files(gp, [sf_chosen])
             return
 
         # Top-line stats.
@@ -3676,6 +3891,11 @@ def main() -> None:
 
         print(f"locate: {len(targets)} target{'s' if len(targets) != 1 else ''}")
         hits = 0
+        # Lap-27 followup: collect source_files of resolved targets so
+        # we can stamp them into recent-paths after the loop. Reads of
+        # any of these files later in the session pass through the
+        # PreToolUse hook silently.
+        resolved_files: set[str] = set()
         for t in targets:
             chosen, candidates, match_type, _alts = resolve_focus(G, idx, t)
             if chosen:
@@ -3686,6 +3906,8 @@ def main() -> None:
                 loc = a.get("source_location") or ""
                 tag = f" ({match_type})" if match_type and match_type != "exact" else ""
                 print(f"  {label:<32} {sf}:{_fmt_loc(loc)}{tag}")
+                if a.get("source_file"):
+                    resolved_files.add(a["source_file"])
             elif candidates:
                 # Surface up to 3 candidate locations so the agent can
                 # re-issue locate with a path-qualifier without an extra
@@ -3701,6 +3923,8 @@ def main() -> None:
                     print(f"      → +{len(candidates) - 3} more")
             else:
                 print(f"  {t:<32} not found")
+        if resolved_files:
+            _stamp_recent_files(gp, resolved_files)
         if hits == 0:
             sys.exit(1)
 
@@ -3769,6 +3993,10 @@ def main() -> None:
         print(f"files: {len(hits)} matching `{pattern}`")
         for sf, _label in hits:
             print(f"  {sf}")
+        # Lap-27 followup: stamp matched files into recent-paths so a
+        # subsequent Read of any of them is a quiet passthrough.
+        # Cap at 50 entries to bound the dedup-log size.
+        _stamp_recent_files(gp, [sf for sf, _label in hits[:50]])
 
     elif cmd == "blast":
         # Lap-22 (meta-harness friction corpus): one-shot callers + callees
@@ -4127,6 +4355,14 @@ def main() -> None:
                 json_results.append(data)
             else:
                 print(_render_shape_text(data))
+            # Lap-27 followup: stamp the file's source_file into recent-
+            # paths so the PreToolUse hook bails on a Read of this same
+            # file later in the session. The cli-stamp already covers
+            # the within-5-min case via load_graph; this extends the
+            # signal to the 5–30 min window.
+            sf = G.nodes[chosen].get("source_file")
+            if sf:
+                _stamp_recent_files(gp, [sf])
         if fmt == "json":
             # Single target: emit the dict for back-compat. Multi: list.
             print(json.dumps(json_results[0] if len(json_results) == 1
@@ -4248,6 +4484,22 @@ def main() -> None:
             print(json.dumps(data))
         else:
             print(_render_search_text(data, md=md))
+        # Lap-27 followup: stamp matched files into recent-paths so the
+        # PreToolUse hook bails on a Read of any of them. Cap to the
+        # first 20 hits to bound the dedup-log writes.
+        match_files: set[str] = set()
+        for hit in (data.get("hits") or [])[:20]:
+            sf = hit.get("source_file")
+            if sf:
+                match_files.add(sf)
+        if not match_files:
+            for f in (data.get("files") or [])[:20]:
+                if isinstance(f, str):
+                    match_files.add(f)
+                elif isinstance(f, dict) and f.get("source_file"):
+                    match_files.add(f["source_file"])
+        if match_files:
+            _stamp_recent_files(gp, match_files)
 
     elif cmd == "add":
         if len(sys.argv) < 3:
