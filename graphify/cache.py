@@ -4,7 +4,19 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import pickle
+import sys
 from pathlib import Path
+from typing import Any
+
+# Pickle cache for the *parsed* graph (post build_from_json + community
+# labelling). Bumped whenever build_from_json output, _backfill_node_kind
+# rules, or load_graph's stamping of `community_labels`/`community_hubs`/
+# `_xlang` changes. Distinct from AST_CACHE_VERSION (per-file extraction
+# cache) — the pickle sits one stage downstream and invalidates on
+# graph.json mtime+size, the version below, networkx version, and the
+# Python (major, minor) tuple.
+PICKLE_CACHE_VERSION = "v1"
 
 
 def _body_content(content: bytes) -> bytes:
@@ -180,3 +192,105 @@ def save_semantic_cache(
             save_cached(p, result, root)
             saved += 1
     return saved
+
+
+# --- parsed-graph pickle cache --------------------------------------------
+
+def _graph_pickle_path(graph_json: Path) -> Path:
+    """Co-locate `graph.json.pickle` next to `graph.json`."""
+    p = Path(graph_json)
+    return p.parent / (p.name + ".pickle")
+
+
+def _nx_version() -> str:
+    try:
+        import networkx
+        return networkx.__version__
+    except Exception:
+        return ""
+
+
+def load_graph_pickle(graph_json: Path) -> tuple[Any, dict] | None:
+    """Return (G, communities) when a fresh pickle exists for graph.json.
+
+    A pickle is fresh when its embedded mtime_ns + size match the current
+    graph.json AND its embedded version tags match (PICKLE_CACHE_VERSION,
+    networkx version, Python major.minor). Any mismatch — and any read or
+    deserialization error — returns None so the caller falls back to JSON
+    parsing.
+
+    Pickle is trusted: it sits next to graph.json under graphify-out/, so
+    anyone who can write the pickle can already write graph.json. No
+    additional integrity check beyond version pinning.
+    """
+    pkl = _graph_pickle_path(graph_json)
+    if not pkl.exists():
+        return None
+    try:
+        st = Path(graph_json).stat()
+    except OSError:
+        return None
+    try:
+        with pkl.open("rb") as fh:
+            payload = pickle.load(fh)
+    except Exception:
+        # Corrupt, half-written, or pickled by an incompatible version.
+        return None
+    if not isinstance(payload, dict):
+        return None
+    if payload.get("graphify_pickle_version") != PICKLE_CACHE_VERSION:
+        return None
+    if payload.get("nx_version") != _nx_version():
+        return None
+    if payload.get("py_version") != list(sys.version_info[:2]):
+        return None
+    if payload.get("graph_json_mtime_ns") != st.st_mtime_ns:
+        return None
+    if payload.get("graph_json_size") != st.st_size:
+        return None
+    G = payload.get("G")
+    communities = payload.get("communities")
+    if G is None or communities is None:
+        return None
+    return G, communities
+
+
+def save_graph_pickle(graph_json: Path, G: Any, communities: dict) -> None:
+    """Atomically write a pickle of (G, communities) next to graph.json.
+
+    Stamps mtime_ns+size of graph.json AT WRITE TIME so a concurrent
+    re-extract that bumps the JSON mid-write produces a stale pickle on
+    the next load (caught by the load-side mtime/size check).
+    """
+    pkl = _graph_pickle_path(graph_json)
+    try:
+        st = Path(graph_json).stat()
+    except OSError:
+        return
+    payload = {
+        "graphify_pickle_version": PICKLE_CACHE_VERSION,
+        "nx_version": _nx_version(),
+        # JSON-safe form of sys.version_info[:2] — pickle stores a tuple, but
+        # the load comparison normalises to list either way (sys.version_info
+        # returns a named tuple, which pickle reconstitutes as the same type).
+        "py_version": list(sys.version_info[:2]),
+        "graph_json_mtime_ns": st.st_mtime_ns,
+        "graph_json_size": st.st_size,
+        "G": G,
+        "communities": communities,
+    }
+    pkl.parent.mkdir(parents=True, exist_ok=True)
+    tmp = pkl.with_suffix(pkl.suffix + ".tmp")
+    try:
+        with tmp.open("wb") as fh:
+            pickle.dump(payload, fh, protocol=pickle.HIGHEST_PROTOCOL)
+        try:
+            os.replace(tmp, pkl)
+        except PermissionError:
+            import shutil
+            shutil.copy2(tmp, pkl)
+            tmp.unlink(missing_ok=True)
+    except Exception:
+        tmp.unlink(missing_ok=True)
+        # Don't raise — pickle save is best-effort. The next call will
+        # re-parse the JSON normally; only the latency win is lost.

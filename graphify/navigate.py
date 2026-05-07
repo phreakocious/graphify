@@ -34,6 +34,7 @@ import networkx as nx
 
 from graphify.build import build_from_json
 from graphify.analyze import _is_file_node
+from graphify.cache import load_graph_pickle, save_graph_pickle
 from graphify.resolve import (
     _norm,
     label_index,
@@ -127,6 +128,15 @@ def load_graph(graph_path: str | Path,
     `freshness_check=False` to suppress (tests, CI, machine pipelines).
     """
     path = Path(graph_path)
+    cached = load_graph_pickle(path)
+    if cached is not None:
+        G, communities = cached
+        if freshness_check:
+            banner = _check_graph_freshness(G, graph_path)
+            if banner:
+                print(banner, file=sys.stderr)
+                G.graph["_freshness_banner"] = banner
+        return G, dict(communities)
     data = json.loads(path.read_text(encoding="utf-8"))
     G = build_from_json(data, directed=True)
     communities: dict[int, list[str]] = defaultdict(list)
@@ -192,6 +202,12 @@ def load_graph(graph_path: str | Path,
     # them with a single dict lookup instead of resolving languages on the
     # hot path. Drops surface as `+N cross-lang hidden`.
     _mark_cross_lang_edges(G)
+    # Save the parsed-graph pickle for the next call. Best-effort: any I/O
+    # failure is swallowed inside save_graph_pickle so the user-visible path
+    # still returns a valid graph. The freshness banner is recomputed on
+    # every load (it depends on filesystem state, not the parse) so it isn't
+    # stamped onto the pickle.
+    save_graph_pickle(path, G, dict(communities))
     if freshness_check:
         banner = _check_graph_freshness(G, graph_path)
         if banner:
