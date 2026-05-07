@@ -1769,6 +1769,77 @@ def test_dependents_alias_routes_through_calls(tmp_path, monkeypatch):
     assert "depth≤" in out, f"depth indicator missing:\n{out}"
 
 
+def test_dependents_explicit_depth_overrides_default(tmp_path, monkeypatch):
+    """Lap-27 #7: `dependents --depth=2` was silently clamped to 3 by
+    `eff_depth = max(depth, 3)` — the agent passed --depth=2 and got
+    depth≤3 in the output banner, walking deeper than asked. Fix: the
+    explicit --depth N value is honored; the verb's documented default
+    (3) only applies when no --depth was passed."""
+    import json as _json
+    from graphify.navigate import navigate
+    # 4-hop chain so depth=2 vs depth=3 produces different listings.
+    nodes = [
+        {"id": "lvl0", "label": "lvl0()", "file_type": "code",
+         "source_file": "a.py", "source_location": "L1"},
+        {"id": "lvl1", "label": "lvl1()", "file_type": "code",
+         "source_file": "a.py", "source_location": "L10"},
+        {"id": "lvl2", "label": "lvl2()", "file_type": "code",
+         "source_file": "a.py", "source_location": "L20"},
+        {"id": "lvl3", "label": "lvl3()", "file_type": "code",
+         "source_file": "a.py", "source_location": "L30"},
+    ]
+    links = [
+        {"source": "lvl1", "target": "lvl0", "relation": "calls",
+         "confidence": "EXTRACTED"},
+        {"source": "lvl2", "target": "lvl1", "relation": "calls",
+         "confidence": "EXTRACTED"},
+        {"source": "lvl3", "target": "lvl2", "relation": "calls",
+         "confidence": "EXTRACTED"},
+    ]
+    _write_graph(tmp_path / "graphify-out", nodes, links)
+    monkeypatch.chdir(tmp_path)
+    # depth=2 → see lvl1, lvl2; not lvl3.
+    out = navigate(["@lvl0", "dependents"], session=False, fmt="text",
+                   depth=2)
+    assert "depth≤2" in out, (
+        f"explicit --depth=2 must surface in the banner, not be clamped to 3:\n{out}"
+    )
+    assert "lvl1()" in out and "lvl2()" in out, (
+        f"two-hop walk should reach lvl1 and lvl2:\n{out}"
+    )
+    assert "lvl3()" not in out, (
+        f"--depth=2 should NOT walk to lvl3 (3 hops away):\n{out}"
+    )
+
+
+def test_dependents_no_depth_uses_verb_default(tmp_path, monkeypatch):
+    """Lap-27 #7 regression guard: when no --depth is passed, the
+    `dependents`/`dependencies` sugar still defaults to 3 (its documented
+    behavior — sugar for transitive callers). Sentinel-based fix must
+    not regress this."""
+    import json as _json
+    from graphify.navigate import navigate
+    nodes = [
+        {"id": "lvl0", "label": "lvl0()", "file_type": "code",
+         "source_file": "a.py", "source_location": "L1"},
+        {"id": "lvl1", "label": "lvl1()", "file_type": "code",
+         "source_file": "a.py", "source_location": "L10"},
+        {"id": "lvl2", "label": "lvl2()", "file_type": "code",
+         "source_file": "a.py", "source_location": "L20"},
+    ]
+    links = [
+        {"source": "lvl1", "target": "lvl0", "relation": "calls",
+         "confidence": "EXTRACTED"},
+        {"source": "lvl2", "target": "lvl1", "relation": "calls",
+         "confidence": "EXTRACTED"},
+    ]
+    _write_graph(tmp_path / "graphify-out", nodes, links)
+    monkeypatch.chdir(tmp_path)
+    out = navigate(["@lvl0", "dependents"], session=False, fmt="text")
+    assert "depth≤3" in out, f"default depth should be 3:\n{out}"
+    assert "lvl1()" in out and "lvl2()" in out
+
+
 def test_dependencies_alias_routes_callees(tmp_path, monkeypatch):
     """Mirror of dependents: `dependencies` walks outbound calls transitively."""
     import json as _json

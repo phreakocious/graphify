@@ -3915,7 +3915,12 @@ def main() -> None:
         kinds: set[str] | None = None
         node_kinds: set[str] | None = None  # --node-kind filter on node_kind attr
         bodies: int | None = None
-        depth: int = 1
+        # Lap-27 #7: depth=None means "user didn't pass --depth". navigate()
+        # resolves to the per-verb default (1 for in/out, 3 for the
+        # dependents/dependencies sugar). Explicit values — including 1 —
+        # are honored as-is, so `--depth=2` no longer gets clamped to 3
+        # by the dependents transitive default.
+        depth: int | None = None
         archived_mode: str = "all"  # --no-archived → "no" / --archived-only → "only"
         include_files: bool = False  # --include-files turns coc back on for file hubs
         code_only: bool = False  # --code-only filters rationale nodes from coc

@@ -2614,7 +2614,7 @@ def _pivot_data(G: nx.DiGraph, communities: dict[int, list[str]],
                 extracted_only: bool,
                 min_confidence: float | None,
                 kinds: set[str] | None = None,
-                depth: int = 1,
+                depth: int | None = None,
                 include_files: bool = False,
                 code_only: bool = False,
                 transitive: bool = False
@@ -2639,6 +2639,12 @@ def _pivot_data(G: nx.DiGraph, communities: dict[int, list[str]],
     # don't repeat the predecessor walk. Used by inferred-edge ranking
     # to push same-class/same-file matches above name-collision noise.
     focus_src, focus_parents = _focus_locality_keys(G, nid)
+
+    # Lap-27 #7: depth=None means "user didn't pass --depth". For in/out
+    # this is depth=1 (immediate); for dependents/dependencies it's 3
+    # (the documented sugar default, resolved in that branch below).
+    if depth is None and key not in ("dependents", "dependencies"):
+        depth = 1
 
     if key == "in":
         # All non-structural in-edges, plus kind-drop visibility when --kind active
@@ -2883,8 +2889,12 @@ def _pivot_data(G: nx.DiGraph, communities: dict[int, list[str]],
         # Defaults to depth=3 unless the caller passed --depth explicitly.
         # Routes through the callers/callees codepath so kind=calls and
         # the rank/drop logic stay in one place.
+        # Lap-27 #7: `depth is None` is the only signal that the user
+        # didn't pass --depth — the old `max(depth, 3)` clamped explicit
+        # values silently (`--depth=2` rendered `depth≤3`). Sentinel
+        # propagates from CLI through navigate() to here.
         base_key = "in" if key == "dependents" else "out"
-        eff_depth = max(depth, 3)
+        eff_depth = 3 if depth is None else depth
         _pname, ids, edges, sort_label, drops = _pivot_data(
             G, communities, cursor, base_key,
             extracted_only=extracted_only,
@@ -3969,7 +3979,7 @@ def navigate(ops: list[str] | str, *,
              limit: int | None = None,
              kinds: set[str] | None = None,
              bodies: int | None = None,
-             depth: int = 1,
+             depth: int | None = None,
              archived_mode: str = "all",
              include_files: bool = False,
              code_only: bool = False,
@@ -4587,7 +4597,7 @@ def navigate(ops: list[str] | str, *,
                     if (pkey in ("in", "out")
                             and extracted_only
                             and not ids
-                            and depth == 1
+                            and (depth is None or depth == 1)
                             and not transitive
                             and not kinds
                             and (drops.get("inferred") or 0) > 0):
