@@ -3355,6 +3355,109 @@ def test_peek_tail_and_range_mutually_exclusive(tmp_path):
     assert "mutually exclusive" in res.stderr, res.stderr
 
 
+def test_doc_brace_expands_to_multi_method(tmp_path):
+    """Lap-25: `doc @Class.{m1,m2}` dumps signature + rationale for each
+    method in one call. Mirrors multi-peek/multi-blast pattern.
+    Verb-fusion family complete (bodies / callers+callees / sig+docs)."""
+    import json as _json, subprocess
+    nodes = [
+        {"id": "cls", "label": "Worker", "file_type": "code",
+         "source_file": "worker.py", "source_location": "L1",
+         "node_kind": "class"},
+        {"id": "qm_run", "label": ".run()", "file_type": "code",
+         "source_file": "worker.py", "source_location": "L2-3",
+         "node_kind": "method"},
+        {"id": "qm_stop", "label": ".stop()", "file_type": "code",
+         "source_file": "worker.py", "source_location": "L5-6",
+         "node_kind": "method"},
+    ]
+    links = [
+        {"source": "cls", "target": "qm_run", "relation": "method",
+         "confidence": "EXTRACTED"},
+        {"source": "cls", "target": "qm_stop", "relation": "method",
+         "confidence": "EXTRACTED"},
+    ]
+    graph_dir = tmp_path / "graphify-out"
+    graph_dir.mkdir()
+    (graph_dir / "graph.json").write_text(_json.dumps(
+        {"directed": True, "multigraph": False, "graph": {},
+         "nodes": nodes, "links": links}), encoding="utf-8")
+    res = subprocess.run(
+        ["graphify", "doc", "Worker.{run,stop}",
+         "--graph", str(graph_dir / "graph.json")],
+        capture_output=True, text=True, cwd=str(tmp_path),
+    )
+    assert res.returncode == 0, f"multi-doc failed:\n{res.stderr}\n{res.stdout}"
+    out = res.stdout
+    assert "multi-doc: 2 targets" in out, f"missing multi-doc banner:\n{out}"
+    assert "[1/2] Worker.run" in out, f"missing [1/2] header:\n{out}"
+    assert "[2/2] Worker.stop" in out, f"missing [2/2] header:\n{out}"
+    # Both methods' labels surface — not just one repeated.
+    assert ".run()" in out and ".stop()" in out, (
+        f"missing per-target sig output:\n{out}"
+    )
+
+
+def test_doc_brace_partial_miss_continues(tmp_path):
+    """Lap-25: multi-doc soft-fails on a missing target — prints the
+    miss inline and continues to the next. Mirrors multi-peek's
+    batch semantics. Single-target doc still hard-exits on miss."""
+    import json as _json, subprocess
+    nodes = [
+        {"id": "cls", "label": "Worker", "file_type": "code",
+         "source_file": "worker.py", "source_location": "L1",
+         "node_kind": "class"},
+        {"id": "qm_run", "label": ".run()", "file_type": "code",
+         "source_file": "worker.py", "source_location": "L2-3",
+         "node_kind": "method"},
+    ]
+    links = [
+        {"source": "cls", "target": "qm_run", "relation": "method",
+         "confidence": "EXTRACTED"},
+    ]
+    graph_dir = tmp_path / "graphify-out"
+    graph_dir.mkdir()
+    (graph_dir / "graph.json").write_text(_json.dumps(
+        {"directed": True, "multigraph": False, "graph": {},
+         "nodes": nodes, "links": links}), encoding="utf-8")
+    # Missing target uses zqqqzzz_* so fuzzy can't match it to Worker.
+    res = subprocess.run(
+        ["graphify", "doc", "Worker.{run,zqqqzzz_nonexistent}",
+         "--graph", str(graph_dir / "graph.json")],
+        capture_output=True, text=True, cwd=str(tmp_path),
+    )
+    assert res.returncode == 0, (
+        f"multi-doc with one valid target should exit 0, got "
+        f"rc={res.returncode}\nstdout:\n{res.stdout}\nstderr:\n{res.stderr}"
+    )
+    assert ".run()" in res.stdout, f"valid target should render:\n{res.stdout}"
+    assert "no node matches `Worker.zqqqzzz_nonexistent`" in res.stderr, (
+        f"missing target should print named error:\n{res.stderr}"
+    )
+
+
+def test_doc_brace_json_incompatible(tmp_path):
+    """Lap-25: --json + brace-expanded multi-doc is incoherent (multiple
+    JSON objects with no separator), so error fast. Single-target --json
+    still works."""
+    import json as _json, subprocess
+    graph_dir = tmp_path / "graphify-out"
+    graph_dir.mkdir()
+    (graph_dir / "graph.json").write_text(_json.dumps(
+        {"directed": True, "multigraph": False, "graph": {},
+         "nodes": [{"id": "x", "label": "x()", "file_type": "code",
+                    "source_file": "x.py", "source_location": "L1",
+                    "node_kind": "function"}],
+         "links": []}), encoding="utf-8")
+    res = subprocess.run(
+        ["graphify", "doc", "{a,b}", "--json",
+         "--graph", str(graph_dir / "graph.json")],
+        capture_output=True, text=True, cwd=str(tmp_path),
+    )
+    assert res.returncode == 1
+    assert "incompatible" in res.stderr, res.stderr
+
+
 def test_peek_method_default_uses_indent_walker(tmp_path):
     """Lap-25 cluster-B incidental: peek of a method (label `.foo()`)
     with default flags returns the method's body, not a flat dump that

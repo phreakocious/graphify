@@ -102,9 +102,10 @@ _HELP_BLOCKS: dict[str, list[str]] = {
         "  doc <symbol>            one-shot signature + docstring/rationale dump — \"what does this metric/method/class mean?\" without pulling the implementation",
         "    --lines N               max lines per rationale block (default 40)",
         "    --md                    render labels as `[label](file:line)` markdown links",
-        "    --json                  structured JSON output",
+        "    --json                  structured JSON output (incompatible with brace-expand multi-doc)",
         "    --graph <path>          path to graph.json (default graphify-out/graph.json)",
         "    Resolves the same as `peek` (Class.method, path-qualified, fuzzy fallback). When no rationale is attached, the signature still prints + a hint to `peek`/`navigate`.",
+        "    Brace-expand `doc @Class.{m1,m2,m3}` to dump signatures + docstrings for several methods in one call (mirrors multi-peek/multi-blast). Misses print inline; exit 1 only when every target misses.",
     ],
     "shape": [
         "  shape <file>            file structure summary: N classes / M fns / K consts / X imports / longest fn — orientation without committing to a `contains` pivot",
@@ -3377,31 +3378,54 @@ def main() -> None:
             sys.exit(1)
         G, _comm = load_graph(gp)
         idx = label_index(G)
-        chosen, candidates, match_type, _alts = resolve_focus(G, idx, target)
-        if not chosen:
-            if candidates:
-                print(f"ambiguous `{target}` ({len(candidates)} matches). "
-                      f"qualify with @<dir>/<file>/<symbol>:", file=sys.stderr)
-                for nid in candidates[:8]:
-                    a = G.nodes[nid]
-                    sf = a.get("source_file", "?")
-                    loc = a.get("source_location", "")
-                    label = a.get("label", nid)
-                    print(f"  {label}  {sf}{':' + loc[1:] if loc.startswith('L') else ''}",
-                          file=sys.stderr)
-                if len(candidates) > 8:
-                    print(f"  +{len(candidates) - 8} more", file=sys.stderr)
+        # Lap-25: brace-expand `@Class.{m1,m2,m3}` so an agent can pull
+        # signatures + docstrings of several methods in one call. Same
+        # pattern as multi-peek / multi-blast; the verb-fusion family is
+        # complete (bodies / callers+callees / sig+docstring).
+        targets = _expand_brace_multi_target(target)
+        multi = len(targets) > 1
+        if multi:
+            if fmt == "json":
+                print("error: --json is incompatible with brace-expanded multi-doc.",
+                      file=sys.stderr)
                 sys.exit(1)
-            print(f"no node matches `{target}`.", file=sys.stderr)
+            print(f"# multi-doc: {len(targets)} targets")
+        any_ok = False
+        for ti, t in enumerate(targets):
+            if multi:
+                if ti > 0:
+                    print()
+                print(f"# [{ti+1}/{len(targets)}] {t}")
+            chosen, candidates, match_type, _alts = resolve_focus(G, idx, t)
+            if not chosen:
+                if candidates:
+                    print(f"ambiguous `{t}` ({len(candidates)} matches). "
+                          f"qualify with @<dir>/<file>/<symbol>:", file=sys.stderr)
+                    for nid in candidates[:8]:
+                        a = G.nodes[nid]
+                        sf = a.get("source_file", "?")
+                        loc = a.get("source_location", "")
+                        label = a.get("label", nid)
+                        print(f"  {label}  {sf}{':' + loc[1:] if loc.startswith('L') else ''}",
+                              file=sys.stderr)
+                    if len(candidates) > 8:
+                        print(f"  +{len(candidates) - 8} more", file=sys.stderr)
+                else:
+                    print(f"no node matches `{t}`.", file=sys.stderr)
+                if not multi:
+                    sys.exit(1)
+                continue
+            any_ok = True
+            if match_type and match_type != "exact":
+                chosen_label = G.nodes[chosen].get("label", chosen)
+                print(f"# matched `{t}` → {chosen_label} ({match_type})")
+            data = doc_node(G, chosen, max_rationale_lines=max_lines)
+            if fmt == "json":
+                print(json.dumps(data))
+            else:
+                print(_render_doc_text(data, md=md))
+        if multi and not any_ok:
             sys.exit(1)
-        if match_type and match_type != "exact":
-            chosen_label = G.nodes[chosen].get("label", chosen)
-            print(f"# matched `{target}` → {chosen_label} ({match_type})")
-        data = doc_node(G, chosen, max_rationale_lines=max_lines)
-        if fmt == "json":
-            print(json.dumps(data))
-        else:
-            print(_render_doc_text(data, md=md))
 
     elif cmd == "shape":
         # File-shape summary: "N classes, M fns, K consts, X imports,
