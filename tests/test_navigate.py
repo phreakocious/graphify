@@ -44,6 +44,87 @@ def test_basename_only_still_resolves_when_unique():
     assert match_type == "exact"
 
 
+def test_directory_query_returns_files_in_dir():
+    """Lap-27 #6: `@<dir>/` (trailing slash) should land on the files in
+    that directory, not fall through to substring fuzzy. Without this,
+    `@graphify/` returns the 6 nodes whose label happens to contain the
+    literal `graphify/` (file-shaped labels like `graphify/__main__.py`)
+    — useless overlap with what the query actually meant.
+    """
+    G = nx.DiGraph()
+    # Two files in `tools/`, plus a noise file outside it and a deeper
+    # `tools/sub/` file that should NOT match an immediate-children query.
+    G.add_node("f1", label="metric_diagnostic.py", file_type="code",
+               source_file="tools/metric_diagnostic.py", source_location="L1",
+               node_kind="file")
+    G.add_node("f2", label="twist_spectrum_diagnostic.py", file_type="code",
+               source_file="tools/twist_spectrum_diagnostic.py",
+               source_location="L1", node_kind="file")
+    G.add_node("f3", label="ab_metric_diagnostic.py", file_type="code",
+               source_file="1d/ab_metric_diagnostic.py", source_location="L1",
+               node_kind="file")
+    idx = label_index(G)
+    chosen, candidates, match_type, _ = resolve_focus(G, idx, "tools/")
+    assert chosen is None, "directory query must yield a listing, not auto-pick"
+    assert match_type == "exact"
+    assert set(candidates) == {"f1", "f2"}, (
+        f"@tools/ should list files in tools/ (f1, f2); got {candidates}"
+    )
+
+
+def test_directory_query_no_trailing_slash_still_recognized():
+    """Lap-27 #6: bare `@<dir>` with no trailing slash and no `.` in the
+    last segment, where the input matches a directory prefix in the
+    graph, should also land on the directory. Without this, every
+    `@tests` query goes through fuzzy and lands on the nearest typo
+    rather than the directory the agent actually meant."""
+    G = nx.DiGraph()
+    G.add_node("f1", label="t1.py", file_type="code",
+               source_file="tests/t1.py", source_location="L1",
+               node_kind="file")
+    G.add_node("f2", label="t2.py", file_type="code",
+               source_file="tests/t2.py", source_location="L1",
+               node_kind="file")
+    G.add_node("noise", label="other.py", file_type="code",
+               source_file="src/other.py", source_location="L1",
+               node_kind="file")
+    idx = label_index(G)
+    chosen, candidates, match_type, _ = resolve_focus(G, idx, "tests")
+    # Two files in tests/ → disambig listing.
+    assert chosen is None
+    assert set(candidates) == {"f1", "f2"}, (
+        f"@tests should list files in tests/ when no symbol named tests "
+        f"exists; got {candidates}"
+    )
+
+
+def test_directory_query_loses_to_real_symbol_match():
+    """Lap-27 #6 guard: when a node label is exactly the dir-shaped
+    input (e.g. `tests` IS a class or fn), the symbol match wins.
+    Directory inference only fires when no real label match exists.
+    Trailing-slash form is unambiguous and still triggers dir lookup."""
+    G = nx.DiGraph()
+    # A real class named `tests` (contrived but possible).
+    G.add_node("cls", label="tests", file_type="code",
+               source_file="src/foo.py", source_location="L10",
+               node_kind="class")
+    # File in tests/ directory.
+    G.add_node("f1", label="t1.py", file_type="code",
+               source_file="tests/t1.py", source_location="L1",
+               node_kind="file")
+    idx = label_index(G)
+    # Bare `@tests` → exact label match wins.
+    chosen, _, match_type, _ = resolve_focus(G, idx, "tests")
+    assert chosen == "cls", "exact label match must beat directory inference"
+    assert match_type == "exact"
+    # `@tests/` (slash form) → unambiguous dir intent, ignores the class.
+    # One file in tests/ → auto-pick (matches single-hit path-qualified
+    # behavior). Multiple files would yield a listing.
+    chosen2, candidates2, match_type2, _ = resolve_focus(G, idx, "tests/")
+    assert chosen2 == "f1", "trailing slash must skip class match"
+    assert match_type2 == "exact"
+
+
 def test_path_qualified_no_match_falls_through():
     """Path that matches no node falls through to fuzzy — doesn't crash."""
     G = _two_files_same_basename()

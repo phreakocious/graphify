@@ -312,6 +312,34 @@ def _rank_match(G: nx.Graph, key: str, nid: str) -> tuple[int, int, int, int, in
 _FUZZY_LIMIT = 25
 
 
+def _files_in_directory(G: nx.DiGraph, dir_prefix: str) -> list[str]:
+    """Lap-27 #6: file-kind nodes whose immediate parent directory matches
+    `dir_prefix`. Test the parent path so the match works on both
+    relative (`tools/foo.py`) and absolute (`/abs/.../tools/foo.py`)
+    source_file shapes — extractor stamps absolute paths but tests
+    use relative ones, and `graphify/graphify/x.py` would otherwise
+    collide with itself on a startswith-style check.
+
+    Immediate children only: `<dir>/<sub>/<file>` is excluded because
+    the user typed `<dir>/` not `<dir>/<sub>/`.
+
+    Used by `resolve_focus` to interpret `@<dir>/` (explicit) and
+    `@<dir>` (last-resort, before fuzzy) as a directory listing rather
+    than substring noise.
+    """
+    hits: list[str] = []
+    for nid, attrs in G.nodes(data=True):
+        if attrs.get("node_kind") != "file":
+            continue
+        sf = _norm(attrs.get("source_file") or "")
+        if "/" not in sf:
+            continue
+        parent = sf.rsplit("/", 1)[0]
+        if parent == dir_prefix or parent.endswith("/" + dir_prefix):
+            hits.append(nid)
+    return hits
+
+
 def resolve_focus(G: nx.DiGraph, idx: dict[str, list[str]],
                   target: str) -> tuple[str | None, list[str], str, list[str]]:
     """Resolve `@<label>` → (chosen_id_or_None, candidates, match_type, alternatives).
@@ -330,6 +358,23 @@ def resolve_focus(G: nx.DiGraph, idx: dict[str, list[str]],
         return None, [], "", []
 
     ALT_LIMIT = 4
+
+    # Lap-27 #6: explicit directory query — `@<dir>/` (trailing slash).
+    # Slash is unambiguous "I mean a directory, not a label." Resolve
+    # to files-in-dir or fail; do NOT fall through to substring/fuzzy
+    # which would otherwise match labels containing "<dir>/" literally
+    # (file-shaped labels in tools that surface them) or fuzzy-pick a
+    # nearby symbol typo.
+    if key.endswith("/"):
+        dir_prefix = key.rstrip("/")
+        if dir_prefix:
+            dir_hits = _files_in_directory(G, dir_prefix)
+            if len(dir_hits) == 1:
+                return dir_hits[0], [], "exact", []
+            if len(dir_hits) > 1:
+                dir_hits.sort(key=lambda n: _rank_match(G, key, n))
+                return None, dir_hits, "exact", []
+        return None, [], "fuzzy", []
 
     # 1. exact match (label or id)
     matches = idx.get(key, [])
@@ -599,6 +644,20 @@ def resolve_focus(G: nx.DiGraph, idx: dict[str, list[str]],
         # untruncated total for accurate "X matches" announcement.
         match_type = "prefix" if prefix_hits and len(prefix_hits) == len(substring_hits) else "substring"
         return None, substring_hits, match_type, []
+
+    # 2b. directory-name fallback (lap-27 #6). Before fuzzy guesses from
+    # labels, try interpreting the bare input as a directory name. Useful
+    # when the agent reaches for `@<dir>` to scope (e.g., `@tests`) and
+    # there's no symbol with that name. Trailing-slash form was handled
+    # up top; this branch is the last-resort for slash-less input that
+    # missed every prior resolver stage.
+    if "/" not in key and "." not in key:
+        dir_hits = _files_in_directory(G, key)
+        if len(dir_hits) == 1:
+            return dir_hits[0], [], "exact", []
+        if len(dir_hits) > 1:
+            dir_hits.sort(key=lambda n: _rank_match(G, key, n))
+            return None, dir_hits, "exact", []
 
     # 3. fuzzy (typo) fallback — labels only. difflib returns close matches in
     # similarity-desc order; preserve that ordering rather than re-ranking,
