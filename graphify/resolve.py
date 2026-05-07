@@ -179,6 +179,80 @@ def _is_archived_path(src: str | None) -> bool:
     return bool(_ARCHIVE_RE.search(src))
 
 
+# --- vendor / generated detection -----------------------------------------
+
+# Lap-27 #2: third-party-imports / build-output paths universal across the
+# major package-managed languages. Anchored on path *segments* (same as
+# `_ARCHIVE_RE`) so a directory called `mybuild` isn't falsely tagged.
+# These are auto-detected — users shouldn't have to enumerate them in
+# `.graphifyignore` for the dependency case to work right.
+#
+# `target/` (Rust) is here even though it's a common dir name in other
+# contexts; the false-positive cost is much lower than the false-negative
+# (users on Cargo projects burn entry-point ranking on `target/debug/...`).
+# `dist/`/`build/` similar — the vast majority of repos that use these
+# names use them for build output.
+_VENDOR_PATH_RE = re.compile(
+    r"(^|/)(?:vendor|node_modules|\.venv|venv|env|site-packages|"
+    r"third_party|third-party|Godeps|dist|build|\.next|target|"
+    r"\.tox|__pycache__|coverage|"
+    r"\.pytest_cache|\.mypy_cache|\.ruff_cache|\.gradle|\.dart_tool|"
+    r"bower_components|jspm_packages|out|"
+    r"DerivedData|Pods)(/|$)",
+)
+
+
+# Filename suffixes that identify generated code. Pure pattern match on
+# the filename component — no path needed. Conservative set: each suffix
+# is a near-universal generator convention with very low false-positive
+# rate. Add cautiously; a too-broad suffix masks first-party code.
+_GENERATED_SUFFIX_RE = re.compile(
+    r"\.(?:pb|generated|min)\.(?:go|ts|js|css|tsx|jsx|py)$|"
+    r"_(?:gen|pb2|pb2_grpc)\.(?:go|py)$|"
+    r"\.g\.dart$|"
+    r"\.designer\.cs$",
+)
+
+
+def _is_vendored_path(src: str | None) -> bool:
+    """Path lives under a third-party / package-manager / build-output dir.
+    See `_VENDOR_PATH_RE` for the segment list."""
+    if not src:
+        return False
+    return bool(_VENDOR_PATH_RE.search(src))
+
+
+def _is_generated_path(src: str | None) -> bool:
+    """Filename matches a generator-convention suffix."""
+    if not src:
+        return False
+    # Match the basename only — full path can contain unrelated dots.
+    bn = src.rsplit("/", 1)[-1]
+    return bool(_GENERATED_SUFFIX_RE.search(bn))
+
+
+def vendor_class(src: str | None) -> str:
+    """Classify a source file path into one of:
+        - `archived`    — under frozen/legacy/deprecated/archive dir
+        - `generated`   — filename matches a known generator suffix
+        - `vendored`    — under vendor/node_modules/.venv/dist/build/etc.
+        - `first_party` — none of the above
+    Order matters: archived > vendored > generated. Archived means the
+    user explicitly shelved it (still their code, just shelved); vendored
+    means the code isn't theirs at all; generated means it lives in their
+    tree but didn't write it. The first match wins so a path like
+    `vendor/lib/foo.pb.go` reports as vendored (not generated) — the
+    outer dir tells you who owns it.
+    """
+    if _is_archived_path(src):
+        return "archived"
+    if _is_vendored_path(src):
+        return "vendored"
+    if _is_generated_path(src):
+        return "generated"
+    return "first_party"
+
+
 # --- ranking helpers -------------------------------------------------------
 
 def _is_private_label(label: str) -> bool:
@@ -294,14 +368,24 @@ def _rank_match(G: nx.Graph, key: str, nid: str) -> tuple[int, int, int, int, in
     """
     label = G.nodes[nid].get("label", nid)
     src = G.nodes[nid].get("source_file")
-    is_archived = 1 if _is_archived_path(src) else 0
+    # Lap-27 #2: vendored/generated paths are demoted to the same tier as
+    # archived. The rank tuple's first slot is "1 = push to bottom"; archived,
+    # vendored, and generated all share this fate, with the existing
+    # `[archived]` tag preserved for back-compat. `vendor_class` is stamped
+    # at build time; when missing (older graph not yet loaded through
+    # build_from_json), fall back to the archived check alone.
+    vc = G.nodes[nid].get("vendor_class")
+    if vc is None:
+        is_demoted = 1 if _is_archived_path(src) else 0
+    else:
+        is_demoted = 0 if vc == "first_party" else 1
     is_rat = 1 if G.nodes[nid].get("file_type") == "rationale" else 0
     is_priv = 1 if _is_private_label(label) else 0
     deg = G.degree(nid)
     is_orphan = 1 if deg == 0 else 0
     length_pad = max(0, len(label) - len(key))
     bucket = _recency_bucket(src)
-    return (is_archived, is_rat, is_priv, is_orphan, length_pad, bucket, -deg)
+    return (is_demoted, is_rat, is_priv, is_orphan, length_pad, bucket, -deg)
 
 
 # --- main resolver ---------------------------------------------------------

@@ -2815,6 +2815,12 @@ def main() -> None:
                     and _kind in ("function", "method", "impl_method", "iface_method")):
                 label_variant_count[_lab] += 1
         entry_pts: list[tuple[str, int, str, str, int]] = []
+        # Lap-27 #2: count vendored/generated entries we filter out so the
+        # listing can show `+N vendored hidden, +M generated hidden` per
+        # the omission-counts rule. Agents who *want* the library API
+        # surface still see it via `--include-vendored` (when shipped).
+        vendored_dropped = 0
+        generated_dropped = 0
         for nid, attrs in G.nodes(data=True):
             label = attrs.get("label", "")
             if not (isinstance(label, str) and label.endswith("()")):
@@ -2836,6 +2842,15 @@ def main() -> None:
                     continue
                 ext_in += 1
             if ext_in > 0:
+                # Filter vendored/generated so the listing surfaces the
+                # user's API surface, not e.g. lodash or .pb.go boilerplate.
+                vc = attrs.get("vendor_class") or "first_party"
+                if vc == "vendored":
+                    vendored_dropped += 1
+                    continue
+                if vc == "generated":
+                    generated_dropped += 1
+                    continue
                 variants = label_variant_count.get(label, 1)
                 entry_pts.append((label, ext_in, sf, loc, variants))
         entry_pts.sort(key=lambda t: (-t[1], t[0]))
@@ -2906,6 +2921,16 @@ def main() -> None:
                       f"`graphify navigate \"@{example}\"` (disambig list) "
                       f"or `graphify locate \"{example.rstrip('()')}\"` "
                       f"(file:line per match)")
+            # Lap-27 #2: surface vendored/generated drops per the
+            # omission-counts rule. Naming the flag is held until those
+            # flags ship — for now the line is a transparency signal.
+            if vendored_dropped or generated_dropped:
+                bits = []
+                if vendored_dropped:
+                    bits.append(f"+{vendored_dropped} vendored hidden")
+                if generated_dropped:
+                    bits.append(f"+{generated_dropped} generated hidden")
+                print("    " + ", ".join(bits))
         if rel_counts:
             print()
             total_rel = sum(rel_counts.values())

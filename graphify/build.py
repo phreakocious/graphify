@@ -134,6 +134,7 @@ def build_from_json(extraction: dict, *, directed: bool = False) -> nx.Graph:
               f"edges with non-rationale_for relations (LLM direction-inversion).",
               file=sys.stderr)
     _backfill_node_kind(G)
+    _stamp_vendor_class(G)
     return G
 
 
@@ -181,6 +182,29 @@ def _backfill_node_kind(G: nx.Graph) -> None:
             continue
         # Leave kind unset for nodes we can't classify by shape — better
         # than guessing wrong.
+
+
+def _stamp_vendor_class(G: nx.Graph) -> None:
+    """Tag every node with `vendor_class` ∈ {first_party, vendored, generated, archived}.
+
+    Lap-27 #2: agents reading entry-point listings on big repos got swamped
+    by `vendor/`, `node_modules/`, `.venv/`, etc. — library code drowned the
+    actual API surface. The fix runs at build time (no AST_CACHE_VERSION
+    bump — the per-file extraction cache is upstream of this and unchanged)
+    so existing graph.json files pick up the tag the next time they're
+    loaded. Per-source-file classification is memoised inside the loop;
+    the cost is one regex check per unique source_file.
+    """
+    from graphify.resolve import vendor_class as _vc
+    cache: dict[str, str] = {}
+    for _nid, attrs in G.nodes(data=True):
+        sf = attrs.get("source_file") or ""
+        if sf in cache:
+            attrs["vendor_class"] = cache[sf]
+            continue
+        cls = _vc(sf)
+        cache[sf] = cls
+        attrs["vendor_class"] = cls
 
 
 def build(extractions: list[dict], *, directed: bool = False) -> nx.Graph:

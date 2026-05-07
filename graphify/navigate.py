@@ -737,6 +737,10 @@ def _node_summary(G: nx.DiGraph, nid: str) -> dict:
         "file_type": a.get("file_type", ""),
         "is_test": _is_test_path(src),
         "is_archived": _is_archived_path(src),
+        # Lap-27 #2: vendor classification (vendored / generated / archived /
+        # first_party). Stamped at build time onto every node, surfaced here
+        # for renderers to tag listings ([vendored] / [generated]).
+        "vendor_class": a.get("vendor_class") or "first_party",
         # Coarse kind annotation: "interface" / "class" / "type_alias" /
         # "iface_method" / "impl_method" / None. Surfaced as
         # [iface]/[impl]/[type] in disambig listings so the agent can
@@ -1761,6 +1765,16 @@ def _render_frontier_text(data: dict, cursor: Cursor, *, show_ops: bool,
     p = data["pivots"]
     test_tag = " [test]" if n.get("is_test") else ""
     archived_tag = " [archived]" if n.get("is_archived") else ""
+    # Lap-27 #2: surface vendored/generated tags on the focus header so
+    # an agent who landed inside `node_modules/` (e.g. via a fuzzy match
+    # that picked up a library function) sees the cue immediately. The
+    # vendor_class field is set at build time; archived has its own field
+    # for back-compat, so we only render the new tags when distinct.
+    vc = n.get("vendor_class") or "first_party"
+    if vc == "vendored":
+        archived_tag = archived_tag + " [vendored]"
+    elif vc == "generated":
+        archived_tag = archived_tag + " [generated]"
     # Lap-7: surface kind on the header too — agents inspecting an interface
     # vs its impl class need the cue at the top, not just on child listings.
     kind = n.get("node_kind") or ""
@@ -2398,6 +2412,14 @@ def _render_listing_text(data: dict, *, show_ops: bool, md: bool = False) -> str
             ft_tag += " [test]"
         if item.get("is_archived"):
             ft_tag += " [archived]"
+        # Lap-27 #2: surface vendor_class on listing rows the same way
+        # `[archived]` does — agents browsing disambig hits should see
+        # which row is from `node_modules/` or a `.pb.go` generator.
+        vc = item.get("vendor_class") or "first_party"
+        if vc == "vendored":
+            ft_tag += " [vendored]"
+        elif vc == "generated":
+            ft_tag += " [generated]"
         kind = item.get("node_kind")
         if kind == "interface" or kind == "iface_method":
             ft_tag += " [iface]"
@@ -3732,6 +3754,15 @@ def shape_file(G: nx.DiGraph, file_nid: str, *,
                 continue
             rel = G.edges[u, nid].get("relation") or ""
             if rel in _STRUCTURAL:
+                continue
+            # Lap-27 #2: skip cross-file callers from vendored/generated
+            # paths. A `shape` entry-point listing should surface "who in
+            # MY code uses this fn"; if the only callers are inside
+            # `node_modules/`, the count is misleading. (The graphify
+            # corpus rarely has this leakage but vendor-heavy Go/JS repos
+            # can have 50:1 ratios.)
+            uvc = G.nodes[u].get("vendor_class") or "first_party"
+            if uvc in ("vendored", "generated"):
                 continue
             ext_in += 1
         fn_ext_in[nid] = ext_in

@@ -244,6 +244,66 @@ def test_graph_pickle_miss_when_corrupt(tmp_graph_json):
     assert load_graph_pickle(tmp_graph_json) is None
 
 
+def test_vendor_class_helpers():
+    """Path/suffix classification covers the universal third-party + generator conventions."""
+    from graphify.resolve import _is_vendored_path, _is_generated_path, vendor_class
+    # Path-segment patterns (vendored)
+    assert _is_vendored_path("node_modules/lodash/index.js")
+    assert _is_vendored_path("repo/node_modules/lodash/index.js")
+    assert _is_vendored_path("vendor/google.golang.org/grpc/server.go")
+    assert _is_vendored_path(".venv/lib/python3.12/site-packages/foo/bar.py")
+    assert _is_vendored_path("third_party/llama/foo.cpp")
+    assert _is_vendored_path("project/dist/main.bundle.js")
+    assert _is_vendored_path("project/build/output.js")
+    assert _is_vendored_path("rust-app/target/debug/deps/foo.rs")
+    assert _is_vendored_path("py/__pycache__/foo.cpython-312.pyc")
+    # Substring traps must NOT match (path segment anchoring).
+    assert not _is_vendored_path("src/buildable/foo.py")
+    assert not _is_vendored_path("src/distance.py")
+    assert not _is_vendored_path("src/vendormock_test.py")
+    # First-party
+    assert not _is_vendored_path("src/main.py")
+    assert not _is_vendored_path("graphify/extract.py")
+
+    # Generator-suffix patterns
+    assert _is_generated_path("api/foo.pb.go")
+    assert _is_generated_path("schemas/foo_gen.go")
+    assert _is_generated_path("client/types.generated.ts")
+    assert _is_generated_path("public/app.min.js")
+    assert _is_generated_path("api/proto_pb2.py")
+    assert _is_generated_path("api/proto_pb2_grpc.py")
+    # First-party doesn't trigger
+    assert not _is_generated_path("src/foo.go")
+    assert not _is_generated_path("src/types.ts")
+
+    # Combined classifier — order: archived > vendored > generated > first_party.
+    assert vendor_class("frozen/old.py") == "archived"
+    assert vendor_class("vendor/x/foo.pb.go") == "vendored"     # vendor wins over generated
+    assert vendor_class("src/proto/foo.pb.go") == "generated"
+    assert vendor_class("src/main.py") == "first_party"
+    assert vendor_class(None) == "first_party"
+    assert vendor_class("") == "first_party"
+
+
+def test_stamp_vendor_class_tags_every_node():
+    """`build_from_json` stamps `vendor_class` on every node in the graph."""
+    from graphify.build import build_from_json
+    extraction = {
+        "nodes": [
+            {"id": "f1", "label": "foo()", "source_file": "src/foo.py", "source_location": "L1-5"},
+            {"id": "v1", "label": "lodash", "source_file": "node_modules/lodash/index.js", "source_location": "L1-5"},
+            {"id": "g1", "label": "Foo()", "source_file": "api/foo.pb.go", "source_location": "L1-5"},
+            {"id": "a1", "label": "old()", "source_file": "frozen/old.py", "source_location": "L1-5"},
+        ],
+        "edges": [],
+    }
+    G = build_from_json(extraction, directed=True)
+    assert G.nodes["f1"]["vendor_class"] == "first_party"
+    assert G.nodes["v1"]["vendor_class"] == "vendored"
+    assert G.nodes["g1"]["vendor_class"] == "generated"
+    assert G.nodes["a1"]["vendor_class"] == "archived"
+
+
 def test_graph_pickle_roundtrip_via_load_graph(tmp_graph_json):
     """End-to-end: load_graph populates the pickle; second call reads from it.
 

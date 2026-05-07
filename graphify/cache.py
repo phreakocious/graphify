@@ -16,7 +16,7 @@ from typing import Any
 # cache) — the pickle sits one stage downstream and invalidates on
 # graph.json mtime+size, the version below, networkx version, and the
 # Python (major, minor) tuple.
-PICKLE_CACHE_VERSION = "v1"
+PICKLE_CACHE_VERSION = "v2"  # v2: lap-27 #2 stamps vendor_class on every node
 
 
 def _body_content(content: bytes) -> bytes:
