@@ -155,7 +155,54 @@ def test_hook_fires_on_cold_read(tmp_path):
     out = _handle_pretool_hook(_read_payload(str(src)), root)
     assert out is not None
     assert out["hookSpecificOutput"]["hookEventName"] == "PreToolUse"
-    assert "graphify navigate" in out["hookSpecificOutput"]["additionalContext"]
+    ctx = out["hookSpecificOutput"]["additionalContext"]
+    # Read-specific nudge points at `shape` (file-level orientation).
+    assert "graphify shape" in ctx
+
+
+def test_hook_read_message_includes_file_size(tmp_path):
+    """When the size gate has the file size, the Read nudge mentions it.
+    Anchors the "scout cheaper" claim in a concrete number."""
+    root = _make_root(tmp_path)
+    src = tmp_path / "main.py"
+    # Pad to ~12 KB so the size hint reads as `Reading 12 KB`.
+    src.write_text("# " + "x" * (12 * 1024))
+    out = _handle_pretool_hook(_read_payload(str(src)), root)
+    assert out is not None
+    ctx = out["hookSpecificOutput"]["additionalContext"]
+    assert "Reading " in ctx and "KB" in ctx
+    # And the suggested command quotes the file path the agent typed.
+    assert str(src) in ctx
+
+
+def test_hook_grep_message_uses_search_verb(tmp_path):
+    """Grep nudge points at `graphify search` (the verb that mirrors
+    grep, with symbol attribution)."""
+    root = _make_root(tmp_path)
+    out = _handle_pretool_hook(
+        {"tool_name": "Grep", "tool_input": {"pattern": "compute_metrics"}},
+        root,
+    )
+    assert out is not None
+    ctx = out["hookSpecificOutput"]["additionalContext"]
+    assert "graphify search" in ctx
+    # The user's pattern is echoed back verbatim so the suggestion is
+    # directly runnable.
+    assert "compute_metrics" in ctx
+
+
+def test_hook_glob_message_uses_files_verb(tmp_path):
+    """Glob nudge points at `graphify files` (the lap-27 verb that
+    mirrors glob over the indexed file set)."""
+    root = _make_root(tmp_path)
+    out = _handle_pretool_hook(
+        {"tool_name": "Glob", "tool_input": {"pattern": "**/*.test.ts"}},
+        root,
+    )
+    assert out is not None
+    ctx = out["hookSpecificOutput"]["additionalContext"]
+    assert "graphify files" in ctx
+    assert "**/*.test.ts" in ctx
 
 
 def test_hook_silent_when_env_var_set(tmp_path, monkeypatch):
@@ -269,7 +316,7 @@ def test_hook_grep_fires_when_cold(tmp_path):
     root = _make_root(tmp_path)
     out = _handle_pretool_hook(_grep_payload(), root)
     assert out is not None
-    assert "graphify navigate" in out["hookSpecificOutput"]["additionalContext"]
+    assert "graphify search" in out["hookSpecificOutput"]["additionalContext"]
 
 
 def test_hook_unknown_tool_silent(tmp_path):

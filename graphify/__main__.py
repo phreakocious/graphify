@@ -383,6 +383,7 @@ def _handle_pretool_hook(payload: dict, root: Path) -> dict | None:
 
     inp = payload.get("tool_input") or {}
     fp = (inp.get("file_path") or "").strip()
+    file_size: int | None = None
 
     if tool == "Read":
         ext = _osp.splitext(fp)[1].lower()
@@ -392,9 +393,13 @@ def _handle_pretool_hook(payload: dict, root: Path) -> dict | None:
             return None
         # File-size floor: skip the nudge on small files. Stat may fail
         # (file outside graph cwd, permissions); on any error fall through
-        # to the nudge so we don't silently drop legitimate cases.
+        # to the nudge so we don't silently drop legitimate cases. The
+        # size we read here is also reused below to anchor the nudge in
+        # a concrete number ("Reading 12 KB") rather than a generic
+        # "before reading unfamiliar code".
         try:
-            if Path(fp).stat().st_size < _HOOK_MIN_FILE_BYTES:
+            file_size = Path(fp).stat().st_size
+            if file_size < _HOOK_MIN_FILE_BYTES:
                 return None
         except OSError:
             pass
@@ -421,14 +426,66 @@ def _handle_pretool_hook(payload: dict, root: Path) -> dict | None:
             except OSError:
                 pass
 
-    msg = (
-        "graphify-out/graph.json exists. Before reading/grepping "
-        "unfamiliar code, scout it cheaper: `graphify navigate "
-        "\"@<symbol>\"` returns a dense affordance frame (~200 tok). "
-        "Then pivot with in/out/methods/coc/parent/[N], or jump to "
-        "file:line once a node is load-bearing. See "
-        "~/.claude/skills/graphify/SKILL.md."
-    )
+    # Lap-27 #9 follow-up: tailor the nudge to the tool. We know which
+    # verb actually fits the shape of what the agent is about to do —
+    # `shape` for a Read (file-level orientation), `search` for a Grep
+    # (regex with symbol attribution), `files` for a Glob (file listing
+    # against the indexed set). Naming the right verb in the nudge is
+    # higher-signal than the old generic "use navigate" — and including
+    # the actual file/pattern they typed makes the suggestion
+    # copy-pasteable.
+    if tool == "Read":
+        size_hint = ""
+        if file_size is not None:
+            kb = max(1, file_size // 1024)
+            size_hint = f"Reading {kb} KB. "
+        # Quote the path as-typed so the suggested command is directly
+        # runnable. graphify shape resolves both relative and absolute
+        # paths, so whichever form the agent passed Read works here.
+        msg = (
+            f"{size_hint}Cheaper first: `graphify shape \"{fp}\"` returns "
+            f"a one-screen summary (classes / fns / longest fn / entry "
+            f"points / line ranges) so the follow-up Read can use "
+            f"--offset/--limit instead of dumping the whole file. For a "
+            f"single declaration, `graphify peek \"@<symbol>\"` is a "
+            f"cursor-free body dump. See ~/.claude/skills/graphify/SKILL.md."
+        )
+    elif tool == "Grep":
+        pat = (inp.get("pattern") or "").strip()
+        if pat:
+            msg = (
+                f"`graphify search \"{pat}\"` runs the same regex but "
+                f"returns hits with symbol attribution (file:line + "
+                f"enclosing fn/class) and ±1 line of context — strictly "
+                f"more info for the same query. See "
+                f"~/.claude/skills/graphify/SKILL.md."
+            )
+        else:
+            msg = (
+                "`graphify search \"<pattern>\"` runs the same regex but "
+                "returns hits with symbol attribution (file:line + "
+                "enclosing fn/class) and ±1 line of context. See "
+                "~/.claude/skills/graphify/SKILL.md."
+            )
+    elif tool == "Glob":
+        pat = (inp.get("pattern") or "").strip()
+        if pat:
+            msg = (
+                f"`graphify files \"{pat}\"` mirrors the glob over the "
+                f"indexed file set — each match is a graph node you can "
+                f"`shape`/`navigate` from in one more call. See "
+                f"~/.claude/skills/graphify/SKILL.md."
+            )
+        else:
+            msg = (
+                "`graphify files \"<glob>\"` mirrors a glob over the "
+                "indexed file set — each match is a graph node you can "
+                "`shape`/`navigate` from. See "
+                "~/.claude/skills/graphify/SKILL.md."
+            )
+    else:
+        # Defensive fallback — the gate above should already exclude this.
+        return None
     # Staleness banner: piggybacks on the same fire when the graph is
     # conspicuously behind the working tree. Per-30min stamp prevents
     # banner-spam without affecting the main nudge cadence.
