@@ -183,8 +183,18 @@ _HELP_BLOCKS: dict[str, list[str]] = {
 }
 
 
-def _print_subcmd_help(cmd: str) -> None:
-    """Print `<cmd> --help`. Falls back to top-level help if cmd is unknown."""
+def _print_subcmd_help(cmd: str, long: bool = False) -> None:
+    """Print `<cmd> --help` (short) or `<cmd> --help-long` (full).
+
+    Lap-27 #5: short by default — just the verb's signature line(s),
+    which is what an LLM scanning for "what does this verb do?"
+    actually needs. `--help-long` keeps the full flag dump for the
+    times the agent is committing to a specific call.
+
+    Each block's first line (and any other 2-space-indented line, like
+    summarize's `@<Class>` and `(no target)` shapes) is a top-level
+    signature; 4-space-indented lines are flags or descriptive notes.
+    """
     block = _HELP_BLOCKS.get(cmd)
     if not block:
         # Unknown subcommand → defer to the caller; top-level help screen
@@ -192,9 +202,66 @@ def _print_subcmd_help(cmd: str) -> None:
         return
     print(f"Usage: graphify {cmd} ...")
     print()
-    for line in block:
-        print(line)
+    if long:
+        for line in block:
+            print(line)
+    else:
+        for line in block:
+            if line.startswith("    "):
+                continue
+            print(line)
+        print()
+        print(f"  (use `graphify {cmd} --help-long` for flags + examples)")
     print()
+
+
+def _print_top_help_short() -> None:
+    """Lap-27 #5: short top-level help. One line per verb, compact
+    install zoo, decision rule deferred to --help-long. The agent
+    scanning for verb names doesn't pay 5K tokens for flags they're
+    not about to use.
+    """
+    print("Usage: graphify <command>")
+    print()
+    print("Common workflows:")
+    print("  Orient on a repo      graphify summarize")
+    print("  Orient on a file      graphify shape <file>")
+    print("  Read a function body  graphify peek <symbol>")
+    print("  Find callers of X     graphify navigate \"@X\" in")
+    print("  Find a string         graphify search \"<regex>\"")
+    print("  Stale graph?          graphify changed   (then `graphify update .`)")
+    print()
+    # First-line-of-block per verb in display order. 2-space-indented
+    # lines (verb signatures with brief descriptions); 4-space lines
+    # (flag entries) are filtered.
+    print("Commands:")
+    for verb in ("navigate", "peek", "shape", "doc", "blast", "locate",
+                 "summarize", "search", "path", "explain", "changed"):
+        block = _HELP_BLOCKS.get(verb, [])
+        for line in block:
+            if line.startswith("    "):
+                continue
+            print(line)
+    print("  diff <old> <new>        compare two graph snapshots")
+    print("  update <path>           re-extract source after edits (no LLM)")
+    print("  watch <path>            live rebuild on code changes")
+    print("  query \"<question>\"       BFS traversal of graph.json")
+    print("  benchmark               token reduction vs naive full-corpus")
+    print("  add <url>               fetch URL into ./raw, then update graph")
+    print("  cluster-only <path>     rerun clustering on existing graph.json")
+    print("  save-result             save Q&A to graphify-out/memory/")
+    print()
+    print("Install (per platform):")
+    print("  install [--platform P]  copy skill to platform config dir")
+    print("                          (claude|gemini|codex|opencode|aider|cursor|")
+    print("                           windows|copilot|vscode|claw|droid|trae|")
+    print("                           trae-cn|antigravity|hermes|kiro)")
+    print("  <platform> install      per-platform skill + hook setup")
+    print("  <platform> uninstall    remove platform-specific config")
+    print("  hook install / uninstall    post-commit/post-checkout git hooks")
+    print()
+    print("Run `graphify --help-long` for flags, decision rule, and examples.")
+    print("Run `graphify <command> --help-long` for one command's full reference.")
 
 
 _SETTINGS_HOOK = {
@@ -1337,15 +1404,25 @@ def main() -> None:
         print(f"graphify {__version__}")
         return
 
-    # `graphify <cmd> --help` (or `-h`) — print just that subcommand's
-    # block. Without this, e.g. `graphify navigate --help` parses `--help`
-    # as a navigate op and errors. Common subcommands have entries in
-    # `_HELP_BLOCKS`; for the rest we fall through to the top-level help.
-    if len(sys.argv) >= 3 and sys.argv[2] in ("-h", "--help") and sys.argv[1] in _HELP_BLOCKS:
-        _print_subcmd_help(sys.argv[1])
-        return
+    # `graphify <cmd> --help` (short, lap-27 #5) or `<cmd> --help-long`
+    # (full). Without this branch, `--help` is parsed as a navigate op
+    # and errors; common subcommands have entries in `_HELP_BLOCKS`.
+    if len(sys.argv) >= 3 and sys.argv[1] in _HELP_BLOCKS:
+        if sys.argv[2] in ("-h", "--help"):
+            _print_subcmd_help(sys.argv[1], long=False)
+            return
+        if sys.argv[2] == "--help-long":
+            _print_subcmd_help(sys.argv[1], long=True)
+            return
 
     if len(sys.argv) < 2 or sys.argv[1] in ("-h", "--help"):
+        # Lap-27 #5: short by default. Cold-start agents reach for
+        # verb names, not flag dumps; --help-long stays available
+        # below for the times an agent commits to one call.
+        _print_top_help_short()
+        return
+
+    if sys.argv[1] == "--help-long":
         print("Usage: graphify <command>")
         print()
         # Lap-21 #4 (sub-agent head-to-head): document the win/lose

@@ -1816,6 +1816,91 @@ def _write_graph(graph_dir, nodes, links):
          "nodes": nodes, "links": links}), encoding="utf-8")
 
 
+def test_top_level_help_is_short_by_default(tmp_path):
+    """Lap-27 #5: `graphify --help` defaults to a short summary —
+    one-line-per-verb, no flag dump. Cold-start agents reach for verb
+    names, not flags; the long form (~3K tokens) was making every
+    `--help` call expensive. Short form must (a) include all top-level
+    verb names, (b) NOT include verb-specific flags like --depth or
+    --include-inferred, (c) point to --help-long for the long form."""
+    import subprocess
+    res = subprocess.run(
+        ["graphify", "--help"],
+        capture_output=True, text=True, timeout=10,
+    )
+    assert res.returncode == 0
+    out = res.stdout
+    # All verb names present.
+    for verb in ("navigate", "peek", "shape", "doc", "blast", "locate",
+                 "summarize", "search", "path", "explain", "changed"):
+        assert verb in out, f"verb `{verb}` missing from short help:\n{out}"
+    # Flag dump suppressed.
+    for flag in ("--depth", "--include-inferred", "--bodies", "--node-kind",
+                 "--explain-cost"):
+        assert flag not in out, (
+            f"short help should not include `{flag}` (use --help-long):\n{out}"
+        )
+    # Discoverability of --help-long.
+    assert "--help-long" in out, (
+        f"short help must point to --help-long:\n{out}"
+    )
+
+
+def test_top_level_help_long_includes_flags(tmp_path):
+    """Lap-27 #5: `graphify --help-long` keeps the existing full reference —
+    flags, decision rule, examples. The short form is the new default;
+    the long form is the escape hatch."""
+    import subprocess
+    res = subprocess.run(
+        ["graphify", "--help-long"],
+        capture_output=True, text=True, timeout=10,
+    )
+    assert res.returncode == 0
+    out = res.stdout
+    # Verb-specific flags appear.
+    for flag in ("--depth", "--include-inferred", "--bodies", "--node-kind"):
+        assert flag in out, f"long help should include `{flag}`:\n{out[:500]}"
+    # Decision rule is part of the long form (lap-21 sub-agent feedback).
+    assert "When to use graphify vs Read" in out
+
+
+def test_subcmd_help_is_short_by_default(tmp_path):
+    """Lap-27 #5: `graphify peek --help` should print the signature line
+    only, not the full flag block. Agents already know they want peek;
+    they need the shape, not every option."""
+    import subprocess
+    res = subprocess.run(
+        ["graphify", "peek", "--help"],
+        capture_output=True, text=True, timeout=10,
+    )
+    assert res.returncode == 0
+    out = res.stdout
+    assert "peek <symbol>" in out
+    # Flags should NOT appear in the short form.
+    assert "--lines" not in out, (
+        f"short subcmd help should omit flags:\n{out}"
+    )
+    assert "--no-docstring" not in out
+    # Pointer to long form.
+    assert "peek --help-long" in out
+
+
+def test_subcmd_help_long_keeps_flags(tmp_path):
+    """Lap-27 #5: `graphify peek --help-long` preserves the existing
+    full flag block — discoverable for agents who actually need to
+    pick a flag."""
+    import subprocess
+    res = subprocess.run(
+        ["graphify", "peek", "--help-long"],
+        capture_output=True, text=True, timeout=10,
+    )
+    assert res.returncode == 0
+    out = res.stdout
+    assert "peek <symbol>" in out
+    assert "--lines" in out
+    assert "--no-docstring" in out
+
+
 def test_dependents_alias_routes_through_calls(tmp_path, monkeypatch):
     """Lap-11: `dependents` is sugar for transitive callers (in --kind=calls
     --depth=3). Two-hop call chain should surface as a single dependents
