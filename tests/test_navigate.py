@@ -5385,6 +5385,74 @@ def test_shape_file_limit_and_all(tmp_path, monkeypatch):
     assert len(full["class_labels"]) == 20, full
 
 
+def test_shape_multi_target_renders_each_file(tmp_path, monkeypatch):
+    """Lap-27 (sub-agent dispatch corpus): `graphify shape <f1> <f2>`
+    runs shape on each and emits a section per file. Closes the
+    `find -name "fileA" -o -name "fileB"` + per-file shape pattern.
+    """
+    import subprocess
+    nodes = [
+        {"id": "fa", "label": "alpha.py", "file_type": "code",
+         "source_file": str(tmp_path / "alpha.py"), "source_location": "L1",
+         "node_kind": "file"},
+        {"id": "ca", "label": "Alpha", "file_type": "code",
+         "source_file": str(tmp_path / "alpha.py"), "source_location": "L1",
+         "node_kind": "class"},
+        {"id": "fb", "label": "beta.py", "file_type": "code",
+         "source_file": str(tmp_path / "beta.py"), "source_location": "L1",
+         "node_kind": "file"},
+        {"id": "cb", "label": "Beta", "file_type": "code",
+         "source_file": str(tmp_path / "beta.py"), "source_location": "L1",
+         "node_kind": "class"},
+    ]
+    links = [
+        {"source": "fa", "target": "ca", "relation": "contains",
+         "confidence": "EXTRACTED"},
+        {"source": "fb", "target": "cb", "relation": "contains",
+         "confidence": "EXTRACTED"},
+    ]
+    _write_graph(tmp_path / "graphify-out", nodes, links)
+    (tmp_path / "alpha.py").write_text("class Alpha:\n    pass\n")
+    (tmp_path / "beta.py").write_text("class Beta:\n    pass\n")
+    monkeypatch.chdir(tmp_path)
+    res = subprocess.run(
+        ["python", "-m", "graphify", "shape", "alpha.py", "beta.py"],
+        capture_output=True, text=True, cwd=str(tmp_path), timeout=15,
+    )
+    assert res.returncode == 0, f"multi-shape failed: {res.stderr}"
+    out = res.stdout
+    assert "Alpha" in out, f"alpha.py shape missing:\n{out}"
+    assert "Beta" in out, f"beta.py shape missing:\n{out}"
+    # Section header naming each target so the agent can navigate the
+    # combined output without mis-attributing classes/fns.
+    assert "alpha.py" in out and "beta.py" in out
+
+
+def test_shape_brace_expand_multi_target(tmp_path, monkeypatch):
+    """Lap-27: `shape {f1,f2,f3}` brace-expands like peek/blast/doc do.
+    Same _expand_brace_multi_target helper covers the pattern."""
+    import subprocess
+    nodes = [
+        {"id": "fa", "label": "alpha.py", "file_type": "code",
+         "source_file": str(tmp_path / "alpha.py"), "source_location": "L1",
+         "node_kind": "file"},
+        {"id": "fb", "label": "beta.py", "file_type": "code",
+         "source_file": str(tmp_path / "beta.py"), "source_location": "L1",
+         "node_kind": "file"},
+    ]
+    _write_graph(tmp_path / "graphify-out", nodes, [])
+    (tmp_path / "alpha.py").write_text("# alpha\n")
+    (tmp_path / "beta.py").write_text("# beta\n")
+    monkeypatch.chdir(tmp_path)
+    res = subprocess.run(
+        ["python", "-m", "graphify", "shape", "{alpha,beta}.py"],
+        capture_output=True, text=True, cwd=str(tmp_path), timeout=15,
+    )
+    assert res.returncode == 0, f"brace-expand shape failed: {res.stderr}"
+    out = res.stdout
+    assert "alpha.py" in out and "beta.py" in out
+
+
 def test_doc_node_emits_signature_and_rationale(tmp_path, monkeypatch):
     """`doc_node` walks rationale_for edges and emits sig + docstring(s).
     Reporter wish: skip the manual symbol → method → docstring pivot."""

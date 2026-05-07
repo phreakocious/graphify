@@ -120,12 +120,13 @@ _HELP_BLOCKS: dict[str, list[str]] = {
         "    Brace-expand `doc @Class.{m1,m2,m3}` to dump signatures + docstrings for several methods in one call (mirrors multi-peek/multi-blast). Misses print inline; exit 1 only when every target misses.",
     ],
     "shape": [
-        "  shape <file>            file structure summary: N classes / M fns / K consts / X imports / longest fn — orientation without committing to a `contains` pivot",
+        "  shape <file> [<file> ...]   file structure summary: N classes / M fns / K consts / X imports / longest fn — orientation without committing to a `contains` pivot",
         "    --limit N               max class/fn names listed in the summary (default 8; the `+N more` tail still surfaces what was truncated)",
         "    --all                   list every class/fn name (no truncation; pairs well with `shape large_file.ts --all` when you already know the file is the target)",
-        "    --json                  structured JSON output",
+        "    --json                  structured JSON output (single target: dict; multi: list of dicts)",
         "    --graph <path>          path to graph.json (default graphify-out/graph.json)",
         "    Resolves the same as `peek` (path-qualified, fuzzy fallback). Errors if target isn't a file.",
+        "    Multi-target: `shape f1.py f2.py f3.py` runs shape on each and emits one section per file. Brace-expand `shape {f1,f2,f3}.py` is supported (mirrors peek/blast/doc). Misses print inline; exit 1 only when every target misses.",
     ],
     "search": [
         "  search <pattern>        body-text grep across nodes — return hits with symbol context (label, file:line, container, community, degree)",
@@ -3792,7 +3793,12 @@ def main() -> None:
         from graphify.analyze import _is_file_node
         args = sys.argv[2:]
         graph_path = DEFAULT_GRAPH_PATH
-        target: str | None = None
+        # Lap-27 (sub-agent dispatch corpus): shape now accepts multiple
+        # targets — `shape f1.py f2.py` runs shape on each and emits one
+        # section per file. Closes the `find -o -name + per-file shape`
+        # pattern. Brace-expand `shape @Class.{m1,m2,m3}` follows the
+        # peek/blast/doc convention via _expand_brace_multi_target.
+        targets: list[str] = []
         fmt = "text"
         # Default 8: a one-screen summary keeps shape useful as a cold-start
         # primitive. `--limit N` widens; `--all` returns the full lists.
@@ -3812,14 +3818,11 @@ def main() -> None:
                 shape_limit = max(1, int(args[i + 1])); i += 2
             elif a.startswith("--limit="):
                 shape_limit = max(1, int(a.split("=", 1)[1])); i += 1
-            elif target is None:
-                target = a; i += 1
             else:
-                print(f"warning: ignoring extra arg `{a}`. shape takes a single target.",
-                      file=sys.stderr)
-                i += 1
-        if not target:
-            print("Usage: graphify shape <file> [--limit N | --all] [--json] [--graph PATH]",
+                targets.append(a); i += 1
+        if not targets:
+            print("Usage: graphify shape <file> [<file> ...] "
+                  "[--limit N | --all] [--json] [--graph PATH]",
                   file=sys.stderr)
             sys.exit(1)
         gp = Path(graph_path)
@@ -3827,33 +3830,64 @@ def main() -> None:
             print(f"error: graph not found at {gp}. run `graphify update <path>` first.",
                   file=sys.stderr)
             sys.exit(1)
+        # Brace-expand each positional. A bare `shape file.py` returns
+        # ["file.py"]; `shape {a,b}.py` returns ["a.py", "b.py"]. Multi
+        # positional + brace-expand compose: `shape a.py {b,c}.py` →
+        # ["a.py", "b.py", "c.py"].
+        expanded: list[str] = []
+        for t in targets:
+            expanded.extend(_expand_brace_multi_target(t))
+        targets = expanded
+        multi = len(targets) > 1
+        # JSON output for multi-target packs results into a list so the
+        # consumer can iterate; single target keeps the prior dict shape
+        # for backwards compat.
+        json_results: list[dict] = []
         G, _comm = load_graph(gp)
         idx = label_index(G)
-        chosen, candidates, match_type, _alts = resolve_focus(G, idx, target)
-        if not chosen:
-            if candidates:
-                print(f"ambiguous `{target}` ({len(candidates)} matches). "
-                      f"qualify with @<dir>/<file>:", file=sys.stderr)
-                for nid in candidates[:8]:
-                    a = G.nodes[nid]
-                    sf = a.get("source_file", "?")
-                    print(f"  {a.get('label', nid)}  {sf}", file=sys.stderr)
-                sys.exit(1)
-            print(f"no node matches `{target}`.", file=sys.stderr)
-            sys.exit(1)
-        if not _is_file_node(G, chosen):
-            # `shape` only makes sense on a file. If the agent landed on
-            # a class/fn, redirect to the file containing it.
-            sf = G.nodes[chosen].get("source_file")
-            print(f"error: `{target}` resolved to {G.nodes[chosen].get('label', chosen)} "
-                  f"(not a file). try `graphify shape \"@{sf}\"` if you meant the file.",
-                  file=sys.stderr)
-            sys.exit(1)
-        data = shape_file(G, chosen, limit=shape_limit)
+        any_ok = False
+        for ti, target in enumerate(targets):
+            if multi and fmt == "text":
+                if ti > 0:
+                    print()
+                print(f"# [{ti+1}/{len(targets)}] shape: {target}")
+            chosen, candidates, match_type, _alts = resolve_focus(G, idx, target)
+            if not chosen:
+                if candidates:
+                    print(f"ambiguous `{target}` ({len(candidates)} matches). "
+                          f"qualify with @<dir>/<file>:", file=sys.stderr)
+                    for nid in candidates[:8]:
+                        a = G.nodes[nid]
+                        sf = a.get("source_file", "?")
+                        print(f"  {a.get('label', nid)}  {sf}", file=sys.stderr)
+                else:
+                    print(f"no node matches `{target}`.", file=sys.stderr)
+                if not multi:
+                    sys.exit(1)
+                continue
+            if not _is_file_node(G, chosen):
+                # `shape` only makes sense on a file. If the agent landed on
+                # a class/fn, redirect to the file containing it.
+                sf = G.nodes[chosen].get("source_file")
+                print(f"error: `{target}` resolved to "
+                      f"{G.nodes[chosen].get('label', chosen)} "
+                      f"(not a file). try `graphify shape \"@{sf}\"` "
+                      f"if you meant the file.", file=sys.stderr)
+                if not multi:
+                    sys.exit(1)
+                continue
+            any_ok = True
+            data = shape_file(G, chosen, limit=shape_limit)
+            if fmt == "json":
+                json_results.append(data)
+            else:
+                print(_render_shape_text(data))
         if fmt == "json":
-            print(json.dumps(data))
-        else:
-            print(_render_shape_text(data))
+            # Single target: emit the dict for back-compat. Multi: list.
+            print(json.dumps(json_results[0] if len(json_results) == 1
+                             else json_results))
+        if not any_ok:
+            sys.exit(1)
 
     elif cmd == "search":
         # Body-text search across nodes. Walks each non-archived code-file,
