@@ -128,6 +128,11 @@ def load_graph(graph_path: str | Path,
     `freshness_check=False` to suppress (tests, CI, machine pipelines).
     """
     path = Path(graph_path)
+    # Lap-27 #9: stamp "graphify CLI was used" so the PreToolUse hook
+    # can suppress its nudge while the agent is in the graphify flow.
+    # Best-effort; runs on every load (cache hit AND miss) so the agent
+    # gets credit even when the load is a 10ms pickle hit.
+    _touch_cli_stamp(path)
     cached = load_graph_pickle(path)
     if cached is not None:
         G, communities = cached
@@ -314,8 +319,37 @@ def _has_chainable_outcome(data: dict | None) -> bool:
 
 RECENT_PATHS_DIR = ".session"
 RECENT_PATHS_FILE = "recent-paths"
-RECENT_PATHS_TTL = 600          # 10 minutes
+# Lap-27 #9: bumped 600 → 1800. The read side (in the PreToolUse hook)
+# uses this same window to decide "did graphify recently touch this
+# file?" — 10 minutes was short enough that a long debugging session
+# would re-nudge on the same file the agent had already navigated to.
+# The MAX cap (200 entries) bounds the file size regardless of TTL.
+RECENT_PATHS_TTL = 1800         # 30 minutes
 RECENT_PATHS_MAX = 200
+# Lap-27 #9: every CLI graph-load updates this stamp. The hook reads
+# the mtime to decide whether graphify was used recently; if so, the
+# nudge is silenced (the agent is already in the flow). Lives next to
+# recent-paths under graphify-out/.session/.
+CLI_STAMP_FILE = "cli-stamp"
+
+
+def _touch_cli_stamp(gpath: Path) -> None:
+    """Touch graphify-out/.session/cli-stamp so the PreToolUse hook can
+    tell that graphify was used recently. Best-effort — failures are
+    swallowed because an absent / unwriteable stamp just means the
+    hook won't get the suppression signal (one extra nudge, not a
+    correctness bug).
+    """
+    target = gpath.parent / RECENT_PATHS_DIR / CLI_STAMP_FILE
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        # Write the timestamp as text so the hook can read it without
+        # depending on filesystem mtime semantics (some CI / Docker
+        # filesystems round mtime to 1s, which is fine here, but a text
+        # value is also debuggable by `cat`).
+        target.write_text(f"{time.time():.0f}\n", encoding="utf-8")
+    except OSError:
+        return
 
 
 def _record_session_paths(gpath: Path, source_files: set[str]) -> None:

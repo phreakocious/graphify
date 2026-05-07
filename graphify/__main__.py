@@ -291,6 +291,210 @@ _SETTINGS_HOOK = {
     ],
 }
 
+
+# --- PreToolUse hook handler ---------------------------------------------
+
+# Lap-27 #9 anti-spam guardrails. The hook is invoked by Claude Code on
+# every Read / Glob / Grep — without these gates the same nudge text fires
+# dozens of times per session, conditioning the agent to filter it out.
+# Each gate is conservative (false-positive cheap; one extra silent call is
+# fine) and they stack so a single positive signal kills the nudge.
+_HOOK_QUIET_ENV = "GRAPHIFY_HOOK_QUIET"
+# Recent CLI use TTL: how long after a graphify command finishes does the
+# hook stay silent. 5 min keeps the lid on while an agent is actively
+# pivoting; longer would hide the nudge from agents who briefly used
+# graphify and then drifted back to raw Read.
+_HOOK_RECENT_USE_TTL = 5 * 60
+# Read-side TTL for the recent-paths log. Bumped from 600 to 1800 (30 min)
+# in lap-27 #9 to match navigate.RECENT_PATHS_TTL — the navigate-side
+# write keeps lines for 30 min, and reading with a shorter window
+# accidentally re-nudges on files that navigate had already surfaced
+# 11-30 min ago.
+_HOOK_RECENT_PATHS_TTL = 30 * 60
+# File-size floor: don't nudge for tiny files. graphify's value prop is
+# "scout structure cheaper than reading" — a 50-line module is already
+# read-cheap and the agent doesn't need orientation. 8 KB ≈ 100-150 lines
+# of typical code; raises the bar for the nudge on small reads.
+_HOOK_MIN_FILE_BYTES = 8 * 1024
+# Source-code extensions the nudge applies to. Mirror of
+# graphify.detect.CODE_EXTENSIONS — kept inline so the hook stays
+# stdlib-only (importing detect pulls in the rest of the package).
+# Update both lists if either changes.
+_HOOK_CODE_EXTS = frozenset({
+    ".py", ".ts", ".js", ".jsx", ".tsx", ".mjs", ".ejs", ".go",
+    ".rs", ".java", ".cpp", ".cc", ".cxx", ".c", ".h", ".hpp",
+    ".rb", ".swift", ".kt", ".kts", ".cs", ".scala", ".php",
+    ".lua", ".toc", ".zig", ".ps1", ".ex", ".exs", ".m", ".mm",
+    ".jl", ".vue", ".svelte", ".dart", ".v", ".sv",
+})
+
+
+def _handle_pretool_hook(payload: dict, root: Path) -> dict | None:
+    """Decide whether to emit the navigate-nudge for one PreToolUse event.
+
+    Returns the JSON output dict on fire, None to suppress. `root` is the
+    project root (where `graphify-out/` lives). Tested directly via
+    test_hooks.py — no subprocess needed.
+
+    Gates (any one suppresses):
+      1. `GRAPHIFY_HOOK_QUIET` env var set → silent.
+      2. graphify CLI was used in the last `_HOOK_RECENT_USE_TTL` sec →
+         silent (the agent is already in the flow).
+      3. Tool isn't Read/Glob/Grep → silent (matcher should already prevent
+         this, but defense-in-depth).
+      4. Read-specific:
+           a. file extension isn't in `_HOOK_CODE_EXTS` → silent.
+           b. file lives under `graphify-out/` → silent.
+           c. file size < `_HOOK_MIN_FILE_BYTES` → silent (small files
+              don't benefit from orientation).
+           d. file is in the recent-paths log within
+              `_HOOK_RECENT_PATHS_TTL` → silent (already navigated /
+              already nudged-on).
+
+    Side effect on fire (Read only): append (timestamp, real_path) to
+    recent-paths so subsequent reads of the same file are quiet.
+    """
+    import os
+    import os.path as _osp
+    import time as _t
+
+    if os.environ.get(_HOOK_QUIET_ENV, "").strip() not in ("", "0", "false", "False"):
+        return None
+
+    tool = payload.get("tool_name") or ""
+    if tool not in ("Read", "Glob", "Grep"):
+        return None
+
+    session_dir = root / "graphify-out" / ".session"
+    cli_stamp = session_dir / "cli-stamp"
+    now = _t.time()
+
+    # Recent CLI use suppression — applies to all three tool types.
+    try:
+        if cli_stamp.exists():
+            try:
+                stamp_ts = float(cli_stamp.read_text(encoding="utf-8").strip())
+            except (OSError, ValueError):
+                stamp_ts = cli_stamp.stat().st_mtime
+            if now - stamp_ts <= _HOOK_RECENT_USE_TTL:
+                return None
+    except OSError:
+        pass
+
+    inp = payload.get("tool_input") or {}
+    fp = (inp.get("file_path") or "").strip()
+
+    if tool == "Read":
+        ext = _osp.splitext(fp)[1].lower()
+        if ext not in _HOOK_CODE_EXTS:
+            return None
+        if "graphify-out/" in fp:
+            return None
+        # File-size floor: skip the nudge on small files. Stat may fail
+        # (file outside graph cwd, permissions); on any error fall through
+        # to the nudge so we don't silently drop legitimate cases.
+        try:
+            if Path(fp).stat().st_size < _HOOK_MIN_FILE_BYTES:
+                return None
+        except OSError:
+            pass
+        # Per-file dedup via the navigate recent-paths log. Both sides
+        # realpath because macOS aliases /tmp → /private/tmp; raw abspath
+        # would miss.
+        recent_log = session_dir / "recent-paths"
+        target = ""
+        try:
+            target = _osp.realpath(fp) if fp else ""
+        except OSError:
+            target = fp
+        if recent_log.exists():
+            try:
+                for line in recent_log.read_text(encoding="utf-8").splitlines():
+                    ts_str, _, path = line.partition("\t")
+                    try:
+                        if now - float(ts_str) > _HOOK_RECENT_PATHS_TTL:
+                            continue
+                    except ValueError:
+                        continue
+                    if path and target and path == target:
+                        return None
+            except OSError:
+                pass
+
+    msg = (
+        "graphify-out/graph.json exists. Before reading/grepping "
+        "unfamiliar code, scout it cheaper: `graphify navigate "
+        "\"@<symbol>\"` returns a dense affordance frame (~200 tok). "
+        "Then pivot with in/out/methods/coc/parent/[N], or jump to "
+        "file:line once a node is load-bearing. See "
+        "~/.claude/skills/graphify/SKILL.md."
+    )
+    # Staleness banner: piggybacks on the same fire when the graph is
+    # conspicuously behind the working tree. Per-30min stamp prevents
+    # banner-spam without affecting the main nudge cadence.
+    try:
+        graph_p = root / "graphify-out" / "graph.json"
+        if graph_p.exists():
+            graph_age = now - graph_p.stat().st_mtime
+            if graph_age > 86400:  # > 1 day
+                stamp = session_dir / "banner-stamp"
+                last_banner = 0.0
+                if stamp.exists():
+                    try:
+                        last_banner = float(stamp.read_text().strip())
+                    except (OSError, ValueError):
+                        last_banner = 0.0
+                if now - last_banner > 1800:  # 30 min
+                    days = int(graph_age // 86400)
+                    days_str = (f"{days}d" if days >= 1
+                                else f"{int(graph_age // 3600)}h")
+                    banner = (f"⚠ graph was extracted {days_str} ago — "
+                              f"results may be stale. `graphify update .` "
+                              f"refreshes incrementally. ")
+                    msg = banner + msg
+                    try:
+                        stamp.parent.mkdir(parents=True, exist_ok=True)
+                        stamp.write_text(f"{now:.0f}", encoding="utf-8")
+                    except OSError:
+                        pass
+    except Exception:
+        pass
+
+    # Dedup-on-fire: write this Read's path into recent-paths so the same
+    # file doesn't re-nudge within the TTL. Best-effort — failure here just
+    # means a possible repeat nudge, not a correctness bug.
+    if tool == "Read" and fp:
+        try:
+            session_dir.mkdir(parents=True, exist_ok=True)
+            recent_log = session_dir / "recent-paths"
+            try:
+                target = _osp.realpath(fp)
+            except OSError:
+                target = fp
+            existing: list[str] = []
+            if recent_log.exists():
+                try:
+                    existing = recent_log.read_text(encoding="utf-8").splitlines()
+                except OSError:
+                    existing = []
+            existing = [
+                line for line in existing
+                if line.partition("\t")[2] != target
+            ]
+            existing.append(f"{now:.0f}\t{target}")
+            # Cap matches RECENT_PATHS_MAX in navigate.py.
+            if len(existing) > 200:
+                existing = existing[-200:]
+            recent_log.write_text("\n".join(existing) + "\n",
+                                  encoding="utf-8")
+        except OSError:
+            pass
+
+    return {"hookSpecificOutput": {
+        "hookEventName": "PreToolUse",
+        "additionalContext": msg,
+    }}
+
 _SKILL_REGISTRATION = (
     "\n# graphify\n"
     "- **graphify** (`~/.claude/skills/graphify/SKILL.md`) "
@@ -1602,101 +1806,15 @@ def main() -> None:
 
     cmd = sys.argv[1]
     if cmd == "_hook":
-        # PreToolUse hook handler — read JSON tool call on stdin, decide
-        # whether to emit the navigate-nudge. Suppresses on non-code Read
-        # because graphify only indexes source; nudging on a .md/.json/.yaml
-        # read is noise. Glob and Grep stay un-gated since both search code.
-        # Stdlib-only and quick-return so the hook adds minimal latency.
-        import os.path as _osp
+        # PreToolUse hook handler — delegate to a testable function so
+        # the gating logic can be unit-tested without a subprocess.
         try:
             payload = json.loads(sys.stdin.read() or "{}")
         except Exception:
             return
-        tool = payload.get("tool_name") or ""
-        inp = payload.get("tool_input") or {}
-        fp = (inp.get("file_path") or "").strip()
-        if tool == "Read":
-            ext = _osp.splitext(fp)[1].lower()
-            # Mirror of graphify.detect.CODE_EXTENSIONS — kept inline so the
-            # hook stays stdlib-only (importing detect pulls in the rest of
-            # the package). Update both lists if either changes.
-            CODE_EXTS = {
-                ".py", ".ts", ".js", ".jsx", ".tsx", ".mjs", ".ejs", ".go",
-                ".rs", ".java", ".cpp", ".cc", ".cxx", ".c", ".h", ".hpp",
-                ".rb", ".swift", ".kt", ".kts", ".cs", ".scala", ".php",
-                ".lua", ".toc", ".zig", ".ps1", ".ex", ".exs", ".m", ".mm",
-                ".jl", ".vue", ".svelte", ".dart", ".v", ".sv",
-            }
-            if ext not in CODE_EXTS:
-                return
-            # Reading our own report → no nudge needed
-            if "graphify-out/" in fp:
-                return
-            # Lap-3: suppress the nudge if the file was just surfaced by a
-            # graphify navigate call. The session log is written by
-            # navigate._record_session_paths and lives alongside graph.json.
-            # Both sides are realpath'd because macOS aliases /tmp →
-            # /private/tmp; raw abspath wouldn't match.
-            try:
-                import time as _t
-                recent_log = Path("graphify-out/.session/recent-paths")
-                if recent_log.exists():
-                    now = _t.time()
-                    target = _osp.realpath(fp) if fp else ""
-                    for line in recent_log.read_text(encoding="utf-8").splitlines():
-                        ts_str, _, path = line.partition("\t")
-                        try:
-                            if now - float(ts_str) > 600:
-                                continue
-                        except ValueError:
-                            continue
-                        if path and target and path == target:
-                            return
-            except Exception:
-                pass
-        msg = (
-            "graphify-out/graph.json exists. Before reading/grepping "
-            "unfamiliar code, scout it cheaper: `graphify navigate "
-            "\"@<symbol>\"` returns a dense affordance frame (~200 tok). "
-            "Then pivot with in/out/methods/coc/parent/[N], or jump to "
-            "file:line once a node is load-bearing. See "
-            "~/.claude/skills/graphify/SKILL.md."
-        )
-        # Lap-3: one-shot staleness banner when the graph is conspicuously
-        # behind the working tree. Stamp file rate-limits to one banner per
-        # 30min so it doesn't piggyback on every code read.
-        try:
-            import time as _t
-            graph_p = Path("graphify-out/graph.json")
-            if graph_p.exists():
-                now = _t.time()
-                graph_age = now - graph_p.stat().st_mtime
-                if graph_age > 86400:  # > 1 day
-                    stamp = Path("graphify-out/.session/banner-stamp")
-                    last_banner = 0.0
-                    if stamp.exists():
-                        try:
-                            last_banner = float(stamp.read_text().strip())
-                        except (OSError, ValueError):
-                            last_banner = 0.0
-                    if now - last_banner > 1800:  # 30min
-                        days = int(graph_age // 86400)
-                        days_str = f"{days}d" if days >= 1 else f"{int(graph_age // 3600)}h"
-                        banner = (f"⚠ graph was extracted {days_str} ago — "
-                                  f"results may be stale. `graphify update .` "
-                                  f"refreshes incrementally. ")
-                        msg = banner + msg
-                        try:
-                            stamp.parent.mkdir(parents=True, exist_ok=True)
-                            stamp.write_text(f"{now:.0f}", encoding="utf-8")
-                        except OSError:
-                            pass
-        except Exception:
-            pass
-        out_payload = {"hookSpecificOutput": {
-            "hookEventName": "PreToolUse",
-            "additionalContext": msg,
-        }}
+        out_payload = _handle_pretool_hook(payload, Path("."))
+        if out_payload is None:
+            return
         sys.stdout.write(json.dumps(out_payload))
         return
     if cmd == "install":
