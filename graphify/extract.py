@@ -33,9 +33,19 @@ from .cache import load_cached, save_cached
 #          on real file nodes (+67% edges on a 1873-file SvelteKit project
 #          per upstream validation). Per-file cached results encode which
 #          import targets resolved, so a bump is required to refresh.
+#   "v4" — lap-27 closure-shorthand detection. Function nodes referenced
+#          via JS/TS object-literal property shorthand (`return { name }`,
+#          `const obj = { foo }`) are stamped with `closure_exposed=True`.
+#          The cross-file resolver allows member-expression linking
+#          (`obj.foo()`) ONLY for unique closure-exposed targets — closes
+#          the lap-9 closure-method link without re-introducing the
+#          phantom-god failure mode 58199eb prevented (`function log()`
+#          collapsing every `Logger.log()` in the corpus). Per-file cached
+#          results lack the `closure_exposed` stamp on existing nodes, so
+#          a bump is required.
 # Note: lap-15's phantom-node resolution runs at MERGE time over the
 # combined per-file results, so it fires on cached output too — no bump.
-AST_CACHE_VERSION = "v3"
+AST_CACHE_VERSION = "v4"
 
 
 # AST node types that represent a member-expression callee
@@ -1022,6 +1032,26 @@ def _extract_generic(path: Path, config: LanguageConfig) -> dict:
     edges: list[dict] = []
     seen_ids: set[str] = set()
     function_bodies: list[tuple[str, object]] = []
+    # Lap-27 (closure-shorthand fix): pre-collect names referenced via
+    # JS/TS object-literal property shorthand (`{ name }` in object
+    # expressions or return statements). Functions whose name appears
+    # in this set are stamped `closure_exposed=True` by `add_node`; the
+    # cross-file resolver uses that flag to gate member-expression
+    # linking — `obj.name()` resolves to a unique closure-exposed
+    # function (closes the lap-9 factory pattern) without recreating
+    # the phantom-god failure mode 58199eb prevented (every
+    # `Logger.log(...)` collapsing onto a one-off `function log(...)`).
+    # Tree-sitter node type `shorthand_property_identifier` is
+    # JS/TS-specific; other languages don't have this AST node, so the
+    # set stays empty for them.
+    closure_shorthand_names: set[str] = set()
+
+    def _collect_shorthand(n) -> None:
+        if n.type == "shorthand_property_identifier":
+            closure_shorthand_names.add(_read_text(n, source))
+        for c in n.children:
+            _collect_shorthand(c)
+    _collect_shorthand(root)
     # Parallel list capturing the full function/class declaration node
     # (not just its body) so the TS type-ref pass can walk param types,
     # return types, generic constraints, and extends/implements clauses.
@@ -1067,6 +1097,15 @@ def _extract_generic(path: Path, config: LanguageConfig) -> dict:
             if kind:
                 attrs["node_kind"] = kind
                 nid_to_kind[nid] = kind
+            # Lap-27 closure-shorthand stamp. The label here looks like
+            # `name()` for functions, `name` for classes/consts; strip
+            # the `()` suffix to compare against shorthand names. Only
+            # function-shaped labels matter for the cross-file gate
+            # (member-expression calls target callables), but stamping
+            # all matches keeps the data uniform.
+            bare = label.rstrip("()") if label.endswith("()") else label
+            if bare and bare in closure_shorthand_names:
+                attrs["closure_exposed"] = True
             nodes.append(attrs)
 
     def add_edge(src: str, tgt: str, relation: str, line: int,
@@ -3894,16 +3933,12 @@ def extract(paths: list[Path], cache_root: Path | None = None) -> dict:
             global_labels_by_name.setdefault(normalised.lower(), []).append(n["id"])
 
     existing_pairs = {(e["source"], e["target"]) for e in all_edges}
+    # Lap-27 closure-shorthand fix: lookup target attrs by id so the
+    # member-expression gate can inspect `closure_exposed` on the
+    # candidate before allowing the cross-file link.
+    nodes_by_id = {n["id"]: n for n in all_nodes}
     for result in per_file:
         for rc in result.get("raw_calls", []):
-            # Member-expression callees (`x.foo()`, `obj.bar()`, `Pkg::baz()`)
-            # cannot be safely resolved by bare property name across files —
-            # without receiver-type analysis we routinely link them to the
-            # wrong target, producing phantom god nodes (e.g. every
-            # `Logger.log(...)` call collapsing onto a one-off
-            # `function log(...)` defined in a smoke-test script).
-            if rc.get("callee_node_type") in _MEMBER_CALL_NODE_TYPES:
-                continue
             callee = rc.get("callee", "")
             if not callee:
                 continue
@@ -3911,7 +3946,33 @@ def extract(paths: list[Path], cache_root: Path | None = None) -> dict:
             caller = rc["caller_nid"]
             if not candidates:
                 continue
-            if len(candidates) == 1:
+            is_member_call = rc.get("callee_node_type") in _MEMBER_CALL_NODE_TYPES
+            if is_member_call:
+                # Member-expression callees (`x.foo()`, `obj.bar()`, `Pkg::baz()`)
+                # cannot be safely resolved by bare property name across files
+                # — without receiver-type analysis we routinely link them to
+                # the wrong target, producing phantom god nodes (every
+                # `Logger.log(...)` collapsing onto a one-off
+                # `function log(...)` from a smoke-test script).
+                #
+                # Lap-27 closure-shorthand fix: allow the link ONLY when the
+                # callee resolves to a SINGLE candidate AND that candidate
+                # was `closure_exposed` (referenced via JS/TS object-literal
+                # property shorthand `{ name }` in its defining file). The
+                # closure pattern is the lap-9 factory shape — `function f()
+                # {} ; return { f }` — where `obj.f()` callers from other
+                # files are genuinely calling that function. Phantom-god
+                # names like `log` typically collide on multiple candidates
+                # (or aren't shorthand-exposed) so this gate stays tight.
+                if len(candidates) != 1:
+                    continue
+                cand_attrs = nodes_by_id.get(candidates[0]) or {}
+                if not cand_attrs.get("closure_exposed"):
+                    continue
+                tgt = candidates[0]
+                confidence = "EXTRACTED"
+                confidence_score = 1.0
+            elif len(candidates) == 1:
                 tgt = candidates[0]
                 confidence = "EXTRACTED"
                 confidence_score = 1.0
