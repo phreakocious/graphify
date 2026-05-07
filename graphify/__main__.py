@@ -136,6 +136,8 @@ _HELP_BLOCKS: dict[str, list[str]] = {
         "    --limit N               max hits (default 50)",
         "    --context N             N lines of pre/post context around each match (default 1; pass 0 to disable)",
         "    --by-symbol             collapse same-symbol hits — one row per containing node with `×N (lines: ...)` (good for `where is X used?`)",
+        "    --files-only            grep -l analog: one row per file with match count + first match lines, no per-line snippets. Coarsest grouping; wins over --by-symbol if both set.",
+        "    --in-files <glob>       restrict the file scan to source_files matching this fnmatch glob. Patterns with `/` match the full path; bare patterns match basename. Closes the `grep -r --include=<glob>` pattern.",
         "    --idents                treat the pattern as an identifier; auto-OR all 5 casings (snake_case, kebab-case, camelCase, PascalCase, SCREAMING_SNAKE) with word-boundary anchors. Cuts the rename-audit OR by hand.",
         "    --md                    label rendered as `[label](file:line)` markdown link",
         "    --json                  structured JSON output",
@@ -3878,6 +3880,8 @@ def main() -> None:
         # disables context for callers who explicitly want minimal output.
         context = 1
         by_symbol = False
+        files_only = False
+        in_files: str | None = None
         md = False
         fmt = "text"
         # Lap-26: --idents auto-expands a single identifier into all 5
@@ -3912,6 +3916,12 @@ def main() -> None:
                 context = max(0, int(a.split("=", 1)[1])); i += 1
             elif a == "--by-symbol":
                 by_symbol = True; i += 1
+            elif a == "--files-only":
+                files_only = True; i += 1
+            elif a == "--in-files" and i + 1 < len(args):
+                in_files = args[i + 1]; i += 2
+            elif a.startswith("--in-files="):
+                in_files = a.split("=", 1)[1]; i += 1
             elif a == "--idents":
                 idents_mode = True; i += 1
             elif a == "--md":
@@ -3952,7 +3962,9 @@ def main() -> None:
         data = search_bodies(G, pattern, kind=kind,
                               archived_mode=archived_mode,
                               limit=limit, context=context,
-                              by_symbol=by_symbol)
+                              by_symbol=by_symbol,
+                              files_only=files_only,
+                              in_files=in_files)
         if fmt == "json":
             print(json.dumps(data))
         else:

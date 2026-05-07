@@ -5722,6 +5722,81 @@ def test_search_bodies_returns_hits_with_symbol_context(tmp_path, monkeypatch):
     )
 
 
+def test_search_files_only_collapses_to_one_row_per_file(tmp_path, monkeypatch):
+    """Lap-27: `search --files-only` is the grep -l analog — one row
+    per file with match count, no per-line content. Closes the
+    `grep -l "X" tests/*.py` pattern (agent wants 'which files
+    contain X' before deciding which to read).
+    """
+    from graphify.navigate import search_bodies, load_graph
+    (tmp_path / "a.py").write_text(
+        "def foo():\n    return spectral_coherence(1)\n"
+        "    spectral_coherence = 5\n"
+    )
+    (tmp_path / "b.py").write_text(
+        "spectral_coherence = 1\n"
+    )
+    (tmp_path / "c.py").write_text("nothing here\n")
+    nodes = [
+        {"id": "fa", "label": "a.py", "file_type": "code",
+         "source_file": str(tmp_path / "a.py"), "source_location": "L1",
+         "node_kind": "file"},
+        {"id": "fb", "label": "b.py", "file_type": "code",
+         "source_file": str(tmp_path / "b.py"), "source_location": "L1",
+         "node_kind": "file"},
+        {"id": "fc", "label": "c.py", "file_type": "code",
+         "source_file": str(tmp_path / "c.py"), "source_location": "L1",
+         "node_kind": "file"},
+        {"id": "foo", "label": "foo()", "file_type": "code",
+         "source_file": str(tmp_path / "a.py"), "source_location": "L1"},
+    ]
+    _write_graph(tmp_path / "graphify-out", nodes, [
+        {"source": "fa", "target": "foo", "relation": "contains",
+         "confidence": "EXTRACTED"},
+    ])
+    monkeypatch.chdir(tmp_path)
+    G, _comm = load_graph(tmp_path / "graphify-out" / "graph.json")
+    res = search_bodies(G, "spectral_coherence", files_only=True)
+    # One row per file, not per match line.
+    files = {h["source_file"] for h in res["hits"]}
+    assert len(res["hits"]) == 2, (
+        f"expected 2 file rows, got {len(res['hits'])}: {res['hits']}"
+    )
+    # a.py has 2 matches (lines 2, 3); b.py has 1.
+    by_file = {h["source_file"]: h for h in res["hits"]}
+    a_path = str(tmp_path / "a.py")
+    b_path = str(tmp_path / "b.py")
+    assert by_file[a_path]["match_count"] == 2
+    assert by_file[b_path]["match_count"] == 1
+
+
+def test_search_in_files_glob_filters_results(tmp_path, monkeypatch):
+    """Lap-27: `search --in-files <glob>` restricts results to source_files
+    matching the glob. Closes the `grep -r "X" --include="*test*.py"`
+    pattern."""
+    from graphify.navigate import search_bodies, load_graph
+    (tmp_path / "tests").mkdir()
+    (tmp_path / "tests" / "test_x.py").write_text("magic_token = 1\n")
+    (tmp_path / "src.py").write_text("magic_token = 2\n")
+    nodes = [
+        {"id": "ft", "label": "test_x.py", "file_type": "code",
+         "source_file": str(tmp_path / "tests" / "test_x.py"),
+         "source_location": "L1", "node_kind": "file"},
+        {"id": "fs", "label": "src.py", "file_type": "code",
+         "source_file": str(tmp_path / "src.py"), "source_location": "L1",
+         "node_kind": "file"},
+    ]
+    _write_graph(tmp_path / "graphify-out", nodes, [])
+    monkeypatch.chdir(tmp_path)
+    G, _comm = load_graph(tmp_path / "graphify-out" / "graph.json")
+    # Without filter: 2 hits. With filter: 1.
+    full = search_bodies(G, "magic_token")
+    assert full["total"] == 2, f"expected 2 unfiltered: {full['hits']}"
+    filtered = search_bodies(G, "magic_token", in_files="*test*.py")
+    assert filtered["total"] == 1
+    assert "test_x.py" in filtered["hits"][0]["source_file"]
+
+
 def test_search_bodies_substring_fallback_on_bad_regex(tmp_path, monkeypatch):
     """A pattern that fails `re.compile` (unbalanced paren etc.) should
     fall back to literal substring search and surface mode='substring'

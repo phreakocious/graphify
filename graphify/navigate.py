@@ -3095,7 +3095,9 @@ def search_bodies(G: nx.DiGraph,
                   archived_mode: str = "no",
                   limit: int = 50,
                   context: int = 0,
-                  by_symbol: bool = False) -> dict:
+                  by_symbol: bool = False,
+                  files_only: bool = False,
+                  in_files: str | None = None) -> dict:
     """Body-text search across all nodes that have source_file + source_location.
 
     Returns hits with the containing node's metadata (label, file:line,
@@ -3119,12 +3121,23 @@ def search_bodies(G: nx.DiGraph,
         per-line emission is right when you want every site; `--by-symbol`
         is right when "where is X used?" — e.g. 4 hits all inside
         `stagedDecode()` should read as 1 symbol with 4 lines.
+    `files_only`: lap-27 (grep -l analog). When True, collapse to one
+        row per source_file with `match_count` + `match_lines`. Useful
+        for "which files contain X" before deciding which to scout.
+        Mutually exclusive with `by_symbol`; if both set, `files_only`
+        wins (coarser grouping is the explicit ask).
+    `in_files`: lap-27. If set, restrict the file scan to source_files
+        matching this fnmatch glob. Patterns with `/` match the full
+        path; bare patterns match basename only. Closes the
+        `grep -r --include=<glob>` pattern.
 
     The pattern is compiled as a case-insensitive regex; on `re.error` we
     fall back to a literal case-insensitive substring match. The mode is
     surfaced in the result so the agent knows whether their `[(` would
     be treated as regex or substring.
     """
+    import fnmatch as _fnmatch
+    in_files_path_glob = bool(in_files and "/" in in_files)
     try:
         rx = re.compile(pattern, re.IGNORECASE)
         match_fn = rx.search
@@ -3152,6 +3165,10 @@ def search_bodies(G: nx.DiGraph,
             continue
         if archived_mode == "only" and not _is_archived_path(sf):
             continue
+        if in_files:
+            target = sf if in_files_path_glob else sf.rsplit("/", 1)[-1]
+            if not _fnmatch.fnmatch(target, in_files):
+                continue
         if not loc.startswith("L"):
             continue
         try:
@@ -3228,7 +3245,31 @@ def search_bodies(G: nx.DiGraph,
     hits.sort(key=_rank)
 
     grouped_total = 0
-    if by_symbol:
+    if files_only:
+        # Lap-27 (grep -l analog): collapse to one row per source_file.
+        # Coarser than by_symbol — useful when "which files contain X"
+        # is the question, before deciding which file to scout. Wins
+        # against `by_symbol` if both flags set (explicit ask is
+        # cheaper / coarser, so honor it).
+        by_path: dict[str, dict] = {}
+        for h in hits:
+            sf = h["source_file"]
+            if sf not in by_path:
+                rep = {
+                    "source_file": sf,
+                    "match_count": 1,
+                    "match_lines": [h["match_line"]],
+                    "snippet": h["snippet"],  # keep first match snippet for orientation
+                }
+                by_path[sf] = rep
+            else:
+                rep = by_path[sf]
+                rep["match_count"] += 1
+                if len(rep["match_lines"]) < 8:
+                    rep["match_lines"].append(h["match_line"])
+        grouped_total = len(hits) - len(by_path)
+        hits = list(by_path.values())
+    elif by_symbol:
         # Group hits by owner node id, preserving the rank order
         # established above. The representative per group is the
         # first-encountered hit (which keeps the smallest match_line
@@ -3265,6 +3306,8 @@ def search_bodies(G: nx.DiGraph,
         "files_scanned": files_scanned,
         "files_read_failed": files_read_failed,
         "by_symbol": by_symbol,
+        "files_only": files_only,
+        "in_files": in_files,
         "grouped": grouped_total,
     }
 
@@ -3287,14 +3330,23 @@ def _render_search_text(data: dict, *, md: bool = False) -> str:
     out: list[str] = []
     grouped = data.get("grouped", 0)
     by_symbol = data.get("by_symbol", False)
-    if by_symbol:
+    files_only = data.get("files_only", False)
+    in_files = data.get("in_files")
+    in_files_tag = f", in-files=`{in_files}`" if in_files else ""
+    if files_only:
+        # Lap-27 (grep -l analog): coarsest grouping. `total` post-collapse
+        # = file count; underlying line hits = total + grouped.
+        line_total = total + grouped
+        header = (f"  search /{pat}/ ({mode}, kind={kind}{in_files_tag}, "
+                  f"--files-only): {total} file(s) covering {line_total} line(s)")
+    elif by_symbol:
         # `total` post-grouping = symbol count; surface the underlying
         # line-hit total (= symbols + grouped) so the agent sees both.
         line_total = total + grouped
-        header = (f"  search /{pat}/ ({mode}, kind={kind}, --by-symbol): "
-                  f"{total} symbol(s) covering {line_total} line(s)")
+        header = (f"  search /{pat}/ ({mode}, kind={kind}{in_files_tag}, "
+                  f"--by-symbol): {total} symbol(s) covering {line_total} line(s)")
     else:
-        header = f"  search /{pat}/ ({mode}, kind={kind}): {total} hit(s)"
+        header = f"  search /{pat}/ ({mode}, kind={kind}{in_files_tag}): {total} hit(s)"
     if total == 0:
         if files_scanned == 0:
             return f"{header}  (no files scanned — graph may have no source-located nodes)"
@@ -3320,6 +3372,20 @@ def _render_search_text(data: dict, *, md: bool = False) -> str:
             f"or use --limit {grand_total} to see more"
         )
     out.append(header)
+
+    # Lap-27: files_only renders one row per file, no per-line snippets.
+    # Bail before the per-hit pipeline (which expects label/match_line).
+    if files_only:
+        for h in data["hits"]:
+            sf = h["source_file"]
+            count = h.get("match_count", 1)
+            lines = h.get("match_lines") or []
+            lines_str = ",".join(str(n) for n in lines[:5])
+            tail = ""
+            if len(lines) > 5:
+                tail = f",+{len(lines) - 5}"
+            out.append(f"    {sf}  ×{count}  (lines: {lines_str}{tail})")
+        return "\n".join(out)
 
     # File-letter table when files repeat.
     file_to_letter: dict[str, str] = {}
