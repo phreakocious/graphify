@@ -43,9 +43,17 @@ from .cache import load_cached, save_cached
 #          collapsing every `Logger.log()` in the corpus). Per-file cached
 #          results lack the `closure_exposed` stamp on existing nodes, so
 #          a bump is required.
+#   "v5" — lap-27 #1 Rust end-line stamping. `extract_rust` now emits
+#          `source_location: L<start>-<end>` for fns / impl methods /
+#          structs / enums / traits / impl blocks (was: bare `L<start>`).
+#          peek/doc/shape on .rs sources used to fall through to
+#          next-sibling-start logic for the body window — silently wrong
+#          on the last fn in a file (absorbed trailing module decls) and
+#          off-by-one on adjacent fns. Bump invalidates every cached
+#          Rust extraction so existing graphs pick up the explicit end.
 # Note: lap-15's phantom-node resolution runs at MERGE time over the
 # combined per-file results, so it fires on cached output too — no bump.
-AST_CACHE_VERSION = "v4"
+AST_CACHE_VERSION = "v5"
 
 
 # AST node types that represent a member-expression callee
@@ -2757,15 +2765,25 @@ def extract_rust(path: Path) -> dict:
     seen_ids: set[str] = set()
     function_bodies: list[tuple[str, object]] = []
 
-    def add_node(nid: str, label: str, line: int) -> None:
+    def add_node(nid: str, label: str, line: int, end_line: int | None = None) -> None:
+        # Lap-27 #1: stamp `L<start>-<end>` (matches Python/TS extractors,
+        # see _make_id-adjacent comment). Without an end_line, peek / shape
+        # / doc fall back to next-sibling-start which is silently wrong on
+        # the last fn in a file (absorbs trailing module-level decls) and
+        # off by one on adjacent fns. Free fns, impl methods, structs,
+        # enums, traits, and impl blocks all get the explicit end now.
         if nid not in seen_ids:
             seen_ids.add(nid)
+            if end_line is not None and end_line >= line:
+                loc = f"L{line}-{end_line}"
+            else:
+                loc = f"L{line}"
             nodes.append({
                 "id": nid,
                 "label": label,
                 "file_type": "code",
                 "source_file": str_path,
-                "source_location": f"L{line}",
+                "source_location": loc,
             })
 
     def add_edge(src: str, tgt: str, relation: str, line: int,
@@ -2791,13 +2809,14 @@ def extract_rust(path: Path) -> dict:
             if name_node:
                 func_name = _read_text(name_node, source)
                 line = node.start_point[0] + 1
+                end_line = node.end_point[0] + 1
                 if parent_impl_nid:
                     func_nid = _make_id(parent_impl_nid, func_name)
-                    add_node(func_nid, f".{func_name}()", line)
+                    add_node(func_nid, f".{func_name}()", line, end_line=end_line)
                     add_edge(parent_impl_nid, func_nid, "method", line)
                 else:
                     func_nid = _make_id(stem, func_name)
-                    add_node(func_nid, f"{func_name}()", line)
+                    add_node(func_nid, f"{func_name}()", line, end_line=end_line)
                     add_edge(file_nid, func_nid, "contains", line)
                 body = node.child_by_field_name("body")
                 if body:
@@ -2809,8 +2828,9 @@ def extract_rust(path: Path) -> dict:
             if name_node:
                 item_name = _read_text(name_node, source)
                 line = node.start_point[0] + 1
+                end_line = node.end_point[0] + 1
                 item_nid = _make_id(stem, item_name)
-                add_node(item_nid, item_name, line)
+                add_node(item_nid, item_name, line, end_line=end_line)
                 add_edge(file_nid, item_nid, "contains", line)
             return
 
@@ -2820,7 +2840,9 @@ def extract_rust(path: Path) -> dict:
             if type_node:
                 type_name = _read_text(type_node, source).strip()
                 impl_nid = _make_id(stem, type_name)
-                add_node(impl_nid, type_name, node.start_point[0] + 1)
+                add_node(impl_nid, type_name,
+                         node.start_point[0] + 1,
+                         end_line=node.end_point[0] + 1)
             body = node.child_by_field_name("body")
             if body:
                 for child in body.children:

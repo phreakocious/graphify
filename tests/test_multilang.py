@@ -452,6 +452,51 @@ def test_rust_no_dangling_edges():
             assert e["source"] in node_ids
 
 
+def test_rust_function_nodes_carry_end_line():
+    """Lap-27 #1: extract_rust emits `L<start>-<end>` source_locations.
+
+    Without an end-line, peek/doc/shape on .rs sources fall through to
+    next-sibling-start which is silently wrong on the last fn in a file
+    and off-by-one on adjacent fns. The fixture has one free fn and
+    three impl methods; all should carry an explicit end >= start.
+    """
+    r = extract_rust(FIXTURES / "sample.rs")
+    found_function = False
+    found_method = False
+    for n in r["nodes"]:
+        loc = n.get("source_location") or ""
+        # File node stays single-line; everything else gets the range.
+        if n.get("label") == "sample.rs":
+            continue
+        # Format must be `L<start>-<end>` with end >= start.
+        assert "-" in loc, f"node {n['label']!r} has loc={loc!r}, expected L<start>-<end>"
+        a, b = loc.lstrip("L").split("-", 1)
+        a_i, b_i = int(a), int(b)
+        assert b_i >= a_i, f"end-line {b_i} < start-line {a_i} for {n['label']!r}"
+        if n.get("label", "").endswith("()"):
+            if n.get("label", "").startswith("."):
+                found_method = True
+            else:
+                found_function = True
+    assert found_function and found_method, (
+        f"expected both free fn and impl method nodes, got "
+        f"function={found_function} method={found_method}"
+    )
+
+
+def test_rust_struct_carries_end_line():
+    """Lap-27 #1: structs/enums/traits also get end-lines so `shape`
+    can rank them correctly when computing the longest decl in a file."""
+    r = extract_rust(FIXTURES / "sample.rs")
+    graph = next((n for n in r["nodes"] if n.get("label") == "Graph"), None)
+    assert graph is not None
+    loc = graph.get("source_location") or ""
+    assert "-" in loc, f"Graph struct has loc={loc!r}, expected L<start>-<end>"
+    a, b = loc.lstrip("L").split("-", 1)
+    # The fixture's `Graph` struct spans L3-5 (open brace through close).
+    assert int(a) == 3 and int(b) == 5, f"Graph struct: expected L3-5, got {loc}"
+
+
 # ── extract() dispatch ────────────────────────────────────────────────────────
 
 def test_extract_dispatches_all_languages():
