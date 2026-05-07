@@ -66,6 +66,25 @@ Turn any folder of files into a navigable knowledge graph with community detecti
 
 **Hand off when:** a specific node is load-bearing → `Read`; reachability X→Y → `path`; one-shot factual question → `explain`; diffuse question on a narrowed area → `query`.
 
+## Dispatching sub-agents (Agent / Explore / Plan)
+
+Sub-agents run with their own system prompts that hard-code `find` / `grep` / `glob` workflows. **They do NOT reliably inherit graphify guidance from CLAUDE.md / skill.md** — verified A/B: an Explore sub-agent in a graphify-indexed project ran 30 `find` / `grep` / `awk` / `head` calls for a question graphify answers in 2 (`shape <file>` then `navigate "@<symbol>"`).
+
+**When you dispatch a sub-agent in a graphify-indexed directory, paste this into the prompt:**
+
+> `graphify-out/graph.json` exists. Reach for graphify BEFORE find/grep when the question is about code structure:
+> - Where is X defined? → `graphify locate X` (multi-symbol: `locate X Y Z`)
+> - What's in this file? → `graphify shape <file>` (multi: `shape f1.py f2.py` or `shape {a,b}.py`)
+> - Which files match a pattern? → `graphify files "<glob>"` (e.g. `*test*.py`, `tools/*.py`)
+> - Who calls X? → `graphify navigate "@X" in --kind=calls`
+> - Who uses X (incl. typed dispatch)? → `graphify navigate "@X" wu`
+> - What strings match? → `graphify search "<pat>"` — add `--idents` for cross-casing, `--files-only` for grep -l, `--in-files "<glob>"` for grep -r --include
+> - What's in this directory? → `graphify navigate "@<dir>/"` (trailing slash matters)
+>
+> **Don't bail after one empty graphify call.** Empty `search` is usually a regex/casing miss — try `shape <file>` or `navigate "@<best-guess-symbol>"` before falling back to grep. graphify is 50–500x cheaper than chained find/grep when the question is about source-code structure.
+
+Without this, the sub-agent burns ~20 calls on what graphify answers in 2–3.
+
 ## What graphify is for
 
 graphify is built around Andrej Karpathy's /raw folder workflow: drop anything into a folder - papers, tweets, screenshots, code, notes - and get a structured knowledge graph that shows you what you didn't know was connected.

@@ -448,8 +448,14 @@ Before any of these moves, scout the graph first — it's 50–500x cheaper than
 graphify navigate "@<symbol>"                       # focus + frontier (~200 tok)
 graphify navigate "@<symbol>" methods 6 in          # chain: focus, list methods, pick 6th, show callers
 graphify peek "<symbol>"                            # one-shot body dump, no cursor
-graphify shape "<file>"                             # N classes / M fns / longest fn — orient without `contains`
+graphify shape "<file>" [<file> ...]                # N classes / M fns / longest fn (multi-target + brace-expand `{a,b}.py`)
 graphify search "<pattern>"                         # body-text grep, hits attributed to symbol
+graphify search "<pat>" --files-only                # grep -l analog: one row per file with match count (no per-line snippets)
+graphify search "<pat>" --in-files "<glob>"         # grep -r --include analog: restrict to source_files matching glob
+graphify files "<glob>"                             # list source-file nodes by basename or path glob (find -name analog)
+graphify locate <s1> <s2> ...                       # multi-symbol file:line, no body
+graphify blast "<symbol>"                           # callers + callees side-by-side, cursor-free
+graphify doc "<symbol>"                             # signature + docstring/rationale dump
 graphify path "A" "B"                               # reachability between two nodes (~50 tok)
 graphify explain "<symbol>"                         # one-shot summary of one node (~350 tok)
 graphify diff old.json new.json                     # what changed: added/removed nodes/edges
@@ -480,6 +486,25 @@ graphify changed [git-ref]                          # files added/modified since
 | `--limit N` | raise per-listing cap from 25 |
 
 Per-id cursor files mean parallel calls don't race. The session id only prints when chaining is in flight (chain paused at disambig, `--session` was passed, or cursor walked >1 step) — pass it via `--session <id>` to resume.
+
+### Dispatching sub-agents (Agent / Explore / Plan)
+
+Sub-agents run with their own system prompts that hard-code `find` / `grep` / `glob` workflows. **They do not reliably inherit graphify guidance from CLAUDE.md** — verified A/B: an Explore sub-agent in a graphify-indexed project ran 30 `find` / `grep` / `awk` / `head` calls for a question graphify answers in 2 (`shape <file>` then `navigate "@<symbol>"`).
+
+When you dispatch a sub-agent in this directory, paste this into the prompt:
+
+> This project has a graphify knowledge graph at `graphify-out/graph.json`. Reach for graphify BEFORE find/grep when the question is about code structure:
+> - Where is X defined? → `graphify locate X` (multi-symbol: `locate X Y Z`)
+> - What's in this file? → `graphify shape <file>` (multi: `shape f1.py f2.py`)
+> - Which files match a pattern? → `graphify files "<glob>"` (e.g. `*test*.py`, `tools/*.py`)
+> - Who calls X? → `graphify navigate "@X" in --kind=calls`
+> - Who uses X (incl. typed dispatch)? → `graphify navigate "@X" wu`
+> - What strings match? → `graphify search "<pat>"` — add `--idents` for cross-casing, `--files-only` for grep-l, `--in-files "<glob>"` for grep-r --include
+> - What's in this directory? → `graphify navigate "@<dir>/"` (trailing slash matters)
+>
+> **Don't bail after one empty graphify call.** Empty `search` is usually a regex/casing miss — try `shape <file>` or `navigate "@<best-guess-symbol>"` before falling back to grep. graphify is 50–500x cheaper than chained find/grep when the question is about source-code structure.
+
+Without this, the sub-agent burns ~20 calls on what graphify answers in 2–3.
 
 ### What NOT to do
 
@@ -521,8 +546,10 @@ Before any of these moves, scout the graph first — it's 50–500x cheaper:
 ```
 graphify navigate "@<symbol>" methods 6 in   # focus, list methods, pick 6th, show callers
 graphify peek "<symbol>"                     # one-shot body dump
-graphify shape "<file>"                      # class/fn/import counts, longest fn
-graphify search "<pattern>"                  # body-text grep, attributed to symbol
+graphify shape "<file>" [<file> ...]         # multi-target: class/fn counts, longest fn (brace-expand `{a,b}.py`)
+graphify search "<pat>" [--files-only|--in-files <glob>]   # body-text grep, attributed to symbol
+graphify files "<glob>"                      # find -name analog: source files by basename or path glob
+graphify locate <s1> <s2> ...                # multi-symbol file:line, no body
 graphify path "A" "B"                        # reachability (~50 tok)
 graphify explain "<symbol>"                  # one-shot node summary (~350 tok)
 graphify update .                            # AST re-extract, no LLM cost
@@ -534,12 +561,20 @@ graphify update .                            # AST re-extract, no LLM cost
 - `@<Class>.<method>` — method shortcut (`@Runner.compute` resolves to the method, not a free `compute()`).
 - `@.<method>()` — method-label form when you don't know the owning class.
 - `@<dir/file>` or `@<dir/file/Symbol>` — path-qualified.
+- `@<dir>/` — directory listing (trailing slash is required for unambiguous dir intent).
 
 ### Useful flags on `navigate`
 
 `--include-inferred` widens to LLM-inferred edges; `--depth N` walks N hops via non-structural edges (`out --depth=2 --kind=calls` for blast-radius); `--bodies N` shows N source lines under each row; `--explain-cost` previews node/byte count before committing; `--code-only` filters rationale nodes from `coc`; `--md` renders labels as markdown links; `--show-session <id>` peeks a saved cursor without mutating it.
 
 Chain ops left-to-right; output is the last op's result. When chaining is in flight (chain paused, `--session` passed, or cursor walked >1 step) the output prints `session: <id>` — pass it via `--session <id>` to resume.
+
+### Dispatching sub-agents
+
+Sub-agents do NOT reliably inherit graphify guidance from project instructions. When dispatching a sub-agent in this directory, paste this into the prompt:
+
+> `graphify-out/graph.json` exists. Reach for graphify before find/grep:
+> `locate <sym>` (file:line), `shape <file>` (file structure, multi-target), `files <glob>` (filename pattern), `search <pat>` (`--files-only` for grep -l, `--in-files <glob>` for grep -r --include), `navigate "@X" in --kind=calls` (callers), `navigate "@<dir>/"` (dir listing). Don't bail after one empty graphify call — try `shape` or `navigate` before falling back to grep.
 
 ### What NOT to do
 
@@ -572,8 +607,10 @@ Before any of these moves, scout the graph first — it's 50–500x cheaper:
 ```
 graphify navigate "@<symbol>" methods 6 in   # chain: focus, methods, pick 6th, show callers
 graphify peek "<symbol>"                     # one-shot body dump
-graphify shape "<file>"                      # class/fn counts + longest fn
-graphify search "<pattern>"                  # body-text grep, attributed to symbol
+graphify shape "<file>" [<file> ...]         # multi-target: class/fn counts + longest fn (brace-expand `{a,b}.py`)
+graphify search "<pat>" [--files-only|--in-files <glob>]   # body-text grep, attributed to symbol
+graphify files "<glob>"                      # find -name analog: source files by basename or path glob
+graphify locate <s1> <s2> ...                # multi-symbol file:line, no body
 graphify path "A" "B"                        # reachability (~50 tok)
 graphify explain "<symbol>"                  # node summary (~350 tok)
 graphify update .                            # AST re-extract after edits
@@ -585,12 +622,20 @@ graphify update .                            # AST re-extract after edits
 - `@<Class>.<method>` — method shortcut. `@Runner.compute` lands on the method, not a free `compute()`.
 - `@.<method>()` — method-label form, owner-class agnostic.
 - `@<dir/file>` or `@<dir/file/Symbol>` — path-qualified.
+- `@<dir>/` — directory listing (trailing slash is required).
 
 ### Useful flags on `navigate`
 
 `--include-inferred`, `--depth N` (multi-hop), `--kind <rel>[,...]`, `--bodies N` (preview lines under each row), `--explain-cost` (preview before committing), `--code-only` (filter rationale from `coc`), `--md` (markdown links), `--show-session <id>` (peek without mutating).
 
 Chain ops left-to-right; output is the last op's result. When chaining is in flight, the output prints `session: <id>` — pass it via `--session <id>` to resume.
+
+### Dispatching sub-agents
+
+Sub-agents do NOT reliably inherit graphify guidance from project instructions. Paste this into the dispatch prompt:
+
+> `graphify-out/graph.json` exists. Reach for graphify before find/grep:
+> `locate <sym>` (file:line), `shape <file>` (file structure, multi-target), `files <glob>` (filename pattern), `search <pat>` (`--files-only` for grep -l, `--in-files <glob>` for grep -r --include), `navigate "@X" in --kind=calls` (callers), `navigate "@<dir>/"` (dir listing). Don't bail after one empty graphify call — try `shape` or `navigate` before falling back to grep.
 
 ### What NOT to do
 
