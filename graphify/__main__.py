@@ -1226,6 +1226,36 @@ def _expand_brace_multi_target(target: str) -> list[str]:
     return [f"{prefix}{p}{suffix}" for p in parts]
 
 
+def _brace_expand_member_miss(target: str, chosen_label: str) -> tuple[str, str] | None:
+    """Lap-26 brace-expand fuzzy-fallback guard.
+
+    `peek @Class.{m1,m2,m3}` expands to per-member targets. If a member
+    doesn't actually exist on Class, resolve_focus's fuzzy step returns
+    Class itself (the parent — "cursor.load" fuzzy-matches "Cursor"),
+    and the curated class-dump path renders the whole class. Repeat for
+    every missing member and the agent gets N identical class dumps
+    instead of N "no member" lines.
+
+    Detect: target was `<parent>.<member>` form, chosen resolved to
+    `<parent>` (the class itself, sans `.member`). Returns `(parent,
+    member)` on a miss; `None` otherwise. Caller uses this only in
+    multi (brace-expand) mode — single-target peek can still fuzzy-
+    fall-back since the agent gets a `# matched ... (fuzzy)` line that
+    makes the substitution visible without compounding.
+    """
+    t = target.lstrip("@").strip()
+    if "." not in t or "/" in t:
+        return None
+    parent, _, member = t.rpartition(".")
+    if not parent or not member:
+        return None
+    cl = chosen_label.lstrip("@").rstrip("()").lstrip(".").strip()
+    pre = parent.lstrip("@").rstrip("()").strip()
+    if cl.lower() == pre.lower():
+        return (parent, member)
+    return None
+
+
 def main() -> None:
     # Check all known skill install locations for a stale version stamp.
     # Skip during install/uninstall (hook writes trigger a fresh check anyway).
@@ -3022,6 +3052,12 @@ def main() -> None:
                     print()
                 print(f"# [{ti+1}/{len(targets)}] {t}")
             chosen, candidates, match_type, _alts = resolve_focus(G, idx, t)
+            if multi and chosen:
+                miss = _brace_expand_member_miss(t, G.nodes[chosen].get("label", ""))
+                if miss:
+                    parent, member = miss
+                    print(f"no member `{member}` on {parent}.", file=sys.stderr)
+                    continue
             if not chosen:
                 if candidates:
                     # Multiple matches — print a short disambig list so the
@@ -3339,6 +3375,12 @@ def main() -> None:
                     print()
                 print(f"# [{ti+1}/{len(targets)}] {t}")
             chosen, candidates, match_type, _alts = resolve_focus(G, idx, t)
+            if multi and chosen:
+                miss = _brace_expand_member_miss(t, G.nodes[chosen].get("label", ""))
+                if miss:
+                    parent, member = miss
+                    print(f"no member `{member}` on {parent}.", file=sys.stderr)
+                    continue
             if not chosen:
                 # Mirror peek's disambig output so the caller can re-issue
                 # blast with a path-qualified target.
@@ -3478,6 +3520,12 @@ def main() -> None:
                     print()
                 print(f"# [{ti+1}/{len(targets)}] {t}")
             chosen, candidates, match_type, _alts = resolve_focus(G, idx, t)
+            if multi and chosen:
+                miss = _brace_expand_member_miss(t, G.nodes[chosen].get("label", ""))
+                if miss:
+                    parent, member = miss
+                    print(f"no member `{member}` on {parent}.", file=sys.stderr)
+                    continue
             if not chosen:
                 if candidates:
                     print(f"ambiguous `{t}` ({len(candidates)} matches). "

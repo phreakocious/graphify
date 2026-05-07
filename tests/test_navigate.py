@@ -268,6 +268,74 @@ def test_community_labels_prefer_symbols_over_files(tmp_path, monkeypatch):
     assert "buildDecodeEngine" in label, f"expected buildDecodeEngine, got: {label}"
 
 
+def test_community_labels_prefer_internal_callables_over_external_stubs(tmp_path):
+    """Lap-26 graphify-on-graphify field report: top-community labels
+    picked the highest-degree non-file symbol, which routinely lands
+    on external stubs (`str`, `pathlib`, `Response`) — built-in or
+    cross-corpus references with high degree but uninformative as a
+    cluster label. Real graph: `c0=str 509 members`, `c1=pathlib 196`.
+
+    Fix adds a 3rd preference tier: internal callables (`source_file`
+    set + `node_kind` in {function,method,class,interface}) are
+    preferred over generic symbols, falling through cleanly when a
+    community is purely external (e.g., a cluster of stdlib refs).
+    """
+    import json as _json
+    from graphify.navigate import load_graph
+    nodes = [
+        # External stub: HIGHER degree (4) but no source_file, no node_kind.
+        # This is how `str` shows up in real graphs — referenced by every
+        # node that uses string types, but it carries no domain meaning.
+        {"id": "stub", "label": "str", "file_type": "code",
+         "source_file": "", "source_location": "", "community": 0},
+        # Internal callable: LOWER degree (3) but a real function.
+        # Without the lap-26 fix, the stub wins on degree and the
+        # cluster gets labeled `c0=str` instead of `c0=buildEngine()`.
+        {"id": "engine", "label": "buildEngine()", "file_type": "code",
+         "source_file": "engine.ts", "source_location": "L10",
+         "node_kind": "function", "community": 0},
+        {"id": "c1", "label": "c1", "file_type": "code",
+         "source_file": "engine.ts", "source_location": "L20",
+         "community": 0},
+        {"id": "c2", "label": "c2", "file_type": "code",
+         "source_file": "engine.ts", "source_location": "L21",
+         "community": 0},
+    ]
+    links = [
+        # stub gets in-degree 4 (each consumer references it).
+        {"source": "engine", "target": "stub", "relation": "uses",
+         "confidence": "EXTRACTED"},
+        {"source": "c1", "target": "stub", "relation": "uses",
+         "confidence": "EXTRACTED"},
+        {"source": "c2", "target": "stub", "relation": "uses",
+         "confidence": "EXTRACTED"},
+        # engine gets in-degree 2 + out-degree 1 = 3. Lower than stub's 4
+        # — only the internal-callable preference tier flips the pick.
+        {"source": "c1", "target": "engine", "relation": "calls",
+         "confidence": "EXTRACTED"},
+        {"source": "c2", "target": "engine", "relation": "calls",
+         "confidence": "EXTRACTED"},
+    ]
+    graph_dir = tmp_path / "graphify-out"
+    graph_dir.mkdir()
+    (graph_dir / "graph.json").write_text(_json.dumps(
+        {"nodes": nodes, "links": links}), encoding="utf-8")
+    G, _comm = load_graph(graph_dir / "graph.json")
+    label = G.graph["community_labels"][0]
+    assert "str" != label, (
+        f"external stub won label despite internal callable available: {label}"
+    )
+    assert "buildEngine" in label, (
+        f"expected internal callable to win the label, got: {label}"
+    )
+    # community_hubs should also point at the internal callable, not
+    # the stub — the hub-id is used by `is_community_hub` annotations
+    # in listings, and pointing at a stub there is the same problem
+    # (agent navigates to `str`, learns nothing about the cluster).
+    hub = G.graph["community_hubs"][0]
+    assert hub == "engine", f"expected hub=engine (internal), got hub={hub}"
+
+
 def test_archived_paths_sort_last_in_disambig():
     """Lap-6/7 friction: `@compile` returned 14 matches mixing active code
     with archived variants. Archived paths (frozen/, legacy/, deprecated/,
@@ -3143,6 +3211,104 @@ def test_peek_brace_partial_miss_continues(tmp_path):
     assert "no node matches `zqqqzzz_nonexistent`" in res.stderr, (
         f"missing target should print named error:\n{res.stderr}"
     )
+
+
+def test_brace_expand_member_miss_helper():
+    """Lap-26 helper: detect when a brace-expanded `@Class.member`
+    target resolved to its parent class instead of the actual member.
+    Returns `(parent, member)` on miss, `None` otherwise.
+
+    The bug it guards against: in the graphify-on-graphify dogfood,
+    `peek "@Cursor.{load,save,read}"` resolved `@Cursor.load` and
+    `@Cursor.read` to class `Cursor` itself via the fuzzy step
+    (similarity ~0.86 because `load`/`read` are short relative to
+    the class name). Then the curated class-dump path fired three
+    times — one real method body plus two duplicate whole-class
+    dumps. With the guard, the misses print per-member miss lines."""
+    from graphify.__main__ import _brace_expand_member_miss
+    # Bug case: target was `@Cursor.load`, fuzzy resolved to class `Cursor`.
+    assert _brace_expand_member_miss("@Cursor.load", "Cursor") == ("Cursor", "load")
+    # Same without @ prefix.
+    assert _brace_expand_member_miss("Cursor.load", "Cursor") == ("Cursor", "load")
+    # Case-insensitive comparison: `cursor.load` against `Cursor` still a miss.
+    assert _brace_expand_member_miss("cursor.load", "Cursor") == ("cursor", "load")
+    # OK case: chosen IS the actual member (label like `.save()` or `save()`).
+    # Trailing parens / leading `.` are decoration the helper strips.
+    assert _brace_expand_member_miss("@Cursor.save", "save()") is None
+    assert _brace_expand_member_miss("@Cursor.save", ".save()") is None
+    assert _brace_expand_member_miss("@Cursor.save", ".save") is None
+    # No-dot target — not member-style, never a miss (single-symbol target).
+    assert _brace_expand_member_miss("Cursor", "Cursor") is None
+    assert _brace_expand_member_miss("@navigate", "navigate") is None
+    # Path-qualified — skip (handled by the path-qualifier branch in
+    # resolve_focus, not the fuzzy fall-back).
+    assert _brace_expand_member_miss("graphify/navigate.py/Cursor", "Cursor") is None
+    # Empty parts.
+    assert _brace_expand_member_miss(".load", "Cursor") is None
+    assert _brace_expand_member_miss("Cursor.", "Cursor") is None
+
+
+def test_peek_brace_member_fuzzy_fallback_to_class_is_miss(tmp_path):
+    """Lap-26 regression: brace-expand `@Worker.{run,q}` where `q` is
+    not a member of Worker. The resolver's fuzzy step (cutoff 0.7)
+    matches `worker.q` against label `Worker` (similarity ≈ 0.86
+    because `q` is one char relative to the class name) and returns
+    the class. Without the brace-expand guard, the curated class-dump
+    path then fires for the missing member, rendering the WHOLE class
+    body instead of a miss line — N missing members produce N
+    duplicate class dumps. With the guard, missing members produce a
+    per-member `no member \\`q\\` on Worker.` line on stderr and the
+    [2/2] stdout section stays empty (no whole-class dump)."""
+    import json as _json, subprocess
+    nodes = [
+        {"id": "cls", "label": "Worker", "file_type": "code",
+         "source_file": "worker.py", "source_location": "L1",
+         "node_kind": "class"},
+        {"id": "qm_run", "label": ".run()", "file_type": "code",
+         "source_file": "worker.py", "source_location": "L2-3",
+         "node_kind": "method"},
+    ]
+    links = [
+        {"source": "cls", "target": "qm_run", "relation": "method",
+         "confidence": "EXTRACTED"},
+    ]
+    graph_dir = tmp_path / "graphify-out"
+    graph_dir.mkdir()
+    (graph_dir / "graph.json").write_text(_json.dumps(
+        {"directed": True, "multigraph": False, "graph": {},
+         "nodes": nodes, "links": links}), encoding="utf-8")
+    (tmp_path / "worker.py").write_text(
+        "class Worker:\n"
+        "    def run(self):\n"
+        "        return None\n"
+    )
+    res = subprocess.run(
+        ["graphify", "peek", "Worker.{run,q}",
+         "--graph", str(graph_dir / "graph.json")],
+        capture_output=True, text=True, cwd=str(tmp_path),
+    )
+    # Multi mode with ≥1 valid target → exit 0.
+    assert res.returncode == 0, (
+        f"multi-peek with one valid + one missing should exit 0:"
+        f"\nstdout:\n{res.stdout}\nstderr:\n{res.stderr}"
+    )
+    # Valid `run` renders.
+    assert "return None" in res.stdout, (
+        f"valid target should render:\n{res.stdout}"
+    )
+    # Missing `q` produces a per-member miss line on stderr.
+    assert "no member `q` on Worker" in res.stderr, (
+        f"missing member should print per-member miss line:\n{res.stderr}"
+    )
+    # The [2/2] stdout section must NOT contain a whole-class dump.
+    # If the guard regresses, "peek class @Worker" would appear under
+    # the missing member's [2/2] header.
+    after_two = res.stdout.split("[2/2] Worker.q", 1)
+    if len(after_two) == 2:
+        assert "peek class @Worker" not in after_two[1], (
+            f"missing-member [2/2] section must not render whole-class dump:"
+            f"\n{after_two[1]}"
+        )
 
 
 def test_blast_brace_expands_to_multi_symbol(tmp_path):

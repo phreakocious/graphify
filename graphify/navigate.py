@@ -147,11 +147,29 @@ def load_graph(graph_path: str | Path,
     # standalone files).
     community_labels: dict[int, str] = {}
     community_hubs: dict[int, str] = {}
+    # Lap-26 graphify-on-graphify field report: pure-degree ranking
+    # picked external stubs (`str`, `pathlib`) and a test-fixture
+    # struct (`Graph` from sample.rs) as the top-3 community labels.
+    # The labels told the agent nothing about what the cluster was
+    # *about* — `c0=str 509 members` is a worse pivot label than
+    # `c0=.get() 509 members` even though the count is identical.
+    # Add a 3rd preference tier: internal callables (sourced
+    # function/method/class) before generic symbols. Falls through
+    # cleanly when a community is purely external (e.g., a cluster
+    # of stdlib references with no domain code).
+    def _internal_callable(nid: str) -> bool:
+        a = G.nodes[nid]
+        if not a.get("source_file"):
+            return False
+        kind = a.get("node_kind") or ""
+        return kind in ("function", "method", "impl_method", "iface_method",
+                        "class", "interface")
     for cid, members in communities.items():
         non_rat = [m for m in members
                    if G.nodes[m].get("file_type") != "rationale"]
         symbols = [m for m in non_rat if not _is_file_node(G, m)]
-        pick_pool = symbols or non_rat  # fall back to file if no symbols
+        internal = [m for m in symbols if _internal_callable(m)]
+        pick_pool = internal or symbols or non_rat  # 3-tier fallback
         if not pick_pool:
             continue
         ranked = sorted(
