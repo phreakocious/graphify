@@ -413,6 +413,13 @@ Per-id cursor files mean parallel calls don't race. The session id only prints w
 
 _CLAUDE_MD_MARKER = "## graphify"
 
+# Lap-27 #10: write corpus-specific guidance to a separate file the user
+# imports, instead of owning the user's top-level CLAUDE.md. The user's
+# CLAUDE.md keeps a single short import line; the file we manage lives
+# in .claude/ and is safe to overwrite on update.
+_GRAPHIFY_MD_RELPATH = ".claude/graphify.md"
+_CLAUDE_MD_IMPORT_LINE = "@.claude/graphify.md"
+
 # AGENTS.md section for Codex, OpenCode, and OpenClaw.
 # All three platforms read AGENTS.md in the project root for persistent instructions.
 _AGENTS_MD_SECTION = """\
@@ -1101,28 +1108,69 @@ def _agents_uninstall(project_dir: Path, platform: str = "") -> None:
         _uninstall_opencode_plugin(project_dir or Path("."))
 
 
-def claude_install(project_dir: Path | None = None) -> None:
-    """Write the graphify section to the local CLAUDE.md."""
-    target = (project_dir or Path(".")) / "CLAUDE.md"
+def claude_install(project_dir: Path | None = None, add_import: bool = True) -> None:
+    """Write graphify guidance to .claude/graphify.md and import it from CLAUDE.md.
 
-    if target.exists():
-        content = target.read_text(encoding="utf-8")
-        if _CLAUDE_MD_MARKER in content:
-            print("graphify already configured in CLAUDE.md")
-            return
-        new_content = content.rstrip() + "\n\n" + _CLAUDE_MD_SECTION
+    Lap-27 #10: graphify owns .claude/graphify.md (project-local, safe to overwrite
+    on update). The user's CLAUDE.md stays user-owned — we only add a single
+    `@.claude/graphify.md` import line, and we offer --no-import for users who
+    want to manage the import themselves. If a legacy `## graphify` section from
+    pre-lap-27 installers is present, we migrate it out (we used to own it).
+    """
+    base = project_dir or Path(".")
+    graphify_md = base / _GRAPHIFY_MD_RELPATH
+    claude_md = base / "CLAUDE.md"
+
+    # 1. Always write/refresh .claude/graphify.md (this file is ours).
+    graphify_md.parent.mkdir(parents=True, exist_ok=True)
+    graphify_md.write_text(_CLAUDE_MD_SECTION, encoding="utf-8")
+    print(f"  {_GRAPHIFY_MD_RELPATH}  ->  written ({graphify_md.resolve()})")
+
+    # 2. Migrate legacy `## graphify` section out of user's CLAUDE.md if present.
+    # Tight check: heading line must be exactly `## graphify` (not e.g.
+    # `## graphify isn't a small-task tool` from a project doc that mentions us).
+    if claude_md.exists():
+        content = claude_md.read_text(encoding="utf-8")
+        new_content, n = re.subn(
+            r"\n*## graphify\n.*?(?=\n## |\Z)",
+            "",
+            content,
+            flags=re.DOTALL,
+        )
+        if n:
+            cleaned = new_content.rstrip() + ("\n" if new_content.strip() else "")
+            claude_md.write_text(cleaned, encoding="utf-8")
+            print(f"  CLAUDE.md         ->  legacy '## graphify' section removed (migrated to {_GRAPHIFY_MD_RELPATH})")
+
+    # 3. Add @-import line unless caller opted out.
+    if add_import:
+        _ensure_import_line(claude_md)
     else:
-        new_content = _CLAUDE_MD_SECTION
+        print(f"  CLAUDE.md         ->  not touched (--no-import)")
+        print(f"  next: add `{_CLAUDE_MD_IMPORT_LINE}` to your CLAUDE.md to load graphify guidance")
 
-    target.write_text(new_content, encoding="utf-8")
-    print(f"graphify section written to {target.resolve()}")
-
-    # Also write Claude Code PreToolUse hook to .claude/settings.json
-    _install_claude_hook(project_dir or Path("."))
+    # 4. PreToolUse hook (unchanged).
+    _install_claude_hook(base)
 
     print()
     print("Claude Code will now check the knowledge graph before answering")
     print("codebase questions and rebuild it after code changes.")
+
+
+def _ensure_import_line(claude_md: Path) -> None:
+    """Add `@.claude/graphify.md` to CLAUDE.md if not present. Idempotent."""
+    if claude_md.exists():
+        content = claude_md.read_text(encoding="utf-8")
+        # Match the import line on its own line (allowing leading whitespace).
+        if re.search(rf"(?m)^\s*{re.escape(_CLAUDE_MD_IMPORT_LINE)}\s*$", content):
+            print(f"  CLAUDE.md         ->  already imports {_GRAPHIFY_MD_RELPATH} (no change)")
+            return
+        new_content = content.rstrip() + "\n\n" + _CLAUDE_MD_IMPORT_LINE + "\n"
+        claude_md.write_text(new_content, encoding="utf-8")
+        print(f"  CLAUDE.md         ->  import added ({_CLAUDE_MD_IMPORT_LINE})")
+    else:
+        claude_md.write_text(_CLAUDE_MD_IMPORT_LINE + "\n", encoding="utf-8")
+        print(f"  CLAUDE.md         ->  created with import ({_CLAUDE_MD_IMPORT_LINE})")
 
 
 def _install_claude_hook(project_dir: Path) -> None:
@@ -1168,33 +1216,52 @@ def _uninstall_claude_hook(project_dir: Path) -> None:
 
 
 def claude_uninstall(project_dir: Path | None = None) -> None:
-    """Remove the graphify section from the local CLAUDE.md."""
-    target = (project_dir or Path(".")) / "CLAUDE.md"
+    """Remove .claude/graphify.md, import line, legacy section, and hook."""
+    base = project_dir or Path(".")
+    graphify_md = base / _GRAPHIFY_MD_RELPATH
+    claude_md = base / "CLAUDE.md"
+    did_anything = False
 
-    if not target.exists():
-        print("No CLAUDE.md found in current directory - nothing to do")
-        return
+    # 1. Delete .claude/graphify.md (the file we own).
+    if graphify_md.exists():
+        graphify_md.unlink()
+        print(f"  {_GRAPHIFY_MD_RELPATH}  ->  removed")
+        did_anything = True
 
-    content = target.read_text(encoding="utf-8")
-    if _CLAUDE_MD_MARKER not in content:
-        print("graphify section not found in CLAUDE.md - nothing to do")
-        return
+    # 2. Strip from CLAUDE.md: import line + legacy `## graphify` section.
+    if claude_md.exists():
+        content = claude_md.read_text(encoding="utf-8")
+        original = content
 
-    # Remove the ## graphify section: from the marker to the next ## heading or EOF
-    cleaned = re.sub(
-        r"\n*## graphify\n.*?(?=\n## |\Z)",
-        "",
-        content,
-        flags=re.DOTALL,
-    ).rstrip()
-    if cleaned:
-        target.write_text(cleaned + "\n", encoding="utf-8")
-        print(f"graphify section removed from {target.resolve()}")
-    else:
-        target.unlink()
-        print(f"CLAUDE.md was empty after removal - deleted {target.resolve()}")
+        # Remove import line(s).
+        content = re.sub(
+            rf"(?m)^\s*{re.escape(_CLAUDE_MD_IMPORT_LINE)}\s*\n?",
+            "",
+            content,
+        )
+        # Remove legacy `## graphify` section (defensive: catches users on the
+        # pre-lap-27 installer who never re-ran install).
+        content = re.sub(
+            r"\n*## graphify\n.*?(?=\n## |\Z)",
+            "",
+            content,
+            flags=re.DOTALL,
+        )
 
-    _uninstall_claude_hook(project_dir or Path("."))
+        if content != original:
+            cleaned = content.rstrip()
+            if cleaned:
+                claude_md.write_text(cleaned + "\n", encoding="utf-8")
+                print(f"  CLAUDE.md         ->  graphify references removed")
+            else:
+                claude_md.unlink()
+                print(f"  CLAUDE.md         ->  was empty after removal, deleted")
+            did_anything = True
+
+    if not did_anything:
+        print("graphify not configured in this project - nothing to do")
+
+    _uninstall_claude_hook(base)
 
 
 def _expand_brace_multi_target(target: str) -> list[str]:
@@ -1371,8 +1438,8 @@ def main() -> None:
         print("  gemini uninstall        remove GEMINI.md section + BeforeTool hook")
         print("  cursor install          write .cursor/rules/graphify.mdc (Cursor)")
         print("  cursor uninstall        remove .cursor/rules/graphify.mdc")
-        print("  claude install          write graphify section to CLAUDE.md + PreToolUse hook (Claude Code)")
-        print("  claude uninstall        remove graphify section from CLAUDE.md + PreToolUse hook")
+        print("  claude install [--no-import]  write .claude/graphify.md + import line in CLAUDE.md + PreToolUse hook (Claude Code)")
+        print("  claude uninstall              remove .claude/graphify.md + import line + PreToolUse hook")
         print("  codex install           write graphify section to AGENTS.md (Codex)")
         print("  codex uninstall         remove graphify section from AGENTS.md")
         print("  opencode install        write graphify section to AGENTS.md + tool.execute.before plugin (OpenCode)")
@@ -1518,11 +1585,12 @@ def main() -> None:
     elif cmd == "claude":
         subcmd = sys.argv[2] if len(sys.argv) > 2 else ""
         if subcmd == "install":
-            claude_install()
+            add_import = "--no-import" not in sys.argv[3:]
+            claude_install(add_import=add_import)
         elif subcmd == "uninstall":
             claude_uninstall()
         else:
-            print("Usage: graphify claude [install|uninstall]", file=sys.stderr)
+            print("Usage: graphify claude [install [--no-import] | uninstall]", file=sys.stderr)
             sys.exit(1)
     elif cmd == "gemini":
         subcmd = sys.argv[2] if len(sys.argv) > 2 else ""
