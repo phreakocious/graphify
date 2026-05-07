@@ -3016,6 +3016,89 @@ def test_summarize_no_entry_points_skips_suggested_next(tmp_path):
     )
 
 
+def test_files_glob_lists_matching_basenames(tmp_path, monkeypatch):
+    """Lap-27 dispatch-corpus follow-up: `graphify files <glob>` lists
+    source-file nodes by basename pattern. Closes the
+    `find -name "*test*.py"` pattern (5+ separate calls observed in a
+    real EGF Explore-agent transcript). Bare basename patterns (no
+    `/`) match basename only; patterns with `/` match the full path.
+    """
+    import subprocess
+    nodes = [
+        {"id": "f1", "label": "test_alpha.py", "file_type": "code",
+         "source_file": "tests/test_alpha.py", "source_location": "L1",
+         "node_kind": "file"},
+        {"id": "f2", "label": "test_beta.py", "file_type": "code",
+         "source_file": "tests/test_beta.py", "source_location": "L1",
+         "node_kind": "file"},
+        {"id": "f3", "label": "main.py", "file_type": "code",
+         "source_file": "src/main.py", "source_location": "L1",
+         "node_kind": "file"},
+        {"id": "f4", "label": "test_old.py", "file_type": "code",
+         "source_file": "archive/test_old.py", "source_location": "L1",
+         "node_kind": "file"},
+    ]
+    _write_graph(tmp_path / "graphify-out", nodes, [])
+    monkeypatch.chdir(tmp_path)
+    res = subprocess.run(
+        ["python", "-m", "graphify", "files", "test_*.py"],
+        capture_output=True, text=True, cwd=str(tmp_path), timeout=15,
+    )
+    assert res.returncode == 0, f"files failed: {res.stderr}"
+    out = res.stdout
+    assert "tests/test_alpha.py" in out
+    assert "tests/test_beta.py" in out
+    assert "archive/test_old.py" in out
+    assert "src/main.py" not in out, (
+        f"main.py shouldn't match `test_*.py`:\n{out}"
+    )
+
+
+def test_files_glob_path_pattern_restricts_directory(tmp_path, monkeypatch):
+    """Lap-27: a glob containing `/` matches against the full source_file
+    path, not just the basename. `tools/*.py` should land on files
+    inside `tools/` only — not on a same-named file in `archive/`."""
+    import subprocess
+    nodes = [
+        {"id": "f1", "label": "diagnostic.py", "file_type": "code",
+         "source_file": "tools/diagnostic.py", "source_location": "L1",
+         "node_kind": "file"},
+        {"id": "f2", "label": "diagnostic.py", "file_type": "code",
+         "source_file": "archive/diagnostic.py", "source_location": "L1",
+         "node_kind": "file"},
+    ]
+    _write_graph(tmp_path / "graphify-out", nodes, [])
+    monkeypatch.chdir(tmp_path)
+    res = subprocess.run(
+        ["python", "-m", "graphify", "files", "tools/*.py"],
+        capture_output=True, text=True, cwd=str(tmp_path), timeout=15,
+    )
+    assert res.returncode == 0, f"files failed: {res.stderr}"
+    out = res.stdout
+    assert "tools/diagnostic.py" in out
+    assert "archive/diagnostic.py" not in out, (
+        f"path glob should not pull in archive/diagnostic.py:\n{out}"
+    )
+
+
+def test_files_glob_no_match_exits_one(tmp_path, monkeypatch):
+    """Lap-27: like `find` returning empty, an empty match should exit
+    non-zero so callers can distinguish "no files" from "ran successfully"."""
+    import subprocess
+    nodes = [
+        {"id": "f1", "label": "main.py", "file_type": "code",
+         "source_file": "src/main.py", "source_location": "L1",
+         "node_kind": "file"},
+    ]
+    _write_graph(tmp_path / "graphify-out", nodes, [])
+    monkeypatch.chdir(tmp_path)
+    res = subprocess.run(
+        ["python", "-m", "graphify", "files", "*.rs"],
+        capture_output=True, text=True, cwd=str(tmp_path), timeout=15,
+    )
+    assert res.returncode == 1, f"empty match should exit 1: rc={res.returncode}"
+
+
 def test_locate_resolves_multiple_symbols_in_one_call(tmp_path, monkeypatch):
     """Lap-21 (R3 sub-agent feedback): `graphify locate <s1> <s2> ...`
     returns file:line for many symbols in one call so an agent doesn't

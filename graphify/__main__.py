@@ -94,6 +94,12 @@ _HELP_BLOCKS: dict[str, list[str]] = {
         "    Resolves each arg the same way `peek` does (Class.method, path-qualified, fuzzy fallback). Output is one row per target with `<label>  <file>:<line-range>`. Ambiguous and missed symbols print a per-row note but don't fail the batch; exit 1 only when every symbol misses.",
         "    Use when you'd otherwise run 3+ `peek`/`navigate` calls just to find file:line for several symbols you already know by name.",
     ],
+    "files": [
+        "  files <glob>            list source-file nodes whose basename (or full path, if glob has `/`) matches",
+        "    --graph <path>          path to graph.json (default graphify-out/graph.json)",
+        "    Bare patterns (`*test*.py`, `*.rs`) match basename. Path patterns (`tools/*.py`, `tests/test_*.py`) match the full source_file. fnmatch syntax — `*`, `?`, `[seq]` — case-sensitive.",
+        "    Use when you'd otherwise run `find -name <glob>` to scope which files exist before pivoting. Pairs with `shape <file>` (orient on one) and `@<dir>/` (list a directory). Exits 1 on no-match so callers can branch.",
+    ],
     "blast": [
         "  blast <symbol>          one-shot blast radius — callers + callees of a symbol, side-by-side, cursor-free",
         "    --limit N               max items per side (default 30)",
@@ -236,7 +242,7 @@ def _print_top_help_short() -> None:
     # (flag entries) are filtered.
     print("Commands:")
     for verb in ("navigate", "peek", "shape", "doc", "blast", "locate",
-                 "summarize", "search", "path", "explain", "changed"):
+                 "files", "summarize", "search", "path", "explain", "changed"):
         block = _HELP_BLOCKS.get(verb, [])
         for line in block:
             if line.startswith("    "):
@@ -1480,6 +1486,8 @@ def main() -> None:
         for line in _HELP_BLOCKS["peek"]:
             print(line)
         for line in _HELP_BLOCKS["locate"]:
+            print(line)
+        for line in _HELP_BLOCKS["files"]:
             print(line)
         for line in _HELP_BLOCKS["doc"]:
             print(line)
@@ -3447,6 +3455,72 @@ def main() -> None:
                 print(f"  {t:<32} not found")
         if hits == 0:
             sys.exit(1)
+
+    elif cmd == "files":
+        # Lap-27 dispatch-corpus follow-up: list source-file nodes by
+        # basename glob. Closes the `find -name "*.py"` pattern that
+        # surfaced 5+ times in a real EGF Explore-agent transcript —
+        # the agent reaches for `find` because there's no graphify
+        # verb for "what files match this pattern?". Trailing-slash
+        # dir queries (`@<dir>/`) cover one slice; this covers the
+        # other (filename-pattern, possibly cross-directory).
+        if any(a in ("-h", "--help") for a in sys.argv[2:]):
+            _print_subcmd_help("files")
+            return
+        import fnmatch as _fnmatch
+        from graphify.navigate import DEFAULT_GRAPH_PATH, load_graph
+        args = sys.argv[2:]
+        graph_path = DEFAULT_GRAPH_PATH
+        pattern: str | None = None
+        i = 0
+        while i < len(args):
+            a = args[i]
+            if a == "--graph" and i + 1 < len(args):
+                graph_path = args[i + 1]; i += 2
+            elif a.startswith("--graph="):
+                graph_path = a.split("=", 1)[1]; i += 1
+            elif pattern is None:
+                pattern = a; i += 1
+            else:
+                print(f"warning: ignoring extra arg `{a}`. files takes a single glob.",
+                      file=sys.stderr)
+                i += 1
+        if not pattern:
+            print("Usage: graphify files <glob> [--graph PATH]", file=sys.stderr)
+            sys.exit(1)
+        gp = Path(graph_path)
+        if not gp.exists():
+            print(f"error: graph not found at {gp}. run `graphify update <path>` first.",
+                  file=sys.stderr)
+            sys.exit(1)
+        G, _comm = load_graph(gp)
+        # Bare patterns (no `/`) match basename only; patterns with
+        # `/` match the full source_file path. fnmatch's translate
+        # treats `*` as "anything except /" only when explicitly
+        # documented otherwise, so for path globs we still rely on
+        # fnmatch which is greedy across `/`. That's fine for the
+        # `<dir>/<glob>` shape agents reach for; if precise depth
+        # control becomes a real friction we can layer on top later.
+        path_glob = "/" in pattern
+        hits: list[tuple[str, str]] = []
+        for nid, attrs in G.nodes(data=True):
+            if attrs.get("node_kind") != "file":
+                continue
+            sf = attrs.get("source_file") or ""
+            if not sf:
+                continue
+            target = sf if path_glob else sf.rsplit("/", 1)[-1]
+            if _fnmatch.fnmatch(target, pattern):
+                hits.append((sf, attrs.get("label") or ""))
+        if not hits:
+            print(f"no files match `{pattern}`.", file=sys.stderr)
+            sys.exit(1)
+        # Sort by source_file for stable output. Path-grouped comes
+        # naturally because string sort puts `tests/...` together.
+        hits.sort()
+        print(f"files: {len(hits)} matching `{pattern}`")
+        for sf, _label in hits:
+            print(f"  {sf}")
 
     elif cmd == "blast":
         # Lap-22 (meta-harness friction corpus): one-shot callers + callees
