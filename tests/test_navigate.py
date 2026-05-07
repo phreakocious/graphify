@@ -4883,6 +4883,197 @@ def test_doc_node_collapses_multiline_ts_signature(tmp_path, monkeypatch):
     assert len(sig_lines) == 1, f"expected one sig line, got {sig_lines}"
 
 
+def test_doc_rationale_does_not_leak_function_body(tmp_path, monkeypatch):
+    """Lap-26 field-report fix: Python rationale extractor emits docstring
+    nodes with `source_location = L<start>` (no end line). The doc verb's
+    contract is "signature + docstring/rationale dump — without pulling
+    the implementation," but the prior flat reader walked the next 40
+    lines from the docstring start, sweeping in body code. The bug
+    surfaced as ~30 body lines under each docstring."""
+    from graphify.navigate import doc_node, _render_doc_text, load_graph
+    sf = str(tmp_path / "leaky.py")
+    nodes = [
+        {"id": "fn", "label": "build_axis()", "file_type": "code",
+         "source_file": sf, "source_location": "L1",
+         "node_kind": "function"},
+        {"id": "rat", "label": "Build the axis from a regime spec.",
+         "file_type": "rationale",
+         "source_file": sf, "source_location": "L2"},
+    ]
+    links = [
+        {"source": "rat", "target": "fn", "relation": "rationale_for",
+         "confidence": "EXTRACTED"},
+    ]
+    _write_graph(tmp_path / "graphify-out", nodes, links)
+    (tmp_path / "leaky.py").write_text(
+        'def build_axis(spec):\n'
+        '    """Build the axis from a regime spec.\n'
+        '\n'
+        '    Returns the axis array.\n'
+        '    """\n'
+        '    body_line_one = compute_one()\n'
+        '    body_line_two = compute_two()\n'
+        '    body_line_three = compute_three()\n'
+        '    DOCSTRING_BLEED_SENTINEL = True  # if this leaks, doc is broken\n'
+        '    return body_line_one\n'
+    )
+    monkeypatch.chdir(tmp_path)
+    G, _comm = load_graph(tmp_path / "graphify-out" / "graph.json")
+    data = doc_node(G, "fn")
+    assert len(data["rationale"]) == 1
+    rendered = _render_doc_text(data)
+    assert "DOCSTRING_BLEED_SENTINEL" not in rendered, (
+        f"doc leaked function body. rendered:\n{rendered}"
+    )
+    assert "compute_one" not in rendered, (
+        f"doc leaked function body. rendered:\n{rendered}"
+    )
+    # And the docstring itself is intact.
+    assert "Build the axis from a regime spec" in rendered
+    assert "Returns the axis array" in rendered
+
+
+def test_strip_leading_docstring_python_multiline():
+    """Lap-26: peek --no-docstring drops the leading triple-quoted block
+    so `peek @foo` doesn't re-show the same docstring `doc @foo` already
+    rendered."""
+    from graphify.navigate import _strip_leading_docstring
+    lines = [
+        'def foo(x):',
+        '    """Build the axis from a regime spec.',
+        '',
+        '    Returns the axis array.',
+        '    """',
+        '    return compute(x)',
+    ]
+    out, removed = _strip_leading_docstring(lines)
+    assert removed == 4, f"4 docstring lines should drop, got {removed}: {out}"
+    assert out == [
+        'def foo(x):',
+        '    return compute(x)',
+    ], out
+
+
+def test_strip_leading_docstring_python_single_line():
+    """Single-line `\"\"\"foo\"\"\"` docstring drops cleanly."""
+    from graphify.navigate import _strip_leading_docstring
+    lines = [
+        'def foo(x):',
+        '    """One-liner."""',
+        '    return x',
+    ]
+    out, removed = _strip_leading_docstring(lines)
+    assert removed == 1, f"single-line docstring should drop 1, got {removed}"
+    assert out[0] == 'def foo(x):'
+    assert out[1] == '    return x'
+
+
+def test_strip_leading_docstring_jsdoc():
+    """JSDoc `/** */` block is recognized too."""
+    from graphify.navigate import _strip_leading_docstring
+    lines = [
+        'function foo(x) {',
+        '  /**',
+        '   * Build the axis.',
+        '   */',
+        '  return compute(x);',
+        '}',
+    ]
+    out, removed = _strip_leading_docstring(lines)
+    assert removed == 3, f"JSDoc block (3 lines) should drop, got {removed}"
+    assert out[0] == 'function foo(x) {'
+    assert out[1] == '  return compute(x);'
+
+
+def test_strip_leading_docstring_no_docstring_is_noop():
+    """Body without a leading docstring is returned unchanged."""
+    from graphify.navigate import _strip_leading_docstring
+    lines = [
+        'def foo(x):',
+        '    return x + 1',
+    ]
+    out, removed = _strip_leading_docstring(lines)
+    assert removed == 0
+    assert out == lines
+
+
+def test_expand_identifier_casings_emits_all_five_forms():
+    """Lap-26 field-report fix: agent had to manually OR
+    `modal-complexity|modal_complexity` for a rename audit. `--idents`
+    expands one canonical identifier to all 5 casings + word boundaries."""
+    from graphify.navigate import _expand_identifier_casings
+    rgx, casings = _expand_identifier_casings("modal_complexity")
+    assert "modal_complexity" in casings, casings
+    assert "modal-complexity" in casings, casings
+    assert "modalComplexity" in casings, casings
+    assert "ModalComplexity" in casings, casings
+    assert "MODAL_COMPLEXITY" in casings, casings
+    # Regex word-boundary anchored so it doesn't hit `modal_complexity_v2`.
+    import re
+    assert re.search(rgx, "x = modal_complexity()"), rgx
+    assert re.search(rgx, "x = modalComplexity()"), rgx
+    assert re.search(rgx, "x = MODAL_COMPLEXITY"), rgx
+    assert not re.search(rgx, "modal_complexity_v2"), (
+        f"\\b boundary should fail on suffix-extended ident, regex was {rgx}"
+    )
+
+
+def test_expand_identifier_casings_handles_camel_input():
+    """Input may already be camelCase or PascalCase — tokenizer splits on
+    upper-boundary so we still emit all 5 forms."""
+    from graphify.navigate import _expand_identifier_casings
+    _, casings = _expand_identifier_casings("modalComplexity")
+    assert "modal_complexity" in casings, casings
+    assert "modal-complexity" in casings, casings
+
+
+def test_expand_identifier_casings_single_token_no_op():
+    """A single-token identifier has no boundaries to differ on. Don't
+    emit a fake regex that matches every word starting with `f`."""
+    from graphify.navigate import _expand_identifier_casings
+    _, casings = _expand_identifier_casings("foo")
+    # Casings collapse for a single token. snake/kebab/camel all = "foo";
+    # pascal = "Foo"; screaming = "FOO". After dedupe: 3 unique.
+    assert "foo" in casings
+    assert "Foo" in casings
+    assert "FOO" in casings
+    assert len(casings) == 3, casings
+
+
+def test_doc_rationale_handles_single_line_comment(tmp_path, monkeypatch):
+    """Comment-style rationale (`# NOTE: …`) is single-line. The reader
+    must NOT walk past it into surrounding code."""
+    from graphify.navigate import doc_node, _render_doc_text, load_graph
+    sf = str(tmp_path / "comment_ratio.py")
+    nodes = [
+        {"id": "fn", "label": "compute()", "file_type": "code",
+         "source_file": sf, "source_location": "L4",
+         "node_kind": "function"},
+        {"id": "rat", "label": "# NOTE: this is the rationale comment.",
+         "file_type": "rationale",
+         "source_file": sf, "source_location": "L1"},
+    ]
+    links = [
+        {"source": "rat", "target": "fn", "relation": "rationale_for",
+         "confidence": "EXTRACTED"},
+    ]
+    _write_graph(tmp_path / "graphify-out", nodes, links)
+    (tmp_path / "comment_ratio.py").write_text(
+        '# NOTE: this is the rationale comment.\n'
+        'BODY_AFTER_COMMENT = "should not appear in doc"\n'
+        '\n'
+        'def compute():\n'
+        '    return 1\n'
+    )
+    monkeypatch.chdir(tmp_path)
+    G, _comm = load_graph(tmp_path / "graphify-out" / "graph.json")
+    data = doc_node(G, "fn")
+    rendered = _render_doc_text(data)
+    assert "BODY_AFTER_COMMENT" not in rendered, (
+        f"comment-rationale leaked next line. rendered:\n{rendered}"
+    )
+
+
 def test_search_bodies_returns_hits_with_symbol_context(tmp_path, monkeypatch):
     """`search_bodies` greps each node's source file and attaches symbol
     context (label, file:line, community, degree) to each match. The
@@ -5854,6 +6045,93 @@ def test_summarize_class_handles_no_callers_no_inheritance(tmp_path, monkeypatch
     # was dropped.
     assert "## Used by" in out and "(none" in out, (
         f"Used by section should appear with (none) marker:\n{out}"
+    )
+
+
+def test_summarize_class_auto_picks_unique_non_archived(tmp_path, monkeypatch):
+    """Lap-26 field-report fix: `summarize @SymplecticGeometry` matched 4
+    nodes — 1 main + 3 in legacy/ subdir generations. Disambig is exactly
+    when archived noise hurts. With `--no-archived` as default, the
+    1-main / N-archived case auto-picks instead of forcing path-qualify."""
+    import subprocess
+    nodes = [
+        {"id": "f1", "label": "lib.py", "file_type": "code",
+         "source_file": "lib.py", "source_location": "L1",
+         "node_kind": "file"},
+        {"id": "f2", "label": "lib.py", "file_type": "code",
+         "source_file": "legacy/v1/lib.py", "source_location": "L1",
+         "node_kind": "file"},
+        {"id": "f3", "label": "lib.py", "file_type": "code",
+         "source_file": "legacy/v2/lib.py", "source_location": "L1",
+         "node_kind": "file"},
+        {"id": "main_cls", "label": "Worker", "file_type": "code",
+         "source_file": "lib.py", "source_location": "L5-15",
+         "node_kind": "class"},
+        {"id": "leg_cls_1", "label": "Worker", "file_type": "code",
+         "source_file": "legacy/v1/lib.py", "source_location": "L5-15",
+         "node_kind": "class"},
+        {"id": "leg_cls_2", "label": "Worker", "file_type": "code",
+         "source_file": "legacy/v2/lib.py", "source_location": "L5-15",
+         "node_kind": "class"},
+        {"id": "main_m", "label": ".run()", "file_type": "code",
+         "source_file": "lib.py", "source_location": "L7-12",
+         "node_kind": "method"},
+    ]
+    links = [
+        {"source": "f1", "target": "main_cls", "relation": "contains",
+         "confidence": "EXTRACTED"},
+        {"source": "main_cls", "target": "main_m", "relation": "method",
+         "confidence": "EXTRACTED"},
+    ]
+    _write_graph(tmp_path / "graphify-out", nodes, links)
+    monkeypatch.chdir(tmp_path)
+    res = subprocess.run(
+        ["python", "-m", "graphify", "summarize", "Worker"],
+        capture_output=True, text=True, cwd=str(tmp_path), timeout=15,
+    )
+    assert res.returncode == 0, (
+        f"--no-archived should auto-pick when 1 non-archived candidate "
+        f"remains: stderr={res.stderr}"
+    )
+    out = res.stdout
+    assert "summarize class @Worker" in out, (
+        f"should land on the main Worker:\n{out}"
+    )
+    assert "auto-picked" in out, (
+        f"footer should name the auto-pick + archived hidden count:\n{out}"
+    )
+    assert "+2 archived hidden" in out, (
+        f"hidden count must surface (omission counts rule):\n{out}"
+    )
+
+
+def test_summarize_class_all_archived_shows_disambig(tmp_path, monkeypatch):
+    """`--all-archived` opts back into the disambig listing including the
+    archived candidates — useful when the agent actually wants to inspect
+    legacy code."""
+    import subprocess
+    nodes = [
+        {"id": "main_cls", "label": "Worker", "file_type": "code",
+         "source_file": "lib.py", "source_location": "L5-15",
+         "node_kind": "class"},
+        {"id": "leg_cls_1", "label": "Worker", "file_type": "code",
+         "source_file": "legacy/v1/lib.py", "source_location": "L5-15",
+         "node_kind": "class"},
+        {"id": "leg_cls_2", "label": "Worker", "file_type": "code",
+         "source_file": "legacy/v2/lib.py", "source_location": "L5-15",
+         "node_kind": "class"},
+    ]
+    _write_graph(tmp_path / "graphify-out", nodes, [])
+    monkeypatch.chdir(tmp_path)
+    res = subprocess.run(
+        ["python", "-m", "graphify", "summarize", "Worker", "--all-archived"],
+        capture_output=True, text=True, cwd=str(tmp_path), timeout=15,
+    )
+    assert res.returncode == 1, "ambiguous with --all-archived should fail loud"
+    err = res.stderr
+    assert "ambiguous" in err
+    assert "legacy/v1/lib.py" in err, (
+        f"--all-archived should keep archived candidates visible:\n{err}"
     )
 
 

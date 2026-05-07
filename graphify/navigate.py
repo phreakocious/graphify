@@ -1233,6 +1233,157 @@ def _read_body_full(source_file: str | None, source_location: str | None,
     return out, line_no, truncated
 
 
+def _strip_leading_docstring(lines: list[str]) -> tuple[list[str], int]:
+    """Drop a leading docstring or JSDoc block from a function body.
+
+    Lap-26 field-report fix: an agent who just ran `doc @foo` and follows
+    up with `peek @foo` re-reads the same docstring inside the body. The
+    `--no-docstring` flag on peek trims it.
+
+    Recognizes:
+      - Python triple-quoted strings (``\"\"\"`` / ``'''``), single- or
+        multi-line, optionally preceded by blank lines after the sig
+      - JSDoc/JS comment blocks (`/** ... */`) above the body opener
+
+    Returns (stripped_lines, n_removed). Returns the input unchanged when
+    no recognized block is found at the head of the body.
+    """
+    if len(lines) < 2:
+        return lines, 0
+    head = lines[0]
+    rest = lines[1:]
+    i = 0
+    while i < len(rest) and not rest[i].strip():
+        i += 1
+    if i >= len(rest):
+        return lines, 0
+    s = rest[i].lstrip()
+
+    if s.startswith('"""') or s.startswith("'''"):
+        delim = s[:3]
+        if delim in s[3:]:
+            return [head] + rest[i + 1:], i + 1
+        for j in range(i + 1, len(rest)):
+            if delim in rest[j]:
+                return [head] + rest[j + 1:], j + 1
+        return lines, 0
+
+    if s.startswith("/**"):
+        if "*/" in s[3:]:
+            return [head] + rest[i + 1:], i + 1
+        for j in range(i + 1, len(rest)):
+            if "*/" in rest[j]:
+                return [head] + rest[j + 1:], j + 1
+        return lines, 0
+
+    return lines, 0
+
+
+def _expand_identifier_casings(name: str) -> tuple[str, list[str]]:
+    """Expand a single identifier into a regex matching all common casings.
+
+    Lap-26 field-report fix: `search modal-complexity|modal_complexity`
+    was a manual OR. The agent's intent ("find this concept anywhere
+    regardless of how it's spelled") deserves a flag.
+
+    Tokenizes by `_`, `-`, and camel boundaries (lowercase→uppercase),
+    then re-emits as snake_case, kebab-case, camelCase, PascalCase, and
+    SCREAMING_SNAKE. Returns the regex (with `\\b...\\b` boundaries to
+    avoid mid-word hits) plus the list of casings for diagnostic output.
+
+    Single-token inputs (`foo`) emit just one casing — there's no useful
+    expansion when there are no boundaries to differ on.
+    """
+    import re as _re
+    raw = name.strip()
+    if not raw:
+        return name, [name]
+    tokens: list[str] = []
+    for part in _re.split(r"[_\-]+", raw):
+        if not part:
+            continue
+        sub = _re.sub(r"(?<=[a-z0-9])(?=[A-Z])", "_", part)
+        for t in sub.split("_"):
+            if t:
+                tokens.append(t.lower())
+    if not tokens:
+        return name, [name]
+    snake = "_".join(tokens)
+    kebab = "-".join(tokens)
+    camel = tokens[0] + "".join(t.capitalize() for t in tokens[1:])
+    pascal = "".join(t.capitalize() for t in tokens)
+    screaming = "_".join(t.upper() for t in tokens)
+    casings = list(dict.fromkeys([snake, kebab, camel, pascal, screaming]))
+    escaped = "|".join(_re.escape(c) for c in casings)
+    return rf"\b(?:{escaped})\b", casings
+
+
+def _read_rationale_body(source_file: str | None, source_location: str | None,
+                         max_lines: int = 40) -> tuple[list[str], int, bool]:
+    """Read rationale text — docstring or single-line comment — without
+    leaking into the surrounding code body.
+
+    Lap-26 field-report fix (doc body overshoot): `_extract_python_rationale`
+    stamps rationale nodes with `source_location = "L{start}"` only — no end
+    line. Routing that through `_read_body_full(flat=True, max_lines=40)`
+    sweeps in ~30 lines of body code after the docstring, violating doc's
+    "signature + docstring … without pulling the implementation" contract.
+
+    This walker stops at the close of the rationale block:
+      - Triple-quoted docstring → scan to closing ``\"\"\"`` / ``'''``
+      - Single-line comment (`# NOTE:`, `# WHY:`, …) → return that line
+      - Defensive fallback for unrecognized shapes → single line
+    """
+    if not source_file or not source_location:
+        return [], 0, False
+    if not source_location.startswith("L"):
+        return [], 0, False
+    try:
+        line_no = int(source_location[1:].split("-", 1)[0].split(":", 1)[0])
+    except ValueError:
+        return [], 0, False
+    try:
+        with open(source_file, "r", encoding="utf-8", errors="replace") as f:
+            lines = f.readlines()
+    except OSError:
+        return [], 0, False
+    start = max(0, line_no - 1)
+    if start >= len(lines):
+        return [], 0, False
+
+    first = lines[start].rstrip("\n")
+    stripped = first.lstrip()
+
+    if stripped.startswith("#"):
+        return [first], line_no, False
+
+    delim: str | None = None
+    if stripped.startswith('"""'):
+        delim = '"""'
+    elif stripped.startswith("'''"):
+        delim = "'''"
+
+    if delim is None:
+        return [first], line_no, False
+
+    # Single-line docstring: opening + closing on the same line.
+    after_open = stripped[3:]
+    if delim in after_open:
+        return [first], line_no, False
+
+    out = [first]
+    cap = max(1, max_lines)
+    for raw in lines[start + 1:start + cap]:
+        ln = raw.rstrip("\n")
+        out.append(ln)
+        if delim in ln:
+            return out, line_no, False
+
+    # Hit max_lines without seeing the close — very long docstring.
+    truncated = (start + cap) < len(lines)
+    return out, line_no, truncated
+
+
 def _coc_summary_data(G: nx.DiGraph, communities: dict[int, list[str]],
                       cursor: Cursor) -> dict:
     """Structural shape of the focus's coc community without enumerating members.
@@ -1445,6 +1596,12 @@ def _render_body_text(data: dict, *, md: bool = False) -> str:
     header = f"  read @{linked_label}  ({sf}:{ln}, {len(body_lines)} lines"
     if truncated:
         header += f" — truncated at {len(body_lines)}, raise with `read N` or focus contained items"
+    # Lap-26: surface the docstring-stripped line count so the rule
+    # "never silent on hidden items" holds. peek --no-docstring sets
+    # this; no other caller currently does.
+    docstring_stripped = data.get("docstring_stripped") or 0
+    if docstring_stripped:
+        header += f" · −{docstring_stripped} docstring"
     header += ")"
     out = [header]
     for i, raw in enumerate(body_lines):
@@ -3559,9 +3716,12 @@ def doc_node(G: nx.DiGraph, nid: str, *, max_rationale_lines: int = 40) -> dict:
     for r in rationale_blocks:
         rsrc = r["node"].get("source_file") or sf
         rloc = r["node"].get("source_location") or ""
-        body, ln, trunc = _read_body_full(rsrc, rloc,
-                                          max_lines=max_rationale_lines,
-                                          flat=True)
+        # Lap-26: docstring-aware reader stops at the closing triple-quote
+        # / end of comment block instead of dumping max_rationale_lines of
+        # surrounding body. Without this `doc` violated its own contract
+        # ("signature + docstring … without pulling the implementation").
+        body, ln, trunc = _read_rationale_body(rsrc, rloc,
+                                               max_lines=max_rationale_lines)
         body_blocks.append({
             "label": r["node"].get("label", r["id"]),
             "source_file": rsrc,
@@ -3651,6 +3811,7 @@ def _render_shape_text(data: dict) -> str:
     # navigate call to recover the range. Falls back to fn_labels when
     # the extractor didn't supply line info (Python pre-explicit-end).
     fn_entries = data.get("fn_entries") or []
+    any_ext_marker = False
     if fn_entries:
         more = data["fns"] - len(fn_entries)
         sfx = f" +{more} more" if more > 0 else ""
@@ -3665,6 +3826,8 @@ def _render_shape_text(data: dict) -> str:
             # to learn which were exported; now the marker is inline.
             ext_in = ent.get("ext_in") or 0
             ext_marker = f" ×{ext_in}" if ext_in > 0 else ""
+            if ext_in > 0:
+                any_ext_marker = True
             if s is not None and e is not None and e != s:
                 bits.append(f"{lab} L{s}-{e}{ext_marker}")
             elif s is not None:
@@ -3687,6 +3850,13 @@ def _render_shape_text(data: dict) -> str:
     if eps:
         bits = [f"{ep['label']} (×{ep['ext_in']})" for ep in eps]
         parts.append(f"    entry points: {', '.join(bits)}")
+        any_ext_marker = True
+    # Lap-26 field-report fix: agent read `×N` as "N variants of this
+    # symbol" rather than "N cross-file callers". Add a one-line legend
+    # ONLY when at least one `×N` was rendered so we don't burn tokens
+    # explaining nothing.
+    if any_ext_marker:
+        parts.append("    (×N: cross-file callers · use `wu` / `blast` to enumerate them)")
 
     return "\n".join(parts)
 

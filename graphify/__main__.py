@@ -54,7 +54,8 @@ _HELP_BLOCKS: dict[str, list[str]] = {
         "    --limit N               max neighbors to list (default 20)",
     ],
     "changed": [
-        "  changed [ref]           list code files added/modified/removed since graph extract (or vs git ref)",
+        "  changed [ref]           list code files added/modified/removed since graph extract (default: walk working tree, compare mtime to graph.json)",
+        "    --since-graph           explicit form of the default mode — files modified since the graph extract, regardless of working-tree clean state",
         "    --since-commit <ref>    diff vs a known git baseline (e.g. `--since-commit ae96912` or branch name); same as the positional [ref] but discoverable",
         "    --since <ref>           shorter alias for --since-commit",
         "    --graph <path>          path to graph.json (default graphify-out/graph.json)",
@@ -64,8 +65,12 @@ _HELP_BLOCKS: dict[str, list[str]] = {
         "    --methods N             max methods listed (default 30; +N more tail if truncated)",
         "    --callers N             max cross-file callers listed (default 8)",
         "    --md                    render labels as `[label](file:line)` markdown links",
+        "    --no-archived           skip archived (frozen/legacy/deprecated/archive) candidates in disambig (default)",
+        "    --archived-only         restrict candidates to archived paths (inspecting legacy code)",
+        "    --all-archived          show all candidates, archived included",
         "    --graph <path>          path to graph.json (default graphify-out/graph.json)",
         "    Resolves the same as `peek`/`blast` (Class.method, path-qualified, fuzzy fallback). Errors if target isn't a class/interface; suggests `peek` or `blast` for other shapes.",
+        "    Disambig auto-picks the unique non-archived match when `--no-archived` (default) leaves exactly one candidate; the count is surfaced as `+N archived hidden`.",
         "  summarize               (no target) repo-wide architectural overview: top communities, cross-file entry points, edge mix, language counts, freshness. Mostly useful for first-contact orientation.",
         "    --graph <path>          path to graph.json (default graphify-out/graph.json)",
     ],
@@ -74,6 +79,7 @@ _HELP_BLOCKS: dict[str, list[str]] = {
         "    --lines N               max lines of body to dump (default 200; walker bails at natural dedent first)",
         "    --tail N                last N source lines of the body (skips earlier lines — useful for return values / cleanup of large fns)",
         "    --range A-B             keep file-absolute lines A..B of the body (1-indexed, inclusive). Use the `L<x>-<y>` shown by `shape`/`navigate` to pick a window. Mutually exclusive with --tail.",
+        "    --no-docstring          drop a leading docstring/JSDoc block from the body. Pairs with `doc` — after `doc @foo` already showed the rationale, `peek --no-docstring @foo` skips re-reading it. Surfaces `−N docstring` in the header.",
         "    --bodies N              when peeking a class, body lines per method (default 3)",
         "    --md                    render the focus label as a clickable `[label](file:line)` link",
         "    --graph <path>          path to graph.json (default graphify-out/graph.json)",
@@ -124,6 +130,7 @@ _HELP_BLOCKS: dict[str, list[str]] = {
         "    --limit N               max hits (default 50)",
         "    --context N             N lines of pre/post context around each match (default 1; pass 0 to disable)",
         "    --by-symbol             collapse same-symbol hits — one row per containing node with `×N (lines: ...)` (good for `where is X used?`)",
+        "    --idents                treat the pattern as an identifier; auto-OR all 5 casings (snake_case, kebab-case, camelCase, PascalCase, SCREAMING_SNAKE) with word-boundary anchors. Cuts the rename-audit OR by hand.",
         "    --md                    label rendered as `[label](file:line)` markdown link",
         "    --json                  structured JSON output",
         "    --graph <path>          path to graph.json (default graphify-out/graph.json)",
@@ -2216,6 +2223,13 @@ def main() -> None:
         method_limit = 30
         caller_limit = 8
         md = False
+        # Lap-26 field-report fix: `summarize @SymplecticGeometry` matched
+        # 4 nodes — 1 main + 3 in `results/symplectic_v3/` (ShinkaEvolve
+        # generation outputs). Disambig is exactly when archived noise
+        # hurts. Match `search`'s default of "no archived" here; agents
+        # who actually want the archive inspect with `--archived-only`
+        # or `--all-archived`.
+        archived_mode = "no"
         args = sys.argv[2:]
         i = 0
         while i < len(args):
@@ -2234,6 +2248,12 @@ def main() -> None:
                 caller_limit = max(0, int(a.split("=", 1)[1])); i += 1
             elif a == "--md":
                 md = True; i += 1
+            elif a == "--no-archived":
+                archived_mode = "no"; i += 1
+            elif a == "--archived-only":
+                archived_mode = "only"; i += 1
+            elif a == "--all-archived":
+                archived_mode = "all"; i += 1
             elif target is None and not a.startswith("--"):
                 target = a; i += 1
             else:
@@ -2250,12 +2270,30 @@ def main() -> None:
         # path-qualified target.
         if target:
             from graphify.resolve import label_index, resolve_focus
+            from graphify.navigate import _filter_archived_ids
             idx = label_index(G)
             chosen, candidates, match_type, _alts = resolve_focus(G, idx, target)
+            archived_hidden = 0
+            if not chosen and candidates:
+                # Lap-26: apply --no-archived (default) before disambig so the
+                # common 1-main / N-archived case auto-resolves instead of
+                # forcing the agent to path-qualify away ShinkaEvolve /
+                # legacy generations.
+                filtered, archived_hidden = _filter_archived_ids(
+                    G, candidates, archived_mode)
+                if len(filtered) == 1:
+                    chosen = filtered[0]
+                    if archived_hidden:
+                        print(f"# auto-picked unique non-archived match "
+                              f"(+{archived_hidden} archived hidden, "
+                              f"unhide with --all-archived)")
+                else:
+                    candidates = filtered
             if not chosen:
                 if candidates:
                     print(f"ambiguous `{target}` ({len(candidates)} matches). "
-                          f"qualify with @<dir>/<file>/<symbol>:", file=sys.stderr)
+                          f"qualify with @<dir>/<file>/<symbol>:",
+                          file=sys.stderr)
                     for nid in candidates[:8]:
                         a_attrs = G.nodes[nid]
                         sf_a = a_attrs.get("source_file", "?")
@@ -2265,6 +2303,10 @@ def main() -> None:
                               file=sys.stderr)
                     if len(candidates) > 8:
                         print(f"  +{len(candidates) - 8} more", file=sys.stderr)
+                    if archived_hidden:
+                        print(f"  +{archived_hidden} archived hidden "
+                              f"(unhide with --all-archived)",
+                              file=sys.stderr)
                     sys.exit(1)
                 print(f"no node matches `{target}`.", file=sys.stderr)
                 sys.exit(1)
@@ -2592,6 +2634,7 @@ def main() -> None:
         if top_entries:
             print()
             print("  Entry points (cross-file callers):")
+            phantom_labels: list[str] = []
             for lab, n, sf, loc, variants in top_entries:
                 # Render `compare() ×104  src/foo.py:42`. Extract the
                 # start line from the L<a>-<b> source_location format;
@@ -2617,10 +2660,21 @@ def main() -> None:
                 annot = ""
                 if variants and variants >= 10:
                     annot += f" ({variants} variants — likely phantom)"
+                    phantom_labels.append(lab)
                 struct = file_struct_count.get(sf, 0)
                 if struct == 0:
                     annot += " (no callable surface in source_file)"
                 print(f"    {lab:<36} ×{n}{where}{annot}")
+            # Lap-26 field-report fix: phantom heuristic was opaque ("how
+            # do I investigate?"). Name the verbs that surface the actual
+            # variants (disambig listing). One line, fires only when at
+            # least one phantom row was emitted.
+            if phantom_labels:
+                example = phantom_labels[0]
+                print(f"  drill phantom variants: "
+                      f"`graphify navigate \"@{example}\"` (disambig list) "
+                      f"or `graphify locate \"{example.rstrip('()')}\"` "
+                      f"(file:line per match)")
         if rel_counts:
             print()
             total_rel = sum(rel_counts.values())
@@ -2702,6 +2756,12 @@ def main() -> None:
         # symbols.
         ref: str | None = None
         graph_path = "graphify-out/graph.json"
+        # Lap-26 field-report fix: the no-ref "compare against graph extract
+        # mtime" mode was the default-and-only-way, but undiscoverable —
+        # field report: "I didn't see a flag to ask `since the graph extract
+        # even if working tree is clean`." Adding `--since-graph` as an
+        # explicit alias makes the intent legible in scripts.
+        explicit_since_graph = False
         args = sys.argv[2:]
         i = 0
         while i < len(args):
@@ -2710,6 +2770,8 @@ def main() -> None:
                 graph_path = args[i + 1]; i += 2
             elif a.startswith("--graph="):
                 graph_path = a.split("=", 1)[1]; i += 1
+            elif a == "--since-graph":
+                explicit_since_graph = True; i += 1
             elif a in ("--since-commit", "--since") and i + 1 < len(args):
                 # Lap-21 polish: discoverable named flag for the positional
                 # ref. The positional is still supported for back-compat.
@@ -2722,6 +2784,10 @@ def main() -> None:
                 i += 1
             else:
                 ref = a; i += 1
+        if explicit_since_graph and ref is not None:
+            print("error: --since-graph and --since-commit are mutually exclusive.",
+                  file=sys.stderr)
+            sys.exit(1)
         gp = Path(graph_path).resolve()
         if not gp.exists():
             print(f"error: graph file not found: {gp}", file=sys.stderr)
@@ -2854,6 +2920,7 @@ def main() -> None:
         from graphify.navigate import (
             DEFAULT_GRAPH_PATH, load_graph,
             _read_body_full, _render_body_text, _read_body_preview,
+            _strip_leading_docstring,
         )
         from graphify.resolve import label_index, resolve_focus
         from graphify.analyze import _is_file_node
@@ -2869,6 +2936,10 @@ def main() -> None:
         # task_004 + zero-tvm task_005.
         tail: int | None = None
         range_spec: str | None = None
+        # Lap-26: --no-docstring strips a leading docstring/JSDoc block
+        # from the body. After running `doc`, the agent already has the
+        # docstring; re-reading it inside the body is wasted tokens.
+        strip_docstring = False
         target: str | None = None
         i = 0
         while i < len(args):
@@ -2893,6 +2964,8 @@ def main() -> None:
                 bodies = max(0, int(args[i + 1])); i += 2
             elif a.startswith("--bodies="):
                 bodies = max(0, int(a.split("=", 1)[1])); i += 1
+            elif a == "--no-docstring":
+                strip_docstring = True; i += 1
             elif a == "--md":
                 md = True; i += 1
             elif target is None:
@@ -3100,6 +3173,12 @@ def main() -> None:
                         trunc = False
                 else:
                     body, ln, trunc = _read_body_full(sf, loc, max_lines=max_lines, flat=is_file)
+                # Lap-26: --no-docstring trims a leading docstring/JSDoc
+                # block. Useful after `doc` already showed the rationale.
+                # No-op when the body has no recognized leading block.
+                docstring_stripped = 0
+                if strip_docstring and body:
+                    body, docstring_stripped = _strip_leading_docstring(body)
                 data = {
                     "type": "body",
                     "label": nattrs.get("label", chosen),
@@ -3108,6 +3187,7 @@ def main() -> None:
                     "lines": body,
                     "start_line": ln,
                     "truncated": trunc,
+                    "docstring_stripped": docstring_stripped,
                 }
                 print(_render_body_text(data, md=md))
         if multi and not any_ok:
@@ -3532,6 +3612,11 @@ def main() -> None:
         by_symbol = False
         md = False
         fmt = "text"
+        # Lap-26: --idents auto-expands a single identifier into all 5
+        # casing variants joined as a `\b(...)\b` regex. Field-report
+        # friction: agent had to manually OR `modal-complexity` and
+        # `modal_complexity` to catch both forms during a rename audit.
+        idents_mode = False
         i = 0
         while i < len(args):
             a = args[i]
@@ -3559,6 +3644,8 @@ def main() -> None:
                 context = max(0, int(a.split("=", 1)[1])); i += 1
             elif a == "--by-symbol":
                 by_symbol = True; i += 1
+            elif a == "--idents":
+                idents_mode = True; i += 1
             elif a == "--md":
                 md = True; i += 1
             elif a == "--json":
@@ -3574,10 +3661,16 @@ def main() -> None:
                 i += 1
         if not pattern:
             print("Usage: graphify search <pattern> [--kind code|rationale|all] "
-                  "[--limit N] [--context N] [--by-symbol] [--md] [--json] "
+                  "[--limit N] [--context N] [--by-symbol] [--idents] [--md] [--json] "
                   "[--no-archived|--archived-only|--all-archived] [--graph PATH]",
                   file=sys.stderr)
             sys.exit(1)
+        if idents_mode:
+            from graphify.navigate import _expand_identifier_casings
+            expanded, casings = _expand_identifier_casings(pattern)
+            print(f"# --idents: expanded `{pattern}` → "
+                  f"{', '.join(casings)}", file=sys.stderr)
+            pattern = expanded
         if kind not in ("code", "rationale", "all"):
             print(f"error: --kind must be one of code|rationale|all (got `{kind}`)",
                   file=sys.stderr)
