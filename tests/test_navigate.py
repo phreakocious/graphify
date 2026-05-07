@@ -3224,6 +3224,194 @@ def test_peek_brace_all_miss_exits_one(tmp_path):
     )
 
 
+def test_peek_tail_returns_last_n_body_lines(tmp_path):
+    """Lap-25 cluster-B: `peek <method> --tail N` returns last N lines of
+    the body so an agent inspecting return values / cleanup of a large fn
+    doesn't have to walk the whole body. Recovery without --tail is
+    `read_file` with a computed offset — three calls minimum."""
+    import json as _json, subprocess
+    src = (
+        "def big_fn():\n"           # L1: header
+        "    a = 1\n"                # L2
+        "    b = 2\n"                # L3
+        "    c = 3\n"                # L4
+        "    d = 4\n"                # L5
+        "    return a + b + c + d\n" # L6
+    )
+    (tmp_path / "big.py").write_text(src)
+    nodes = [
+        {"id": "f", "label": "big_fn()", "file_type": "code",
+         "source_file": "big.py", "source_location": "L1-6",
+         "node_kind": "function"},
+    ]
+    graph_dir = tmp_path / "graphify-out"
+    graph_dir.mkdir()
+    (graph_dir / "graph.json").write_text(_json.dumps(
+        {"directed": True, "multigraph": False, "graph": {},
+         "nodes": nodes, "links": []}), encoding="utf-8")
+    res = subprocess.run(
+        ["graphify", "peek", "big_fn", "--tail", "2",
+         "--graph", str(graph_dir / "graph.json")],
+        capture_output=True, text=True, cwd=str(tmp_path),
+    )
+    assert res.returncode == 0, f"peek --tail failed:\n{res.stderr}\n{res.stdout}"
+    out = res.stdout
+    # body extracted is 6 lines (L1-6 plus the trailing blank-tolerant
+    # walker may include 1 trailing blank — assert structurally on the
+    # presence of the return-statement line and the absence of L1's def).
+    assert "return a + b + c + d" in out, f"--tail dropped the return:\n{out}"
+    # The header line `def big_fn():` should NOT appear when --tail 2 is
+    # used (we asked for last 2 lines).
+    assert "def big_fn():" not in out, f"--tail 2 should drop header:\n{out}"
+
+
+def test_peek_range_returns_file_absolute_window(tmp_path):
+    """Lap-25 cluster-B: `peek <fn> --range A-B` returns lines A..B
+    (file-absolute, inclusive) of the body. Pairs with the `L<x>-<y>`
+    line ranges shape/navigate already surface — agent reads the range
+    off shape, dumps the slice in one call."""
+    import json as _json, subprocess
+    src = (
+        "def big_fn():\n"           # L1
+        "    a = 1\n"                # L2
+        "    b = 2\n"                # L3
+        "    c = 3\n"                # L4
+        "    return a + b + c\n"    # L5
+    )
+    (tmp_path / "big.py").write_text(src)
+    nodes = [
+        {"id": "f", "label": "big_fn()", "file_type": "code",
+         "source_file": "big.py", "source_location": "L1-5",
+         "node_kind": "function"},
+    ]
+    graph_dir = tmp_path / "graphify-out"
+    graph_dir.mkdir()
+    (graph_dir / "graph.json").write_text(_json.dumps(
+        {"directed": True, "multigraph": False, "graph": {},
+         "nodes": nodes, "links": []}), encoding="utf-8")
+    res = subprocess.run(
+        ["graphify", "peek", "big_fn", "--range", "3-4",
+         "--graph", str(graph_dir / "graph.json")],
+        capture_output=True, text=True, cwd=str(tmp_path),
+    )
+    assert res.returncode == 0, f"peek --range failed:\n{res.stderr}\n{res.stdout}"
+    out = res.stdout
+    assert "b = 2" in out, f"--range 3-4 should include line 3:\n{out}"
+    assert "c = 3" in out, f"--range 3-4 should include line 4:\n{out}"
+    # Lines outside the range must NOT appear.
+    assert "a = 1" not in out, f"--range 3-4 leaked line 2:\n{out}"
+    assert "return a + b + c" not in out, f"--range 3-4 leaked line 5:\n{out}"
+
+
+def test_peek_range_out_of_bounds_errors(tmp_path):
+    """Lap-25 cluster-B: --range that misses the body prints a named
+    error showing the actual body line range so the agent can re-issue
+    with the right window. Falls back to soft-fail in multi mode."""
+    import json as _json, subprocess
+    src = "def small():\n    return 1\n"  # body L1-2
+    (tmp_path / "s.py").write_text(src)
+    nodes = [
+        {"id": "f", "label": "small()", "file_type": "code",
+         "source_file": "s.py", "source_location": "L1-2",
+         "node_kind": "function"},
+    ]
+    graph_dir = tmp_path / "graphify-out"
+    graph_dir.mkdir()
+    (graph_dir / "graph.json").write_text(_json.dumps(
+        {"directed": True, "multigraph": False, "graph": {},
+         "nodes": nodes, "links": []}), encoding="utf-8")
+    res = subprocess.run(
+        ["graphify", "peek", "small", "--range", "100-200",
+         "--graph", str(graph_dir / "graph.json")],
+        capture_output=True, text=True, cwd=str(tmp_path),
+    )
+    assert res.returncode == 1, (
+        f"--range outside body should exit 1 in single mode, got "
+        f"rc={res.returncode}\nstdout:\n{res.stdout}\nstderr:\n{res.stderr}"
+    )
+    # Diagnostic names the actual body window so agent can pick valid range.
+    assert "falls outside body" in res.stdout, (
+        f"missing diagnostic on out-of-range:\n{res.stdout}"
+    )
+
+
+def test_peek_tail_and_range_mutually_exclusive(tmp_path):
+    """Lap-25 cluster-B: --tail and --range together is incoherent;
+    error fast rather than silently picking one."""
+    import json as _json, subprocess
+    graph_dir = tmp_path / "graphify-out"
+    graph_dir.mkdir()
+    (graph_dir / "graph.json").write_text(_json.dumps(
+        {"directed": True, "multigraph": False, "graph": {},
+         "nodes": [{"id": "x", "label": "x()", "file_type": "code",
+                    "source_file": "x.py", "source_location": "L1"}],
+         "links": []}), encoding="utf-8")
+    res = subprocess.run(
+        ["graphify", "peek", "x", "--tail", "3", "--range", "1-2",
+         "--graph", str(graph_dir / "graph.json")],
+        capture_output=True, text=True, cwd=str(tmp_path),
+    )
+    assert res.returncode == 1
+    assert "mutually exclusive" in res.stderr, res.stderr
+
+
+def test_peek_method_default_uses_indent_walker(tmp_path):
+    """Lap-25 cluster-B incidental: peek of a method (label `.foo()`)
+    with default flags returns the method's body, not a flat dump that
+    bleeds into the next sibling. Pre-fix, peek used `_is_file_node`
+    (returns True for any `.method()`) to choose flat mode — invisible
+    at the 200-line cap, would burst on any `--tail`/`--range`."""
+    import json as _json, subprocess
+    src = (
+        "class C:\n"                 # L1
+        "    def first(self):\n"     # L2: header
+        "        a = 1\n"            # L3
+        "        return a\n"         # L4
+        "\n"                          # L5
+        "    def second(self):\n"    # L6 — must NOT bleed in
+        "        return 99\n"        # L7
+    )
+    (tmp_path / "c.py").write_text(src)
+    nodes = [
+        {"id": "cls", "label": "C", "file_type": "code",
+         "source_file": "c.py", "source_location": "L1",
+         "node_kind": "class"},
+        {"id": "m1", "label": ".first()", "file_type": "code",
+         "source_file": "c.py", "source_location": "L2-4",
+         "node_kind": "impl_method"},
+        {"id": "m2", "label": ".second()", "file_type": "code",
+         "source_file": "c.py", "source_location": "L6-7",
+         "node_kind": "impl_method"},
+    ]
+    links = [
+        {"source": "cls", "target": "m1", "relation": "method",
+         "confidence": "EXTRACTED"},
+        {"source": "cls", "target": "m2", "relation": "method",
+         "confidence": "EXTRACTED"},
+    ]
+    graph_dir = tmp_path / "graphify-out"
+    graph_dir.mkdir()
+    (graph_dir / "graph.json").write_text(_json.dumps(
+        {"directed": True, "multigraph": False, "graph": {},
+         "nodes": nodes, "links": links}), encoding="utf-8")
+    res = subprocess.run(
+        ["graphify", "peek", "C.first",
+         "--graph", str(graph_dir / "graph.json")],
+        capture_output=True, text=True, cwd=str(tmp_path),
+    )
+    assert res.returncode == 0, f"peek failed:\n{res.stderr}\n{res.stdout}"
+    out = res.stdout
+    assert "def first(self):" in out, f"missing method header:\n{out}"
+    assert "return a" in out, f"missing first's return:\n{out}"
+    # Pre-fix this was the bug: peek bled into the next method's body.
+    assert "def second" not in out, (
+        f"peek of `C.first` bled into the next method's body:\n{out}"
+    )
+    assert "return 99" not in out, (
+        f"peek of `C.first` bled into `second`'s return:\n{out}"
+    )
+
+
 def test_method_listings_attribute_owning_class(tmp_path, monkeypatch):
     """Lap-21 #1 (sub-agent head-to-head): rows for `.method()`-shape
     nodes show `Class.method()` instead of bare `.method()`. The agent

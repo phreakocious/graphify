@@ -37,7 +37,7 @@ Turn any folder of files into a navigable knowledge graph with community detecti
 /graphify navigate --session <id>                     # resume a prior session (id is printed in every output)
 /graphify navigate --show-session <id>                # peek a saved session's frontier without mutating the cursor
 /graphify navigate --quiet-hints                      # suppress hint lines (per-session dedup also applies on --session)
-/graphify peek "<symbol>"                             # one-shot body read — resolve, dump body, no session/cursor side-effects (accepts Class.method; brace-expand `@Class.{m1,m2,m3}` for N method bodies in one call)
+/graphify peek "<symbol>"                             # one-shot body read — resolve, dump body, no session/cursor side-effects (accepts Class.method; brace-expand `@Class.{m1,m2,m3}` for N method bodies in one call; `--tail N` / `--range A-B` to slice large bodies instead of falling back to read_file)
 /graphify blast "<symbol>"                            # one-shot blast radius — callers + callees side-by-side under ## Callers / ## Callees (refactor planning, cursor-free; brace-expand `@Class.{m1,m2}` for multi-symbol blast)
 /graphify summarize "@<Class>"                        # one-shot class summary — signature + method list + cross-file callers + inheritance fused into one call (use for "tell me about this class" tasks instead of falling back to read_file on huge bodies)
 /graphify search "<pattern>"                          # body-text grep across nodes — returns hits with symbol context (label, file:line, container, community, degree)
@@ -1516,6 +1516,8 @@ $(cat graphify-out/.graphify_python) -m graphify peek <symbol> [--lines N] [--md
 ```
 
 - `--lines N` — max body lines (default 200; the indent walker bails at the natural dedent first, so this is a cap).
+- `--tail N` — last N source lines of the body. Use to inspect return values / cleanup of a large fn without dumping the whole thing.
+- `--range A-B` — keep file-absolute lines `A..B` (1-indexed, inclusive). Use the `L<x>-<y>` shape/navigate already prints. Mutually exclusive with `--tail`.
 - `--md` — wrap focus label as `[label](file:line)` for IDE click-through.
 - Path qualifiers work: `peek tools/foo.py/_classify_file`.
 - **Brace-expand for multi-method dumps**: `peek "@Class.{m1,m2,m3}"` dumps three method bodies in one call. Section header `# [i/N] @Class.mi` separates each body. Misses print inline; exit 1 only when every target misses.

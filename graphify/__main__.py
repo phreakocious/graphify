@@ -72,6 +72,8 @@ _HELP_BLOCKS: dict[str, list[str]] = {
     "peek": [
         "  peek <symbol>           one-shot body read — resolve, dump body, touch no cursor/session/history",
         "    --lines N               max lines of body to dump (default 200; walker bails at natural dedent first)",
+        "    --tail N                last N source lines of the body (skips earlier lines — useful for return values / cleanup of large fns)",
+        "    --range A-B             keep file-absolute lines A..B of the body (1-indexed, inclusive). Use the `L<x>-<y>` shown by `shape`/`navigate` to pick a window. Mutually exclusive with --tail.",
         "    --bodies N              when peeking a class, body lines per method (default 3)",
         "    --md                    render the focus label as a clickable `[label](file:line)` link",
         "    --graph <path>          path to graph.json (default graphify-out/graph.json)",
@@ -2860,6 +2862,12 @@ def main() -> None:
         bodies = 3       # lines per method when peeking a class
         method_limit = 12  # cap on methods shown in curated dump
         md = False
+        # Lap-25 cluster-B fix: agents fell back to read_file/sed when peek
+        # gave them a 482-line body wall and they only wanted the cleanup
+        # (--tail) or a specific range (--range). Both surfaced on EGF
+        # task_004 + zero-tvm task_005.
+        tail: int | None = None
+        range_spec: str | None = None
         target: str | None = None
         i = 0
         while i < len(args):
@@ -2872,6 +2880,14 @@ def main() -> None:
                 max_lines = max(1, int(args[i + 1])); i += 2
             elif a.startswith("--lines="):
                 max_lines = max(1, int(a.split("=", 1)[1])); i += 1
+            elif a == "--tail" and i + 1 < len(args):
+                tail = max(1, int(args[i + 1])); i += 2
+            elif a.startswith("--tail="):
+                tail = max(1, int(a.split("=", 1)[1])); i += 1
+            elif a == "--range" and i + 1 < len(args):
+                range_spec = args[i + 1]; i += 2
+            elif a.startswith("--range="):
+                range_spec = a.split("=", 1)[1]; i += 1
             elif a == "--bodies" and i + 1 < len(args):
                 bodies = max(0, int(args[i + 1])); i += 2
             elif a.startswith("--bodies="):
@@ -2887,6 +2903,24 @@ def main() -> None:
                 print(f"warning: ignoring extra arg `{a}`. peek takes a single target.",
                       file=sys.stderr)
                 i += 1
+        if tail is not None and range_spec is not None:
+            print("error: --tail and --range are mutually exclusive.", file=sys.stderr)
+            sys.exit(1)
+        range_lo: int | None = None
+        range_hi: int | None = None
+        if range_spec is not None:
+            try:
+                if "-" in range_spec:
+                    lo_s, hi_s = range_spec.split("-", 1)
+                    range_lo = int(lo_s); range_hi = int(hi_s)
+                else:
+                    range_lo = range_hi = int(range_spec)
+                if range_lo > range_hi:
+                    raise ValueError
+            except ValueError:
+                print(f"error: --range expects N-M (file-absolute lines), got `{range_spec}`",
+                      file=sys.stderr)
+                sys.exit(1)
         if not target:
             print("Usage: graphify peek <symbol> [--lines N] [--md] [--graph PATH]",
                   file=sys.stderr)
@@ -3028,8 +3062,43 @@ def main() -> None:
                 if more > 0:
                     print(f"    +{more} more — `peek {label}.<method>` for individual bodies")
             else:
-                is_file = _is_file_node(G, chosen)
-                body, ln, trunc = _read_body_full(sf, loc, max_lines=max_lines, flat=is_file)
+                # Lap-25 cluster-B incidental fix: peek used `_is_file_node`
+                # (an analyze.py classifier intended to filter method-stubs
+                # from "knowledge gap" reports) which returns True for every
+                # `.method()` label. That accidentally put method peeks into
+                # flat-read mode — invisible at the 200-line default but
+                # broken under --tail/--range with a 10k cap. Anchor on the
+                # actual node_kind so the indent walker handles methods.
+                is_file = (nattrs.get("node_kind") == "file")
+                if tail is not None or range_lo is not None:
+                    # Read full body (generous cap), then slice. Truncation
+                    # marker drops because the caller asked for a window, not
+                    # a head-cap; line numbers in the render show what's shown.
+                    full_body, ln_full, _ = _read_body_full(
+                        sf, loc, max_lines=10_000, flat=is_file
+                    )
+                    if tail is not None:
+                        body = full_body[-tail:]
+                        ln = ln_full + (len(full_body) - len(body))
+                        trunc = False
+                    else:
+                        body_end = ln_full + len(full_body) - 1
+                        if range_hi < ln_full or range_lo > body_end:
+                            label = nattrs.get("label", chosen)
+                            loc_short = loc[1:] if loc and loc.startswith("L") else (loc or "")
+                            print(f"  peek @{label}: --range {range_lo}-{range_hi} "
+                                  f"falls outside body L{loc_short} "
+                                  f"(body lines {ln_full}-{body_end})")
+                            if multi:
+                                continue
+                            sys.exit(1)
+                        lo = max(range_lo, ln_full)
+                        hi = min(range_hi, body_end)
+                        body = full_body[lo - ln_full:hi - ln_full + 1]
+                        ln = lo
+                        trunc = False
+                else:
+                    body, ln, trunc = _read_body_full(sf, loc, max_lines=max_lines, flat=is_file)
                 data = {
                     "type": "body",
                     "label": nattrs.get("label", chosen),
