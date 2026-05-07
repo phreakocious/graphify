@@ -269,6 +269,25 @@ def _new_session_id() -> str:
     return secrets.token_hex(3)
 
 
+def _has_chainable_outcome(data: dict | None) -> bool:
+    """Lap-27 #8: did the call produce something the agent can chain on?
+
+    Used to gate session-id printing — on hard misses (resolver returned
+    no candidates, --node-kind filtered the listing to zero) the cursor
+    didn't move, so `--session <id>` won't recover anything useful and
+    the line is noise. Disambig listings have items and ARE chainable
+    via `[N] --session <id>`, so this returns True for them.
+    """
+    if data is None:
+        return False
+    t = data.get("type")
+    if t == "error":
+        return False
+    if t == "listing" and not data.get("items"):
+        return False
+    return True
+
+
 # --- session-recent path log ----------------------------------------------
 #
 # Lap-3: the PreToolUse hook nudges "scout cheaper with graphify" on every
@@ -4772,10 +4791,12 @@ def navigate(ops: list[str] | str, *,
         parts.append(json.dumps(last_data, default=str))
 
     # Print the session id so the agent has something to pass to
-    # `--session` on the next call if they want to chain. Always
-    # printed when session_id is set (i.e. session is not False);
-    # see lap-22 comment block above for the rationale.
-    if session_id is not None:
+    # `--session` on the next call if they want to chain. Suppressed
+    # on hard misses (resolver miss, kind-filter zeroed listing) per
+    # lap-27 #8 — the call produced nothing pickable so threading
+    # --session won't help recover. Lap-22 disambig affordance is
+    # preserved: disambig listings have items and ARE pickable.
+    if session_id is not None and _has_chainable_outcome(last_data):
         parts.append(f"  session: {session_id}  (resume with --session {session_id})")
         # Lap-22b: on a disambig listing, the numbered rows look
         # pickable (because they ARE — `navigate "[N]"` works) but

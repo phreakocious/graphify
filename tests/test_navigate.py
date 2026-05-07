@@ -564,6 +564,101 @@ def test_pivot_listing_does_not_emit_pick_hint(tmp_path, monkeypatch):
     )
 
 
+def test_session_id_suppressed_on_resolver_miss(tmp_path, monkeypatch):
+    """Lap-27 #8: when `@<symbol>` resolves to no candidates, the call
+    produced nothing the agent can chain on — the cursor didn't move.
+    Printing `session: <id>` in that case is noise on a hard miss.
+    Drop it; agents who got here via an existing chain can re-pass
+    --session manually if they want to recover."""
+    import json as _json
+    from graphify.navigate import navigate
+    nodes = [
+        {"id": "n1", "label": "alpha()", "file_type": "code",
+         "source_file": "a.py", "source_location": "L1", "community": 0},
+    ]
+    graph_dir = tmp_path / "graphify-out"
+    graph_dir.mkdir()
+    (graph_dir / "graph.json").write_text(_json.dumps(
+        {"nodes": nodes, "links": []}), encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+    out = navigate(["@zqqqzzz_nonexistent"], session=True, fmt="text")
+    assert "no node matches" in out
+    assert "session:" not in out, (
+        f"session-id should be suppressed on a hard resolver miss:\n{out}"
+    )
+
+
+def test_session_id_suppressed_on_kind_filter_zeroed_listing(tmp_path, monkeypatch):
+    """Lap-27 #8: when --node-kind filters every row out of a listing,
+    the result has zero pickable items. Session-id is noise — there's
+    nothing to chain on, and the agent got the message that the filter
+    was too tight from the omission count itself."""
+    import json as _json
+    from graphify.navigate import navigate
+    nodes = [
+        {"id": "f", "label": "lib.py", "file_type": "code",
+         "source_file": "lib.py", "source_location": "L1",
+         "node_kind": "file"},
+        {"id": "g", "label": "go()", "file_type": "code",
+         "source_file": "lib.py", "source_location": "L5",
+         "node_kind": "function", "community": 0},
+    ]
+    links = [
+        {"source": "f", "target": "g", "relation": "contains",
+         "confidence": "EXTRACTED"},
+    ]
+    graph_dir = tmp_path / "graphify-out"
+    graph_dir.mkdir()
+    (graph_dir / "graph.json").write_text(_json.dumps(
+        {"nodes": nodes, "links": links}), encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+    # contains listing of one fn, filtered to interfaces only → zero items.
+    out = navigate(["@lib.py", "contains", "--node-kind", "interface"],
+                   session=True, fmt="text")
+    assert "session:" not in out, (
+        f"session-id should be suppressed when --node-kind zeros the listing:\n{out}"
+    )
+
+
+def test_session_id_kept_on_disambig_listing_with_pickable_rows(tmp_path, monkeypatch):
+    """Lap-27 #8 regression guard: the lap-22 pickable-disambig affordance
+    must not regress. Disambig listings have items and ARE chainable via
+    `[N] --session <id>`; session-id stays."""
+    import json as _json
+    from graphify.navigate import navigate
+    nodes = [
+        {"id": "fa", "label": "lib.py", "file_type": "code",
+         "source_file": "lib.py", "source_location": "L1",
+         "node_kind": "file"},
+        {"id": "fb", "label": "tools.py", "file_type": "code",
+         "source_file": "tools.py", "source_location": "L1",
+         "node_kind": "file"},
+        {"id": "ra", "label": "run()", "file_type": "code",
+         "source_file": "lib.py", "source_location": "L10-20",
+         "node_kind": "function", "community": 0},
+        {"id": "rb", "label": "run()", "file_type": "code",
+         "source_file": "tools.py", "source_location": "L30-40",
+         "node_kind": "function", "community": 0},
+    ]
+    links = [
+        {"source": "fa", "target": "ra", "relation": "contains",
+         "confidence": "EXTRACTED"},
+        {"source": "fb", "target": "rb", "relation": "contains",
+         "confidence": "EXTRACTED"},
+    ]
+    graph_dir = tmp_path / "graphify-out"
+    graph_dir.mkdir()
+    (graph_dir / "graph.json").write_text(_json.dumps(
+        {"nodes": nodes, "links": links}), encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+    out = navigate(["@run"], session=True, fmt="text")
+    assert "ambiguous" in out
+    assert "session:" in out, (
+        f"disambig keeps session-id (rows are pickable):\n{out}"
+    )
+    assert "to pick a row" in out
+
+
 def test_siblings_on_file_returns_n_a(tmp_path, monkeypatch):
     """Lap-6 friction 10: `siblings` on a file used to return empty;
     the user couldn't tell whether it was a real empty or a misuse.
