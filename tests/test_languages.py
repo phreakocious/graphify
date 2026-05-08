@@ -668,3 +668,118 @@ def test_markdown_no_dangling_edges():
     node_ids = {n["id"] for n in r["nodes"]}
     for e in r["edges"]:
         assert e["source"] in node_ids, f"Dangling source: {e}"
+
+
+# ── Markdown→code reference merge-pass ──────────────────────────────────────
+
+
+def test_markdown_captures_pending_refs(tmp_path):
+    """extract_markdown emits pending_md_refs for backticked tokens scoped
+    to the most-recent heading. Resolution itself happens at merge time —
+    this test checks the per-file capture step in isolation."""
+    from graphify.extract import extract_markdown
+    md = tmp_path / "guide.md"
+    md.write_text(
+        "# Top\n\n"
+        "## Authentication\n\n"
+        "Use `Authenticator` to log in. The `login` method is async.\n"
+    )
+    r = extract_markdown(md)
+    refs = r.get("pending_md_refs", [])
+    tokens = {ref["token"] for ref in refs}
+    assert "Authenticator" in tokens
+    assert "login" in tokens
+
+
+def test_markdown_skips_short_and_path_tokens(tmp_path):
+    """Capture-time filters drop tokens shorter than 3 chars and tokens that
+    look like file paths or CLI flags."""
+    from graphify.extract import extract_markdown
+    md = tmp_path / "noise.md"
+    md.write_text(
+        "# x\n"
+        "Skip these: `i`, `--flag`, `path/to/file.py`, `foo bar`. "
+        "Keep `MyClass`.\n"
+    )
+    r = extract_markdown(md)
+    tokens = {ref["token"] for ref in r.get("pending_md_refs", [])}
+    assert tokens == {"MyClass"}
+
+
+def test_markdown_refs_resolve_to_code_symbols(tmp_path):
+    """End-to-end: a python class is referenced by name in a sibling
+    markdown file; extract() emits a `references` edge from the md
+    heading to the class node."""
+    from graphify.extract import extract
+    (tmp_path / "auth.py").write_text(
+        "class Authenticator:\n"
+        "    def login(self):\n"
+        "        pass\n"
+    )
+    (tmp_path / "README.md").write_text(
+        "# API\n\n"
+        "## Auth\n\n"
+        "Use `Authenticator` to log in. The `login` method is the entrypoint.\n"
+    )
+    result = extract([tmp_path / "auth.py", tmp_path / "README.md"], cache_root=tmp_path)
+    refs = [e for e in result["edges"] if e.get("relation") == "references"]
+    targets = {e["target"] for e in refs}
+    # Both the class and its method get matched. Heading-scoped, so the
+    # source is the `## Auth` heading node, not the file.
+    assert any("authenticator" in t and "login" not in t for t in targets), (
+        f"expected reference to Authenticator class in {targets}"
+    )
+    assert any("login" in t for t in targets), (
+        f"expected reference to login method in {targets}"
+    )
+    # All emitted as INFERRED — textual match, not structural.
+    assert all(e["confidence"] == "INFERRED" for e in refs)
+
+
+def test_markdown_refs_skip_stopwords_and_unknowns(tmp_path):
+    """Backticks around English stopwords and around symbols that don't
+    exist in the graph produce no edges."""
+    from graphify.extract import extract
+    (tmp_path / "code.py").write_text("def known():\n    pass\n")
+    (tmp_path / "README.md").write_text(
+        "# Title\n\n"
+        "We `set` the value `for` each `item`. Also `nonexistent_symbol`.\n"
+    )
+    result = extract([tmp_path / "code.py", tmp_path / "README.md"], cache_root=tmp_path)
+    refs = [e for e in result["edges"] if e.get("relation") == "references"]
+    assert refs == [], f"Expected no refs, got {refs}"
+
+
+def test_markdown_refs_drop_when_too_ambiguous(tmp_path):
+    """When 4+ nodes share a label (e.g. `init` exists everywhere), the
+    backtick mention is too ambiguous to surface — dropped, not emitted
+    as N noisy edges."""
+    from graphify.extract import extract
+    for name in ("a", "b", "c", "d", "e"):
+        (tmp_path / f"mod_{name}.py").write_text(
+            f"class C{name.upper()}:\n    def common(self):\n        pass\n"
+        )
+    (tmp_path / "DOC.md").write_text(
+        "# Pattern\n\nAll the `common` methods do the same thing.\n"
+    )
+    py_files = sorted(tmp_path.glob("mod_*.py"))
+    result = extract(py_files + [tmp_path / "DOC.md"], cache_root=tmp_path)
+    refs = [e for e in result["edges"] if e.get("relation") == "references"]
+    common_refs = [e for e in refs if "common" in e["target"]]
+    assert common_refs == [], f"Expected no edges for ambiguous `common`, got {common_refs}"
+
+
+def test_markdown_refs_skip_inside_fenced_code(tmp_path):
+    """Backticks inside fenced code blocks are content, not references —
+    the example code shouldn't trigger spurious edges."""
+    from graphify.extract import extract
+    (tmp_path / "lib.py").write_text("def helper():\n    pass\n")
+    (tmp_path / "guide.md").write_text(
+        "# Snippet\n\n"
+        "```python\n"
+        "result = `helper`  # this backtick is code content, not a ref\n"
+        "```\n"
+    )
+    result = extract([tmp_path / "lib.py", tmp_path / "guide.md"], cache_root=tmp_path)
+    refs = [e for e in result["edges"] if e.get("relation") == "references"]
+    assert refs == [], f"Code-block content should not produce refs, got {refs}"

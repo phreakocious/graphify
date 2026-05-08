@@ -62,9 +62,17 @@ from .cache import load_cached, save_cached
 #          cells from before this commit treated .md / .mdx as
 #          unsupported and produced empty results — bump forces
 #          re-extract so md nodes appear.
+#   "v8" — lap-27 navigator-original: extract_markdown captures
+#          `pending_md_refs` (backtick-quoted tokens scoped to nearest
+#          heading) for merge-time resolution into `references` edges.
+#          Cached results from v7 lack that key — without a bump,
+#          `wu @MyClass` would silently miss markdown mentions on
+#          existing graphs. Resolution itself runs at merge time over
+#          merged output, so once a v8 cache cell is written it's
+#          stable.
 # Note: lap-15's phantom-node resolution runs at MERGE time over the
 # combined per-file results, so it fires on cached output too — no bump.
-AST_CACHE_VERSION = "v7"
+AST_CACHE_VERSION = "v8"
 
 
 # AST node types that represent a member-expression callee
@@ -3368,6 +3376,122 @@ def extract_powershell(path: Path) -> dict:
     return {"nodes": nodes, "edges": clean_edges, "raw_calls": raw_calls}
 
 
+# ── Markdown→code reference resolution ───────────────────────────────────────
+
+# Common English / shell / programming words that frequently appear inside
+# backticks in prose but aren't symbol references. Skipped during resolution
+# to keep `references` edges meaningful. Tokens shorter than 3 chars are
+# already filtered at capture time.
+_MD_REF_STOPWORDS = frozenset({
+    "the", "and", "for", "this", "that", "with", "from", "into", "onto",
+    "true", "false", "none", "null", "nil", "yes", "not", "but", "all",
+    "use", "set", "get", "add", "run", "see", "via", "out", "off", "now",
+    "any", "new", "old", "etc", "vs", "id", "ip", "tcp", "udp", "ssl", "tls",
+    "git", "npm", "pip", "uv", "ssh", "scp", "rm", "cp", "mv", "ls", "cat",
+    "json", "yaml", "toml", "xml", "html", "css", "url", "uri", "http",
+    "https", "rest", "api", "cli", "ide", "ui", "ux", "os", "io", "ok",
+})
+
+
+def _resolve_markdown_refs(per_file: list[dict], all_nodes: list[dict]) -> list[dict]:
+    """Resolve backtick-quoted tokens in markdown bodies into `references`
+    edges to matching code/doc nodes.
+
+    Per-file extractors capture pending refs (token + scope_nid + line) in
+    `result["pending_md_refs"]`. We can only resolve them once all per-file
+    extraction has merged because the resolution target may live in any
+    other file's nodes.
+
+    Resolution rules:
+      - Direct id match: `_make_id(token)` exactly matches an existing node id
+      - Label match: case-insensitive equality after stripping decoration
+        (leading `.`, trailing `()`)
+      - Multi-match: emit edges to every match (still findable via `wu`,
+        confidence reflects ambiguity)
+      - Stopword / short-token filter: drop common English words and 1-2
+        char tokens to keep the signal:noise ratio high
+      - Self-reference filter: drop edges where a heading would point at
+        itself or its containing file
+
+    Edges are INFERRED with confidence_score:
+      - 0.90 when exactly one node matches (high signal)
+      - 0.70 when 2-3 nodes share the label (still useful via `wu`)
+      - dropped when 4+ nodes match (noise)
+    """
+    if not per_file:
+        return []
+
+    # Build the global indexes once. Both index views (id + normalized label)
+    # land in the same dict so single-lookup resolution works either way.
+    by_id: dict[str, str] = {}
+    by_label: dict[str, list[str]] = {}
+    for n in all_nodes:
+        nid = n.get("id")
+        if not nid:
+            continue
+        by_id[nid] = nid
+        label = (n.get("label") or "").strip()
+        if not label:
+            continue
+        # Normalize label same way humans backtick a method: drop leading
+        # dot for `.foo()` style and trailing `()`. Case-insensitive.
+        norm = label.lstrip(".").rstrip(")").rstrip("(").strip().lower()
+        if not norm or len(norm) < 3:
+            continue
+        by_label.setdefault(norm, []).append(nid)
+
+    edges: list[dict] = []
+    seen_pairs: set[tuple[str, str]] = set()
+
+    for result in per_file:
+        for ref in result.get("pending_md_refs", []) or []:
+            token = ref.get("token", "")
+            source = ref.get("source", "")
+            if not token or not source:
+                continue
+            tok_lower = token.lower()
+            if tok_lower in _MD_REF_STOPWORDS:
+                continue
+
+            # Resolve. Try id-shape first (cheap, exact), then label.
+            candidates: list[str] = []
+            id_candidate = _make_id(token)
+            if id_candidate and id_candidate in by_id:
+                candidates.append(id_candidate)
+            else:
+                # Label index — already lowercased + decorated-stripped.
+                norm = token.lstrip(".").rstrip(")").rstrip("(").strip().lower()
+                if norm in by_label:
+                    candidates.extend(by_label[norm])
+
+            if not candidates:
+                continue
+            # Drop ambiguous wide matches — edges with 4+ targets are noise.
+            if len(candidates) > 3:
+                continue
+            score = 0.90 if len(candidates) == 1 else 0.70
+
+            for tgt in candidates:
+                if tgt == source:  # self-reference (heading mentioning itself)
+                    continue
+                pair = (source, tgt)
+                if pair in seen_pairs:
+                    continue
+                seen_pairs.add(pair)
+                edges.append({
+                    "source": source,
+                    "target": tgt,
+                    "relation": "references",
+                    "confidence": "INFERRED",
+                    "confidence_score": score,
+                    "source_file": ref.get("source_file", ""),
+                    "source_location": ref.get("source_location", ""),
+                    "weight": 1.0,
+                })
+
+    return edges
+
+
 # ── Cross-file import resolution ──────────────────────────────────────────────
 
 def _resolve_cross_file_imports(
@@ -3944,6 +4068,15 @@ def extract_markdown(path: Path) -> dict:
     code_block_lines: list[str] = []
     code_block_count = 0
 
+    # Backtick-quoted token captures, anchored on the most-recent heading
+    # (or the file node when no heading has been seen yet). Resolved at
+    # merge time by `_resolve_markdown_refs` against the global label/id
+    # index of all extracted nodes — turns ``MyClass`` in a doc into a
+    # `references` edge `md_heading → code_symbol` so `wu @MyClass` and
+    # `search MyClass` both surface the doc mention next to call sites.
+    pending_md_refs: list[dict] = []
+    _BACKTICK_RE = re.compile(r"`([^`\n]+)`")
+
     lines = source.splitlines()
     for line_num_0, line_text in enumerate(lines):
         line_num = line_num_0 + 1
@@ -4001,7 +4134,36 @@ def extract_markdown(path: Path) -> dict:
             heading_stack.append((level, h_nid))
             continue
 
-    return {"nodes": nodes, "edges": edges, "input_tokens": 0, "output_tokens": 0}
+        # Backticked tokens in body / heading prose — defer resolution to
+        # merge time so we can match against the GLOBAL node label/id index.
+        if "`" in line_text:
+            scope_nid = heading_stack[-1][1] if heading_stack else file_nid
+            for m in _BACKTICK_RE.finditer(line_text):
+                tok = m.group(1).strip()
+                # Cheap filters at capture time. Real resolution happens
+                # later — these only trim obvious non-symbol noise so the
+                # merge-time index lookup doesn't have to scan paths /
+                # CLI flags / multi-word phrases.
+                if len(tok) < 3:
+                    continue
+                if any(c in tok for c in (" ", "/", "\\", "\t")):
+                    continue
+                if tok.startswith("--") or tok.startswith("-"):
+                    continue
+                pending_md_refs.append({
+                    "source": scope_nid,
+                    "token": tok,
+                    "source_file": str_path,
+                    "source_location": f"L{line_num}",
+                })
+
+    return {
+        "nodes": nodes,
+        "edges": edges,
+        "pending_md_refs": pending_md_refs,
+        "input_tokens": 0,
+        "output_tokens": 0,
+    }
 
 
 # ── Main extract and collect_files ────────────────────────────────────────────
@@ -4138,6 +4300,16 @@ def extract(paths: list[Path], cache_root: Path | None = None) -> dict:
     for result in per_file:
         all_nodes.extend(result.get("nodes", []))
         all_edges.extend(result.get("edges", []))
+
+    # Markdown→code references — resolve backtick-quoted symbols in .md
+    # bodies against the global label/id index. Runs at merge time because
+    # we need *all* nodes from all files in scope. Failures are non-fatal.
+    try:
+        md_ref_edges = _resolve_markdown_refs(per_file, all_nodes)
+        all_edges.extend(md_ref_edges)
+    except Exception as exc:
+        import logging
+        logging.getLogger(__name__).warning("Markdown ref resolution failed, skipping: %s", exc)
 
     # Add cross-file class-level edges (Python only - uses Python parser internally)
     py_paths = [p for p in paths if p.suffix == ".py"]
