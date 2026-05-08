@@ -6407,6 +6407,183 @@ def test_include_inferred_silent_emits_no_inferred_to_add_listing(tmp_path, monk
     )
 
 
+def test_global_hint_dedup_suppresses_repeats_across_bare_calls(tmp_path, monkeypatch):
+    """Educational hints (flag-existence, like `hidden_inferred`) must dedup
+    across bare one-shot calls within the same graph. Without the global-hints
+    file, the per-cursor `hints_emitted` resets every ephemeral call and the
+    same `add --include-inferred` line repeats verbatim across N navigates to
+    different focuses — pure noise after the first emission. The fix records
+    educational-keyed emissions in graphify-out/.navigate/_global_hints.json
+    and suppresses subsequent emissions within the same graph.
+
+    Context-actionable hints (drill_via_contains, class_shape_via_methods,
+    etc.) are NOT dedup'd at the global scope — they name a structural cause
+    specific to the current focus and stay load-bearing every call."""
+    from graphify.navigate import navigate
+    nodes = [
+        {"id": "tgt", "label": "f()", "file_type": "code",
+         "source_file": "a.py", "source_location": "L10"},
+        {"id": "c1", "label": "caller()", "file_type": "code",
+         "source_file": "a.py", "source_location": "L1"},
+        {"id": "tgt2", "label": "g()", "file_type": "code",
+         "source_file": "b.py", "source_location": "L10"},
+        {"id": "c2", "label": "other()", "file_type": "code",
+         "source_file": "b.py", "source_location": "L1"},
+    ]
+    # One EXTRACTED + one INFERRED edge per target so `hidden_inferred`
+    # would normally fire on the default extracted-only frontier.
+    links = [
+        {"source": "c1", "target": "tgt", "relation": "calls",
+         "confidence": "EXTRACTED"},
+        {"source": "c1", "target": "tgt", "relation": "calls",
+         "confidence": "INFERRED", "confidence_score": 0.7},
+        {"source": "c2", "target": "tgt2", "relation": "calls",
+         "confidence": "EXTRACTED"},
+        {"source": "c2", "target": "tgt2", "relation": "calls",
+         "confidence": "INFERRED", "confidence_score": 0.7},
+    ]
+    _write_graph(tmp_path / "graphify-out", nodes, links)
+    monkeypatch.chdir(tmp_path)
+
+    # First call (default ephemeral session) — hint fires.
+    out1 = navigate(["@f"], fmt="text")
+    assert "hidden inferred edges available" in out1, (
+        f"first emission should fire the hint:\n{out1}"
+    )
+
+    # Second call, *different* focus, same graph — hint suppressed.
+    out2 = navigate(["@g"], fmt="text")
+    assert "hidden inferred edges available" not in out2, (
+        f"second emission of same educational hint should be suppressed by "
+        f"per-graph global dedup:\n{out2}"
+    )
+
+    # Sanity: the global hints file records the suppression key.
+    import json
+    state = json.loads((tmp_path / "graphify-out" / ".navigate"
+                        / "_global_hints.json").read_text())
+    assert "hidden_inferred" in state.get("keys", {})
+
+
+def test_global_hint_dedup_isolated_per_graph(tmp_path, monkeypatch):
+    """Two independent graphs each get their own educational-hint state.
+    A hint suppressed in graph A must still fire on the first call against
+    graph B, because the dedup file lives next to that graph's cursor dir."""
+    from graphify.navigate import navigate
+    nodes_a = [
+        {"id": "a1", "label": "f()", "file_type": "code",
+         "source_file": "a.py", "source_location": "L1"},
+        {"id": "a2", "label": "g()", "file_type": "code",
+         "source_file": "a.py", "source_location": "L5"},
+    ]
+    links_a = [
+        {"source": "a2", "target": "a1", "relation": "calls",
+         "confidence": "EXTRACTED"},
+        {"source": "a2", "target": "a1", "relation": "calls",
+         "confidence": "INFERRED", "confidence_score": 0.7},
+    ]
+    nodes_b = [
+        {"id": "b1", "label": "f()", "file_type": "code",
+         "source_file": "b.py", "source_location": "L1"},
+        {"id": "b2", "label": "g()", "file_type": "code",
+         "source_file": "b.py", "source_location": "L5"},
+    ]
+    links_b = [
+        {"source": "b2", "target": "b1", "relation": "calls",
+         "confidence": "EXTRACTED"},
+        {"source": "b2", "target": "b1", "relation": "calls",
+         "confidence": "INFERRED", "confidence_score": 0.7},
+    ]
+    proj_a = tmp_path / "proj_a"
+    proj_b = tmp_path / "proj_b"
+    proj_a.mkdir()
+    proj_b.mkdir()
+    _write_graph(proj_a / "graphify-out", nodes_a, links_a)
+    _write_graph(proj_b / "graphify-out", nodes_b, links_b)
+
+    monkeypatch.chdir(proj_a)
+    out_a1 = navigate(["@f"], fmt="text")
+    assert "hidden inferred edges available" in out_a1
+    out_a2 = navigate(["@f"], fmt="text")
+    assert "hidden inferred edges available" not in out_a2  # dedup'd in A
+
+    # Switch graphs — first call on B should fire fresh, even though A's
+    # dedup file recorded the hint.
+    monkeypatch.chdir(proj_b)
+    out_b1 = navigate(["@f"], fmt="text")
+    assert "hidden inferred edges available" in out_b1, (
+        f"hint should fire on first call against a NEW graph "
+        f"(per-graph dedup state):\n{out_b1}"
+    )
+
+
+def test_global_hint_dedup_skipped_with_no_session(tmp_path, monkeypatch):
+    """`--no-session` (session=False) opts out of all disk activity, including
+    the global hints file. The hint fires every call — that's the expected
+    contract for the no-disk mode (some tests depend on this)."""
+    from graphify.navigate import navigate
+    nodes = [
+        {"id": "tgt", "label": "f()", "file_type": "code",
+         "source_file": "a.py", "source_location": "L10"},
+        {"id": "c1", "label": "caller()", "file_type": "code",
+         "source_file": "a.py", "source_location": "L1"},
+    ]
+    links = [
+        {"source": "c1", "target": "tgt", "relation": "calls",
+         "confidence": "EXTRACTED"},
+        {"source": "c1", "target": "tgt", "relation": "calls",
+         "confidence": "INFERRED", "confidence_score": 0.7},
+    ]
+    _write_graph(tmp_path / "graphify-out", nodes, links)
+    monkeypatch.chdir(tmp_path)
+    out1 = navigate(["@f"], session=False, fmt="text")
+    out2 = navigate(["@f"], session=False, fmt="text")
+    assert "hidden inferred edges available" in out1
+    assert "hidden inferred edges available" in out2, (
+        f"--no-session must NOT consult/write the global hints file:\n{out2}"
+    )
+    # Confirm the global file was never written.
+    assert not (tmp_path / "graphify-out" / ".navigate"
+                / "_global_hints.json").exists()
+
+
+def test_global_hint_dedup_does_not_suppress_structural_hints(tmp_path, monkeypatch):
+    """Structural hints (drill_via_contains, class_shape_via_methods, etc.)
+    name a focus-specific structural cause and must continue to fire every
+    time their condition holds. The global-hint dedup applies ONLY to
+    educational/flag-existence hints in `_GLOBAL_HINT_KEYS`."""
+    from graphify.navigate import navigate
+    # Class with 0 direct callers but methods with callers — triggers
+    # `class_shape_via_methods`. NOT in _GLOBAL_HINT_KEYS, must fire repeatedly.
+    nodes = [
+        {"id": "cls", "label": "Foo", "file_type": "code", "node_kind": "class",
+         "source_file": "a.py", "source_location": "L1"},
+        {"id": "meth", "label": ".bar()", "file_type": "code",
+         "node_kind": "method",
+         "source_file": "a.py", "source_location": "L5"},
+        {"id": "caller", "label": "use()", "file_type": "code",
+         "node_kind": "function",
+         "source_file": "b.py", "source_location": "L1"},
+    ]
+    links = [
+        {"source": "cls", "target": "meth", "relation": "method",
+         "confidence": "EXTRACTED"},
+        {"source": "caller", "target": "meth", "relation": "calls",
+         "confidence": "EXTRACTED"},
+    ]
+    _write_graph(tmp_path / "graphify-out", nodes, links)
+    monkeypatch.chdir(tmp_path)
+    out1 = navigate(["@Foo"], fmt="text")
+    out2 = navigate(["@Foo"], fmt="text")
+    # `class_shape_via_methods` is NOT in _GLOBAL_HINT_KEYS, so both calls
+    # must surface the hint. Match on a stable substring.
+    assert "via methods" in out1 and "via methods" in out2, (
+        f"structural hints must fire every call — they name THIS focus's "
+        f"cause, not a generic flag.\n--- out1 ---\n{out1}"
+        f"\n--- out2 ---\n{out2}"
+    )
+
+
 def test_include_inferred_default_off_silent_no_marker(tmp_path, monkeypatch):
     """Sanity: the symmetric confirmation must NOT fire when
     `--include-inferred` was NOT passed. Default extracted-only output

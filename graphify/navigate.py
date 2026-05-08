@@ -1793,27 +1793,105 @@ LEGEND = (
 )
 
 
+# Hints that name a flag's existence rather than a focus-specific structural
+# cause. Repeating these across bare one-shot calls (where the cursor is
+# ephemeral and `hints_emitted` resets every call) is pure noise — the agent
+# either learned the flag the first time or didn't, and seeing
+# "add `--include-inferred`" 10 times across 10 different focuses adds zero
+# information. Dedup'd at a per-graph scope via _GLOBAL_HINTS_FILE so they
+# fire once per graph and stay quiet thereafter.
+#
+# Context-actionable hints (drill_via_contains, class_shape_via_methods, etc.)
+# are NOT in this set: they name the structural cause of THIS focus's edge
+# count and are load-bearing every time their condition holds.
+_GLOBAL_HINT_KEYS: frozenset[str] = frozenset({
+    "hidden_inferred",
+    "no_inferred_to_add",
+})
+
+_GLOBAL_HINTS_FILE = "_global_hints.json"
+
+
+def _global_hints_path(navigate_dir: Path | None) -> Path | None:
+    if navigate_dir is None:
+        return None
+    return navigate_dir / _GLOBAL_HINTS_FILE
+
+
+def _global_hints_load(navigate_dir: Path | None) -> set[str]:
+    """Load already-emitted global hint keys for this graph.
+    Returns an empty set on missing/malformed file."""
+    p = _global_hints_path(navigate_dir)
+    if p is None or not p.exists():
+        return set()
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+        keys = data.get("keys", {}) if isinstance(data, dict) else {}
+        return set(keys.keys()) if isinstance(keys, dict) else set()
+    except Exception:
+        return set()
+
+
+def _global_hints_record(navigate_dir: Path | None, key: str) -> None:
+    """Record `key` as emitted at the per-graph scope. Best-effort; failures
+    are silent (a missed write just means the hint may fire again next call,
+    which is graceful degradation, not a regression)."""
+    p = _global_hints_path(navigate_dir)
+    if p is None:
+        return
+    try:
+        existing: dict[str, Any] = {}
+        if p.exists():
+            try:
+                existing = json.loads(p.read_text(encoding="utf-8"))
+                if not isinstance(existing, dict):
+                    existing = {}
+            except Exception:
+                existing = {}
+        keys = existing.get("keys") if isinstance(existing.get("keys"), dict) else {}
+        keys[key] = time.time()
+        existing["keys"] = keys
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(json.dumps(existing, indent=2), encoding="utf-8")
+    except OSError:
+        pass
+
+
 def _emit_hint(out: list[str], key: str, message: str,
-               cursor: Cursor | None, quiet_hints: bool) -> None:
-    """Append a hint line subject to two gates:
+               cursor: Cursor | None, quiet_hints: bool,
+               *, navigate_dir: Path | None = None) -> None:
+    """Append a hint line subject to three gates:
        1. `quiet_hints=True` → suppress all hints (CLI: `--quiet-hints`).
        2. `key in cursor.hints_emitted` → already shown this hint kind in
           this session — skip the repeat.
-    Records emitted keys on the cursor for future calls. Non-session
-    (ephemeral) cursors discard the record on save, so dedup only takes
-    effect once the agent commits to `--session <id>`.
+       3. `key in _GLOBAL_HINT_KEYS` and key already recorded in the
+          per-graph global hints file → suppress across bare one-shot calls
+          where the cursor is ephemeral. Educational hints (flag-existence)
+          fire once per graph and stay quiet; structural hints aren't in
+          the global set and continue to fire every time their condition
+          holds.
+
+    Records emitted keys on the cursor and, for global keys, on the
+    per-graph hints file. Non-session (ephemeral) cursors discard the
+    cursor record on save; the global file persists across calls.
     """
     if quiet_hints:
         return
     if cursor is not None and key in cursor.hints_emitted:
         return
+    if key in _GLOBAL_HINT_KEYS and navigate_dir is not None:
+        if key in _global_hints_load(navigate_dir):
+            return
     out.append(message)
     if cursor is not None:
         cursor.hints_emitted.append(key)
+    if key in _GLOBAL_HINT_KEYS and navigate_dir is not None:
+        _global_hints_record(navigate_dir, key)
 
 
 def _render_frontier_text(data: dict, cursor: Cursor, *, show_ops: bool,
-                           md: bool = False, quiet_hints: bool = False) -> str:
+                           md: bool = False, quiet_hints: bool = False,
+                           navigate_dir: Path | None = None) -> str:
     if data.get("current") is None:
         # First-contact: surface the cheat-sheet unconditionally so a brand-new
         # agent doesn't have to know `--ops-hint` exists. After a focus lands,
@@ -2208,7 +2286,7 @@ def _render_frontier_text(data: dict, cursor: Cursor, *, show_ops: bool,
         _emit_hint(out, "hidden_inferred",
             "  hint: hidden inferred edges available — "
             "add `--include-inferred` to widen pivots beyond AST ground truth.",
-            cursor, quiet_hints)
+            cursor, quiet_hints, navigate_dir=navigate_dir)
     elif data.get("extracted_only") is False:
         # Symmetric case (lap-20 field-report fix): the user opted in with
         # `--include-inferred` but every pivot would render identically to
@@ -2218,7 +2296,7 @@ def _render_frontier_text(data: dict, cursor: Cursor, *, show_ops: bool,
         _emit_hint(out, "no_inferred_to_add",
             "  hint: --include-inferred on — no inferred edges to add "
             "(view is identical to AST-only default).",
-            cursor, quiet_hints)
+            cursor, quiet_hints, navigate_dir=navigate_dir)
 
     if data.get("last_listing_size") and data.get("last_pivot"):
         out.append(f"  last: {data['last_pivot']}({data['last_listing_size']}) · pick [N]")
@@ -4323,7 +4401,8 @@ def navigate(ops: list[str] | str, *,
             return json.dumps(last_data)
         body = _render_frontier_text(last_data, cursor,
                                      show_ops=show_ops_hint, md=md,
-                                     quiet_hints=quiet_hints)
+                                     quiet_hints=quiet_hints,
+                                     navigate_dir=gpath.parent / CURSOR_DIR)
         # Header pins this output as a peek (not a step) so the agent
         # doesn't read the frontier as the result of an op they didn't run.
         return f"  show-session: {show_session}\n{body}"
@@ -5000,9 +5079,16 @@ def navigate(ops: list[str] | str, *,
     if last_data is None:
         parts.append("(no output)")
     elif last_data.get("type") == "frontier":
+        # Pass navigate_dir so the per-graph global hint dedup
+        # (_GLOBAL_HINT_KEYS — flag-existence hints like `hidden_inferred`)
+        # can suppress repeats across bare one-shot calls. `persist=False`
+        # (--no-session) skips the dedup entirely; that's fine — the agent
+        # opted out of disk activity.
+        ndir = (gpath.parent / CURSOR_DIR) if persist else None
         parts.append(_render_frontier_text(last_data, cursor,
                                            show_ops=show_ops_hint, md=md,
-                                           quiet_hints=quiet_hints))
+                                           quiet_hints=quiet_hints,
+                                           navigate_dir=ndir))
     elif last_data.get("type") == "listing":
         parts.append(_render_listing_text(last_data, show_ops=show_ops_hint, md=md))
     elif last_data.get("type") == "body":
