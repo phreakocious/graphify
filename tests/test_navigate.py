@@ -6547,6 +6547,37 @@ def test_global_hint_dedup_skipped_with_no_session(tmp_path, monkeypatch):
                 / "_global_hints.json").exists()
 
 
+def test_render_body_truncated_message_names_correct_flag_per_entry_point():
+    """The body renderer is shared between `navigate ... read` (positional
+    `read N`) and `peek <symbol>` (`--lines N`). The truncated banner must
+    name the flag the agent's entry point actually accepts — telling a peek
+    user to "raise with `read N`" sends them to the wrong tool."""
+    from graphify.navigate import _render_body_text
+    base = {
+        "type": "body",
+        "label": "f()",
+        "owner_class": None,
+        "source_file": "a.py",
+        "source_location": "L1-50",
+        "lines": ["def f():", "    pass"],
+        "start_line": 1,
+        "truncated": True,
+        "docstring_range": (0, 0),
+    }
+    out_navigate = _render_body_text(base)
+    assert "raise with `read N`" in out_navigate, (
+        f"navigate read should keep its positional flag in the message:\n{out_navigate}"
+    )
+    out_peek = _render_body_text({**base, "entry_point": "peek"})
+    assert "--lines N" in out_peek and "raise with `read N`" not in out_peek, (
+        f"peek entry should name --lines/--tail/--range, not `read N`:\n{out_peek}"
+    )
+    # peek output also surfaces the surgical-slice options (--tail, --range)
+    # because peek calls are often on huge bodies where the agent wants a
+    # window, not a higher cap.
+    assert "--tail" in out_peek and "--range" in out_peek
+
+
 def test_body_walker_warns_when_returns_far_short_of_stamped_range(tmp_path, monkeypatch):
     """When the graph stamps `source_location: L<a>-<b>` covering N lines but
     the indent-walker bails after just 1-3 lines, the most likely cause is a

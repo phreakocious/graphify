@@ -1744,7 +1744,19 @@ def _render_body_text(data: dict, *, md: bool = False) -> str:
     visible_count = len(body_lines) - docstring_stripped
     header = f"  read @{linked_label}  ({sf}:{ln}, {visible_count} lines"
     if truncated:
-        header += f" — truncated at {len(body_lines)}, raise with `read N` or focus contained items"
+        # Lap-27 dogfood: the renderer is shared between `navigate ... read`
+        # (positional `read N`) and `peek <symbol>` (`--lines N`). Without
+        # the entry-point hint the truncated message named the wrong flag
+        # for half its callers — agents reaching for `peek` would read
+        # "raise with `read N`" and run that, hitting "no listing to pick
+        # from" or worse. Default `read N` (back-compat for navigate);
+        # peek sets `entry_point="peek"` so the render names `--lines N`.
+        if data.get("entry_point") == "peek":
+            header += (f" — truncated at {len(body_lines)}, raise with "
+                       f"`--lines N`, slice with `--tail N` or "
+                       f"`--range A-B`, or focus contained items")
+        else:
+            header += f" — truncated at {len(body_lines)}, raise with `read N` or focus contained items"
     if docstring_stripped:
         header += f" · −{docstring_stripped} docstring"
     header += ")"

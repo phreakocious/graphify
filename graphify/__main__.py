@@ -3903,6 +3903,7 @@ def main() -> None:
                     "start_line": ln,
                     "truncated": trunc,
                     "docstring_range": ds_range,
+                    "entry_point": "peek",
                 }
                 print(_render_body_text(data, md=md))
         if multi and not any_ok:
