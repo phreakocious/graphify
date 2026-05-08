@@ -41,7 +41,7 @@ Turn any folder of files into a navigable knowledge graph with community detecti
 /graphify blast "<symbol>"                            # one-shot blast radius — callers + callees side-by-side under ## Callers / ## Callees (refactor planning, cursor-free; brace-expand `@Class.{m1,m2}` for multi-symbol blast)
 /graphify summarize "@<Class>"                        # one-shot class summary — signature + method list + cross-file callers + inheritance fused into one call (use for "tell me about this class" tasks instead of falling back to read_file on huge bodies)
 /graphify search "<pattern>"                          # body-text grep across nodes — returns hits with symbol context (label, file:line, container, community, degree)
-/graphify shape "<file>"                              # file structure summary: N classes / M fns / K consts / X imports / longest fn — fns line stamps `×N` for cross-file callers and pins entry-point fns into the truncated listing (file's API surface visible inline)
+/graphify shape "<file>"                              # file structure summary: N classes / M fns / K consts / X imports / longest fn — fns line stamps `×N` for cross-file callers and pins entry-point fns into the truncated listing; on CLI-script files with no external callers, falls back to `entry points: L<n> [from __main__]` / `[top-level]` / `[shebang]` so investigation scripts stop reading as dead-end leaves
 /graphify query "<question>"                          # BFS traversal - broad context (use after navigate narrows scope)
 /graphify query "<question>" --dfs                    # DFS - trace a specific path
 /graphify query "<question>" --budget 1500            # cap answer at N tokens
@@ -62,7 +62,9 @@ Turn any folder of files into a navigable knowledge graph with community detecti
 - **Enumerating a community or large pivot.** `coc summary` returns shape without 1000 rows; `--explain-cost` previews `N nodes ≈ K bytes` before committing.
 - **You don't know where to start.** `navigate "@<best-guess>"` either hits or returns a disambiguation listing of real names.
 
-**Skip navigate for non-code files** (`.json`/`.yaml`/`.toml`/`.csv`/`.md`/`.txt`/`.log`/lockfiles/scratch). graphify only indexes source code — calling navigate will miss and waste a call.
+**graphify indexes source code AND markdown.** `.py` / `.ts` / `.js` / `.go` / `.rs` / etc. produce class/fn/method nodes; `.md` / `.mdx` produce file/heading/code-block nodes plus `references` edges from any backtick-quoted token (`MyClass`, `compile()`) that resolves to a code symbol. So `navigate "@MyClass" wu` surfaces both source call sites *and* doc mentions in one call; `search "<pattern>"` matches code bodies *and* markdown bodies.
+
+**Skip navigate for genuinely unindexed files** (`.json`/`.yaml`/`.toml`/`.csv`/`.txt`/`.log`/lockfiles/scratch). Calling navigate on these will miss.
 
 **Hand off when:** a specific node is load-bearing → `Read`; reachability X→Y → `path`; one-shot factual question → `explain`; diffuse question on a narrowed area → `query`.
 
@@ -77,9 +79,11 @@ Sub-agents run with their own system prompts that hard-code `find` / `grep` / `g
 > - What's in this file? → `graphify shape <file>` (multi: `shape f1.py f2.py` or `shape {a,b}.py`)
 > - Which files match a pattern? → `graphify files "<glob>"` (e.g. `*test*.py`, `tools/*.py`)
 > - Who calls X? → `graphify navigate "@X" in --kind=calls`
-> - Who uses X (incl. typed dispatch)? → `graphify navigate "@X" wu`
-> - What strings match? → `graphify search "<pat>"` — add `--idents` for cross-casing, `--files-only` for grep -l, `--in-files "<glob>"` for grep -r --include
+> - Who uses X (incl. typed dispatch + doc mentions)? → `graphify navigate "@X" wu` — also surfaces backtick-quoted refs in `.md`/`.mdx` (README, ARCHITECTURE, design docs) as `references` edges
+> - What strings match? → `graphify search "<pat>"` — add `--idents` for cross-casing, `--files-only` for grep -l, `--in-files "<glob>"` for grep -r --include. Searches code bodies AND markdown headings/paragraphs.
 > - What's in this directory? → `graphify navigate "@<dir>/"` (trailing slash matters)
+>
+> **graphify indexes `.md`/`.mdx` too**, not just code. Doc files become file/heading/code-block nodes; backtick refs to code symbols resolve to `references` edges. So "where is `MyClass` mentioned?" includes both source call sites and doc references.
 >
 > **Don't bail after one empty graphify call.** Empty `search` is usually a regex/casing miss — try `shape <file>` or `navigate "@<best-guess-symbol>"` before falling back to grep. graphify is 50–500x cheaper than chained find/grep when the question is about source-code structure.
 
@@ -1327,7 +1331,7 @@ Op forms:
 - `callers` / `callees` — sugar for `in --kind=calls` / `out --kind=calls`. Drops uses/imports/references noise.
 - `dependents` / `dependencies` — transitive callers/callees on call edges, default depth 3 (`--depth N` to override). Verbs map onto coupling rather than graph direction.
 - `coc summary` — structural shape of the focus's coc community (top hubs, composition, edge mix) instead of enumerating. Cheap on big communities.
-- `where-used` (alias `wu`) — superop combining `in` with text-mention search of the symbol's bare name. Edge-discovered rows first, text-discovered rows below carry `[mentions L<line>]` tags. Catches dynamic dispatch / string-keyed lookup that AST-only `in` misses.
+- `where-used` (alias `wu`) — superop combining `in` with text-mention search of the symbol's bare name. Edge-discovered rows first (call sites + `references` edges from `.md`/`.mdx` backtick mentions), text-discovered rows below carry `[mentions L<line>]` tags. Catches dynamic dispatch / string-keyed lookup that AST-only `in` misses, and surfaces "this symbol is also referenced in these design docs" in the same call.
 - `read` (or `body`) — dump the focused node's body inline (default 200 lines, cap with `read N`). Folds focus + Read into one call. On file nodes, flat-dumps the first N lines.
 - `filter <regex>` (or `f <regex>`) — narrow the most recent listing by regex on label. Works after any listing op. Renumbers picks 1-based against the filtered view (`methods filter "_deficit" 2` lands on the second match). Falls back to case-insensitive substring when regex fails to compile (header tags `, substring`).
 - `[N]` — focus on the Nth item from the most recent listing
@@ -1337,14 +1341,14 @@ Op forms:
 
 ### Sibling subcommands (one-shot, no cursor)
 - `graphify peek "<symbol>"` — body dump. Same resolver ladder as navigate, including `Class.method` and `<dir>/<file>/<symbol>` qualifiers. `--lines N` for cap (default 200), `--md` for clickable label.
-- `graphify search "<pattern>"` — body-text grep with symbol context. `--kind code|rationale|all`, `--context N` for pre/post lines around each match (default 1; pass 0 to disable), `--limit N`. Pattern is a case-insensitive regex; falls back to literal substring on `re.error` (mode surfaced in header). Eliminates the grep fallback for "where does this string appear in code" — every hit comes back with label, file:line, community, degree.
+- `graphify search "<pattern>"` — body-text grep with symbol context. Searches across code bodies AND markdown headings/paragraphs/code blocks (`.md`/`.mdx` are indexed as first-class nodes). `--kind code|rationale|all`, `--context N` for pre/post lines around each match (default 1; pass 0 to disable), `--limit N`. Pattern is a case-insensitive regex; falls back to literal substring on `re.error` (mode surfaced in header). Eliminates the grep fallback for "where does this string appear" — every hit comes back with label, file:line, community, degree.
 - `graphify shape "<file>"` — counts of classes, fns, consts, imports + the longest fn by line span. Each fn in the listing carries its line range (`L101-123`) and a `×N` marker when it has cross-file callers — the file's API surface is visible inline. Entry-point fns are pinned into the truncated listing even when they fall past `--limit` (default 8), so a public function at the bottom of a 21-fn file is never hidden inside `+N more`. Saves a `contains` pivot for orientation.
 
 ### Output format
 
 Frontier (after focus or `back`):
 ```
-@ <label> · c<cid> hub:<auto-name> · deg=<N> · <file>:<line> [file_type] · <age> · <lines>ln [· !stale]
+@ <label> · c<cid> hub:<auto-name> · deg=<N> · <file>:<line> [file_type] · <age> · <lines>ln [· !stale] [· script:<kind>]
   ↗in(N: confidence-mix [; +M via methods])  ↘out(N: confidence-mix)  ◉methods(N)  ◇contains(N)
   ⊕coc(N)  ←rat(N)  →inh(N)  ⇡parent(N)  ◈sib(N)  ↺(history-depth)
 ```
@@ -1352,6 +1356,7 @@ Frontier (after focus or `back`):
 - `c<cid> hub:<name>` — community label and its top-degree representative. The focused `<label>` is *in* the cluster; `hub:` names the cluster, not the focus.
 - `· 3d · 482ln` — file age (git last-commit when in a repo, prefixed `g`; else mtime) and line count for code <= 1MB.
 - `!stale` — source mtime > graph.json mtime; `graphify update .` is probably due.
+- `· script:main` / `· script:tl` / `· script:sh` — CLI-script tag on Python / JS / TS file nodes. `main` = canonical `if __name__ == "__main__":` (or `require.main === module` / `import.meta.main`). `tl` = top-level call to a function defined in this file (the "no clunky main incantation" investigation style). `sh` = shebang only. Tells you "this file is runnable" before you decide whether to read it as a library or an entry point. `shape <file>` on a script with no external callers falls back to listing the entry lines as `entry points: L<n> [from __main__]`.
 - `+M via methods` on `↗in` for classes — unique callers reachable through the class's methods (deduped). Guards the trust-bug where `↗in(0)` reads as "dead" but the methods take 50 calls.
 - Confidence mix `Next ext, Minf@lo-hi` — EXTRACTED is AST ground truth, INFERRED is LLM with score range. Navigate hides INFERRED by default; pass `--include-inferred` for cross-language / doc-linked breadth.
 
