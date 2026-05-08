@@ -65,6 +65,14 @@ across 11 files in this repo). Path-qualified resolution
 - **Respect the budget.** Default `--bodies` is off; `--context` defaults
   to 1; `coc` has a smaller default limit than other listings (large
   communities are the common case). Agents who want more pass the flag.
+- **Fuse the call sequence, not just the tokens.** The biggest wins in
+  lap-22→25 weren't on per-call output size — they were on collapsing
+  N calls into one. `blast @<symbol>` returns callers + callees
+  side-by-side (lap-22: −47% calls on EGF). `summarize @<Class>` fuses
+  sig + methods + cross-file callers + inheritance (lap-23b: −31% calls
+  on Klein). `peek @C.{m1,m2,m3}` brace-expands to N method bodies in
+  one pass (lap-25). When you ship a verb here, ask: does this collapse
+  a chain the agent was about to do anyway?
 
 ## Anti-guessing: hints over silence
 
@@ -109,7 +117,24 @@ Agents need ground truth to plan and to commit. Numbers beat words.
   marker when file mtime > graph.json mtime.
 - `shape <file>` surfaces an `entry points:` line — top-3 fns ranked by
   external (cross-file, non-structural) in-edges. Lands the agent on
-  the API surface before they read any code.
+  the API surface before they read any code. Each fn carries a `×N`
+  marker for cross-file callers and pins past `--limit` so a public
+  fn at the file's tail isn't hidden inside `+N more` (lap-24/26).
+  On CLI-script files with no external callers, falls back to
+  `entry points: L<n> [from __main__] / [top-level] / [shebang]` so
+  investigation scripts stop reading as dead-end leaves (lap-27).
+- `.md` / `.mdx` files index as first-class nodes (file/heading/code-block).
+  Backtick-quoted tokens that resolve to code symbols become `references`
+  edges — `wu @MyClass` returns call sites *and* doc mentions in one
+  pass; `search "<pat>"` matches code bodies *and* markdown bodies.
+  Eliminates the "where is this discussed?" grep fallback (lap-27).
+- `script_kind` tag on Python / JS / TS file nodes — `main_block`
+  (canonical `if __name__ == "__main__":` / `require.main` /
+  `import.meta.main`), `top_level` (bare-identifier call to an
+  own-defined fn — the no-clunky-main investigation style), or
+  `shebang` only. Frontier renders `· script:main` / `· script:tl`
+  / `· script:sh` so the agent knows a file is runnable before
+  deciding to read it as library or entry point (lap-27).
 - `[depth≤N]` tag on listings produced by `_transitive_walk` so agents
   can tell whether a `--depth=3` walk fanned out or dead-ended at hop 1.
 
@@ -135,7 +160,8 @@ constant lives at the top of `extract.py` with a version-history
 comment block — add an entry whenever you bump.
 
 Exception: changes that only run at MERGE time (e.g., phantom-node
-resolution) operate over cached output and don't need a bump.
+resolution, markdown-`references`-edge resolution) operate over
+cached output and don't need a bump.
 
 ## Hint vs auto-act vs default change
 
