@@ -279,3 +279,200 @@ def test_resolve_phantom_nodes_preserves_unrelated_edges():
     assert ("foo_runner", "foo_helper", "calls") in pairs, pairs
     assert ("bar_sub", "foo_base", "inherits") in pairs, pairs
     assert "base" not in {n["id"] for n in new_nodes}
+
+
+# ── Lap-27: CLI-script indicator detection ────────────────────────────────────
+# Investigation-style scripts (the EGF *_diagnostic.py / phase_coherence_*.py
+# pattern) have zero external in-edges, so shape's entry-points line says
+# "no entry points" exactly when the agent most needs orientation. The
+# extractor stamps `script` / `script_kind` / `script_entries` on the file
+# node so navigate / shape can land the agent on the runnable entry instead.
+
+
+def _file_node(result):
+    """First node returned is always the file node (extract_python invariant)."""
+    return result["nodes"][0]
+
+
+def test_script_main_block_detected(tmp_path):
+    """Canonical `if __name__ == "__main__":` block — strongest indicator."""
+    p = tmp_path / "tool.py"
+    p.write_text(
+        "def helper():\n"
+        "    pass\n"
+        "def main():\n"
+        "    helper()\n"
+        "if __name__ == \"__main__\":\n"
+        "    main()\n"
+    )
+    fn = _file_node(extract_python(p))
+    assert fn.get("script") is True
+    assert fn.get("script_kind") == "main_block"
+    # Entry should be the call inside __main__ (line 6), not the if itself.
+    assert fn.get("script_entries") == [6], fn.get("script_entries")
+
+
+def test_script_top_level_call_detected(tmp_path):
+    """EGF investigation style — bare top-level call to a function defined
+    locally is the runnable entry. Must fire even without a __main__ block."""
+    p = tmp_path / "investigation.py"
+    p.write_text(
+        "def analyze(data): return data\n"
+        "def report(x): print(x)\n"
+        "result = analyze([1,2,3])\n"
+        "report(result)\n"
+    )
+    fn = _file_node(extract_python(p))
+    assert fn.get("script") is True
+    assert fn.get("script_kind") == "top_level"
+    # Both lines qualify (assignment-with-own-RHS + bare call).
+    assert fn.get("script_entries") == [3, 4], fn.get("script_entries")
+
+
+def test_script_top_level_for_loop_detected(tmp_path):
+    """Top-level for/while are script-y irrespective of whether the body
+    calls own fns — module-level loops only show up in scripts/notebooks."""
+    p = tmp_path / "loop_script.py"
+    p.write_text(
+        "def step(i): print(i)\n"
+        "for i in range(10):\n"
+        "    step(i)\n"
+    )
+    fn = _file_node(extract_python(p))
+    assert fn.get("script_kind") == "top_level"
+    assert fn.get("script_entries") == [2]
+
+
+def test_script_shebang_only_when_no_other_signal(tmp_path):
+    """Shebang is the weakest indicator — fires only when neither
+    main_block nor top_level applies. Catches wrapper scripts that
+    just delegate to an imported `main`."""
+    p = tmp_path / "wrapper.py"
+    p.write_text(
+        "#!/usr/bin/env python\n"
+        "from foo import main\n"
+        "main()\n"
+    )
+    fn = _file_node(extract_python(p))
+    assert fn.get("script_kind") == "shebang"
+    assert fn.get("script_entries") == [1]
+
+
+def test_library_file_no_script_signal(tmp_path):
+    """Pure library (only defs and class — no top-level work) must NOT
+    be tagged as a script. Most files in any codebase fall here, so a
+    false positive would be very loud."""
+    p = tmp_path / "lib.py"
+    p.write_text(
+        "def public_fn(): return 42\n"
+        "class Helper:\n"
+        "    def do(self): return public_fn()\n"
+    )
+    fn = _file_node(extract_python(p))
+    assert fn.get("script") in (False, None)
+    assert fn.get("script_kind") is None
+
+
+def test_library_with_top_level_imported_call_no_false_positive(tmp_path):
+    """Library files commonly run config setup at module level
+    (`logger.setLevel(...)`, `pd.set_option(...)`). These are member
+    expressions on imported names — NOT bare calls to own fns. The
+    detector requires a bare-identifier callee in `own_fn_names` to
+    fire, so this case stays clean."""
+    p = tmp_path / "config_lib.py"
+    p.write_text(
+        "import logging\n"
+        "logger = logging.getLogger(__name__)\n"
+        "logger.setLevel(logging.INFO)\n"
+        "def public_fn(): return 42\n"
+    )
+    fn = _file_node(extract_python(p))
+    assert fn.get("script") in (False, None), (
+        f"library w/ logger config tripped script flag: {fn}"
+    )
+
+
+def test_script_main_block_priority_over_top_level(tmp_path):
+    """When both signals are present, main_block wins — the `if __name__`
+    block is the canonical entry, and top-level helpers are typically
+    test scaffolding the script wraps in `__main__` for cleanliness."""
+    p = tmp_path / "both.py"
+    p.write_text(
+        "def setup(): pass\n"
+        "def main(): setup()\n"
+        "setup()\n"
+        "if __name__ == \"__main__\":\n"
+        "    main()\n"
+    )
+    fn = _file_node(extract_python(p))
+    assert fn.get("script_kind") == "main_block"
+
+
+def test_script_js_require_main_detected(tmp_path):
+    """JS canonical `if (require.main === module)`."""
+    from graphify.extract import extract_js
+    p = tmp_path / "tool.js"
+    p.write_text(
+        "function main() { console.log('hi'); }\n"
+        "if (require.main === module) {\n"
+        "    main();\n"
+        "}\n"
+    )
+    fn = _file_node(extract_js(p))
+    assert fn.get("script_kind") == "main_block"
+    assert fn.get("script_entries") == [3]
+
+
+def test_script_ts_import_meta_main_detected(tmp_path):
+    """Modern Deno/Bun style — `if (import.meta.main)`."""
+    from graphify.extract import extract_js
+    p = tmp_path / "tool.ts"
+    p.write_text(
+        "function main(): void { console.log('hi'); }\n"
+        "if (import.meta.main) {\n"
+        "    main();\n"
+        "}\n"
+    )
+    fn = _file_node(extract_js(p))
+    assert fn.get("script_kind") == "main_block"
+
+
+def test_script_js_top_level_assignment_to_own(tmp_path):
+    """JS assignment whose RHS calls a function defined in the file —
+    same EGF investigation pattern, JS flavor. Detector walks any
+    non-boring top-level statement for own-fn calls in the subtree."""
+    from graphify.extract import extract_js
+    p = tmp_path / "investigation.js"
+    p.write_text(
+        "#!/usr/bin/env node\n"
+        "function analyze(d) { return d.x; }\n"
+        "function report(d) { console.log(d); }\n"
+        "const data = { x: 1 };\n"
+        "const result = analyze(data);\n"
+        "report(result);\n"
+    )
+    fn = _file_node(extract_js(p))
+    assert fn.get("script_kind") == "top_level"
+    # Lines 5, 6: `const result = analyze(data);` and `report(result);`.
+    assert 5 in (fn.get("script_entries") or [])
+    assert 6 in (fn.get("script_entries") or [])
+
+
+def test_script_metadata_survives_to_file_node(tmp_path):
+    """Sanity: the stamp lives on the file node specifically (not
+    methods/classes), and extract.py never stamps it on inner nodes —
+    methods get script_kind=None even if their owning file is a script."""
+    p = tmp_path / "tool.py"
+    p.write_text(
+        "def main(): pass\n"
+        "if __name__ == \"__main__\":\n"
+        "    main()\n"
+    )
+    result = extract_python(p)
+    file_node = result["nodes"][0]
+    assert file_node.get("script_kind") == "main_block"
+    # All other nodes must NOT carry script metadata.
+    for n in result["nodes"][1:]:
+        assert "script_kind" not in n, (
+            f"Inner node leaked script metadata: {n}"
+        )

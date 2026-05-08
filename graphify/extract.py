@@ -70,9 +70,20 @@ from .cache import load_cached, save_cached
 #          existing graphs. Resolution itself runs at merge time over
 #          merged output, so once a v8 cache cell is written it's
 #          stable.
+#   "v9" — lap-27 navigator-original: file nodes for Python / JS / TS
+#          carry `script` + `script_kind` + `script_entries` when the
+#          file looks like a runnable CLI script. `script_kind` is one
+#          of `main_block` (canonical `if __name__ == "__main__":` /
+#          `if (require.main === module)`), `top_level` (top-level
+#          calls to own functions, top-level for/while), or `shebang`
+#          (executable shebang line, weakest signal — only when no
+#          other indicator fires). Falls into shape's "entry points:"
+#          line when external in-edges = 0 so investigation scripts
+#          stop reading as dead-end leaves. Cached cells from v8 lack
+#          the metadata; bump forces re-extract.
 # Note: lap-15's phantom-node resolution runs at MERGE time over the
 # combined per-file results, so it fires on cached output too — no bump.
-AST_CACHE_VERSION = "v8"
+AST_CACHE_VERSION = "v9"
 
 
 # AST node types that represent a member-expression callee
@@ -1107,6 +1118,190 @@ _SWIFT_CONFIG = LanguageConfig(
 )
 
 
+# ── Script-indicator detection ────────────────────────────────────────────────
+# Lap-27 field report: investigation-style scripts have zero external
+# in-edges, so `shape`'s entry-points line says "no entry points" exactly
+# when the agent most needs orientation. Stamp the file node with a
+# `script` flag + the line number(s) of the runnable entry so navigate
+# and shape can land the agent there.
+#
+# Indicator priority (strongest first):
+#   1. `main_block`  — canonical `if __name__ == "__main__":` (Python) or
+#                      `if (require.main === module)` / `import.meta.main`
+#                      (JS/TS). Entry lines are the calls inside the block.
+#   2. `top_level`   — top-level call to a function defined in this file,
+#                      or top-level for/while/with. Catches the script
+#                      style most commonly written by hand:
+#                          analyze_data()
+#                          report(results)
+#                      Filters noise from library config (top-level calls
+#                      to *imported* names like `logger.basicConfig(...)`)
+#                      by requiring the callee to be defined in this file.
+#   3. `shebang`     — executable shebang only (e.g. `#!/usr/bin/env python`).
+#                      Weakest; fires only when 1 + 2 don't.
+#
+# Returned `script_entries` lines are 1-indexed, deduplicated, and capped
+# at 5 (a script with >5 top-level call sites is "looks runnable" — the
+# count is the signal, not every line).
+
+
+def _detect_script_indicators(root, source: bytes, ts_module: str,
+                              own_fn_names: set[str]) -> tuple[str | None, list[int]]:
+    """Inspect a parsed module for CLI-script signatures.
+
+    Returns ``(kind, entry_lines)`` where ``kind`` is one of
+    ``"main_block"``, ``"top_level"``, ``"shebang"`` or ``None``.
+    """
+    try:
+        text = source.decode("utf-8", errors="replace") if isinstance(source, (bytes, bytearray)) else source
+    except Exception:
+        text = ""
+
+    has_shebang = False
+    if text.startswith("#!"):
+        first_line = text.split("\n", 1)[0]
+        if ts_module == "tree_sitter_python" and "python" in first_line:
+            has_shebang = True
+        elif ts_module in ("tree_sitter_javascript", "tree_sitter_typescript"):
+            if any(rt in first_line for rt in ("node", "deno", "bun", "tsx", "ts-node")):
+                has_shebang = True
+
+    main_block_entries: list[int] = []
+    top_level_entries: list[int] = []
+
+    # "Boring" top-level statements: declarations, imports, comments. Anything
+    # NOT in this set is candidate top-level work; we then look inside it for
+    # bare calls to functions defined in this file. Catches the common
+    # EGF investigation pattern where work is wrapped in assignments
+    # (`result = analyze(data)`) rather than bare expression statements.
+    PY_BORING = {
+        "import_statement", "import_from_statement", "future_import_statement",
+        "function_definition", "class_definition", "decorated_definition",
+        "comment", "string",
+    }
+    JS_BORING = {
+        "import_statement", "export_statement",
+        "function_declaration", "generator_function_declaration",
+        "class_declaration",
+        "interface_declaration", "type_alias_declaration",
+        "ambient_declaration", "module", "namespace_declaration",
+        "comment", "hash_bang_line",
+    }
+    LOOPY = {
+        "for_statement", "while_statement", "with_statement",
+        "for_in_statement", "for_of_statement",
+    }
+
+    for child in root.children:
+        ct = child.type
+        if ts_module == "tree_sitter_python":
+            if ct == "if_statement" and _py_is_main_block(child, source):
+                main_block_entries.extend(_find_calls_to_own(child, source, own_fn_names))
+                if not main_block_entries:
+                    main_block_entries.append(child.start_point[0] + 1)
+                continue
+            if ct in PY_BORING:
+                continue
+            if ct in LOOPY:
+                top_level_entries.append(child.start_point[0] + 1)
+                continue
+            # Walk anything else (expression_statement, assignment, try, etc.)
+            # for bare calls to own functions.
+            if _find_calls_to_own(child, source, own_fn_names):
+                top_level_entries.append(child.start_point[0] + 1)
+        elif ts_module in ("tree_sitter_javascript", "tree_sitter_typescript"):
+            if ct == "if_statement" and _js_is_main_block(child, source):
+                main_block_entries.extend(_find_calls_to_own(child, source, own_fn_names))
+                if not main_block_entries:
+                    main_block_entries.append(child.start_point[0] + 1)
+                continue
+            if ct in JS_BORING:
+                continue
+            if ct in LOOPY:
+                top_level_entries.append(child.start_point[0] + 1)
+                continue
+            if _find_calls_to_own(child, source, own_fn_names):
+                top_level_entries.append(child.start_point[0] + 1)
+
+    if main_block_entries:
+        return "main_block", sorted(set(main_block_entries))[:5]
+    if top_level_entries:
+        return "top_level", sorted(set(top_level_entries))[:5]
+    if has_shebang:
+        return "shebang", [1]
+    return None, []
+
+
+def _py_is_main_block(if_node, source: bytes) -> bool:
+    """Python: `if __name__ == "__main__":` — match by tokens, not grammar shape."""
+    for child in if_node.children:
+        if child.type == "comparison_operator":
+            cond = source[child.start_byte:child.end_byte].decode("utf-8", errors="replace")
+            return "__name__" in cond and "__main__" in cond
+    return False
+
+
+def _js_is_main_block(if_node, source: bytes) -> bool:
+    """JS/TS: `if (require.main === module)` or `if (import.meta.main)`."""
+    for child in if_node.children:
+        if child.type in ("parenthesized_expression", "binary_expression"):
+            text = source[child.start_byte:child.end_byte].decode("utf-8", errors="replace")
+            if ("require.main" in text and "module" in text) or "import.meta.main" in text:
+                return True
+    return False
+
+
+def _py_top_call_name(expr_stmt_node, source: bytes) -> str | None:
+    """Bare top-level call: expression_statement → call → identifier."""
+    for child in expr_stmt_node.children:
+        if child.type == "call":
+            if child.children:
+                fn = child.children[0]
+                if fn.type == "identifier":
+                    return source[fn.start_byte:fn.end_byte].decode("utf-8", errors="replace")
+            break
+    return None
+
+
+def _js_top_call_name(expr_stmt_node, source: bytes) -> str | None:
+    """JS/TS top-level call: expression_statement → (await_expression →) call_expression → identifier."""
+    for child in expr_stmt_node.children:
+        target = child
+        if child.type == "await_expression":
+            target = next((c for c in child.children if c.type == "call_expression"), None)
+        if target is not None and target.type == "call_expression":
+            if target.children:
+                fn = target.children[0]
+                if fn.type == "identifier":
+                    return source[fn.start_byte:fn.end_byte].decode("utf-8", errors="replace")
+            break
+    return None
+
+
+def _find_calls_to_own(node, source: bytes, own_fn_names: set[str]) -> list[int]:
+    """Walk a subtree, return line numbers where a call's bare callee is defined locally.
+
+    Bails out of a call subtree once a match is found at that level so an
+    outermost-only check (no nested-call double-count). Recurses elsewhere.
+    """
+    results: list[int] = []
+
+    def walk(n) -> None:
+        if n.type in ("call", "call_expression"):
+            if n.children:
+                fn = n.children[0]
+                if fn.type == "identifier":
+                    name = source[fn.start_byte:fn.end_byte].decode("utf-8", errors="replace")
+                    if name in own_fn_names:
+                        results.append(n.start_point[0] + 1)
+                        return
+        for child in n.children:
+            walk(child)
+
+    walk(node)
+    return results
+
+
 # ── Generic extractor ─────────────────────────────────────────────────────────
 
 def _extract_generic(path: Path, config: LanguageConfig) -> dict:
@@ -2048,6 +2243,33 @@ def _extract_generic(path: Path, config: LanguageConfig) -> dict:
             "source_location": f"L{line}",
             "weight": 1.0,
         })
+
+    # ── Script-indicator stamp ────────────────────────────────────────────────
+    # Only Python / JS / TS for now — most CLI-script-style usage lives there
+    # and the detector is tuned to those grammars. Other languages have
+    # their own runnable conventions (Go's `func main()`, Rust's `fn main()`)
+    # that the AST already exposes as ordinary entry points; no extra tag
+    # needed.
+    if config.ts_module in ("tree_sitter_python", "tree_sitter_javascript",
+                            "tree_sitter_typescript"):
+        own_fn_names: set[str] = set()
+        for n in nodes:
+            lbl = n.get("label", "")
+            if lbl.endswith("()"):
+                own_fn_names.add(lbl[:-2].lstrip("."))
+        try:
+            kind, entries = _detect_script_indicators(
+                root, source, config.ts_module, own_fn_names
+            )
+        except Exception:
+            kind, entries = None, []
+        if kind:
+            for n in nodes:
+                if n["id"] == file_nid:
+                    n["script"] = True
+                    n["script_kind"] = kind
+                    n["script_entries"] = entries
+                    break
 
     # ── Clean edges ───────────────────────────────────────────────────────────
     valid_ids = seen_ids

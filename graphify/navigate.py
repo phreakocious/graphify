@@ -786,6 +786,15 @@ def _node_summary(G: nx.DiGraph, nid: str) -> dict:
         "git_mtime": meta.get("git_mtime"),
         "lines": meta.get("lines"),
         "size": meta.get("size"),
+        # Lap-27: CLI-script metadata stamped onto the file node by extract.py
+        # for Python / JS / TS files that look runnable (canonical __main__
+        # block, top-level call to a function defined in this file, or a
+        # shebang line). Surfaced as a compact `· script:main` / `· script:tl`
+        # / `· script:sh` tag and consumed by `shape`'s entry-points fallback
+        # when the file has no external callers.
+        "script": bool(a.get("script")),
+        "script_kind": a.get("script_kind"),
+        "script_entries": a.get("script_entries") or [],
     }
 
 
@@ -816,6 +825,14 @@ def _meta_tag(item: dict) -> str:
     fs_mtime = item.get("mtime")
     if fs_mtime and _GRAPH_MTIME and fs_mtime > _GRAPH_MTIME:
         parts.append("!stale")
+    # Lap-27: compact CLI-script badge. Folded into the same metadata strip so
+    # the file header line answers "what kind of file is this?" without an
+    # extra round trip. Kind shorthand: main = canonical `__main__` block,
+    # tl = top-level call to own fn / loop, sh = shebang only.
+    sk = item.get("script_kind")
+    if sk:
+        short = {"main_block": "main", "top_level": "tl", "shebang": "sh"}.get(sk, sk)
+        parts.append(f"script:{short}")
     return (" · " + " · ".join(parts)) if parts else ""
 
 
@@ -3814,6 +3831,15 @@ def shape_file(G: nx.DiGraph, file_nid: str, *,
     # <file>` next, just to read the orientation paragraph at the top.
     # Capturing 3-5 lines of it inline saves that follow-up.
     docstring = _file_top_docstring(sf) if sf else []
+    # Lap-27: CLI-script fallback. When a file has zero external callers,
+    # `entry_points` is empty — but the file may still be a runnable script
+    # (`if __name__ == "__main__":`, top-level call to own fn, shebang).
+    # Surface those entry lines so investigation-style scripts stop
+    # reading as dead-end leaves. Stamped on the file node by extract.py;
+    # we just propagate to the renderer here.
+    script_kind = fattrs.get("script_kind")
+    script_entries_raw = list(fattrs.get("script_entries") or [])
+
     return {
         "type": "shape",
         "label": label,
@@ -3826,6 +3852,8 @@ def shape_file(G: nx.DiGraph, file_nid: str, *,
         "imports": imports,
         "longest_fn": longest_fn,
         "entry_points": entry_points[:3],
+        "script_kind": script_kind,
+        "script_entries": script_entries_raw[:3],
         "total_lines": total_lines,
         "docstring": docstring,
         # `limit=None` (`--all`) returns the full lists; default 8 keeps the
@@ -4056,6 +4084,17 @@ def _render_shape_text(data: dict) -> str:
         bits = [f"{ep['label']} (×{ep['ext_in']})" for ep in eps]
         parts.append(f"    entry points: {', '.join(bits)}")
         any_ext_marker = True
+    elif data.get("script_kind") and data.get("script_entries"):
+        # Lap-27 fallback: file has no external callers but looks runnable.
+        # Surface the runnable entry lines so the agent lands on the script's
+        # actual entry instead of reading the longest fn or scanning blind.
+        sk = data["script_kind"]
+        se = data["script_entries"]
+        kind_label = {"main_block": "from __main__",
+                      "top_level": "top-level",
+                      "shebang": "shebang"}.get(sk, sk)
+        line_str = ", ".join(f"L{ln}" for ln in se)
+        parts.append(f"    entry points: {line_str} [{kind_label}]")
     # Lap-26 field-report fix: agent read `×N` as "N variants of this
     # symbol" rather than "N cross-file callers". Add a one-line legend
     # ONLY when at least one `×N` was rendered so we don't burn tokens

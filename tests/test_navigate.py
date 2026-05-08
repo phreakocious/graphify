@@ -5132,6 +5132,111 @@ def test_shape_file_surfaces_entry_points(tmp_path, monkeypatch):
     )
 
 
+def test_shape_file_falls_back_to_script_entries(tmp_path, monkeypatch):
+    """Lap-27: when a file has 0 external callers but the extractor
+    stamped `script_kind` + `script_entries` (CLI-script signature),
+    `shape` surfaces those entry lines instead of falling silent.
+    Investigation-style scripts (no imports from elsewhere) used to
+    render `entry points:` empty — exactly when the agent most needs
+    orientation. Now the line reads `entry points: L42 [from __main__]`
+    or `entry points: L18, L19 [top-level]`."""
+    from graphify.navigate import shape_file, _render_shape_text, load_graph
+    sf = str(tmp_path / "investigate.py")
+    nodes = [
+        # File node with the script stamp the extractor would have set.
+        {"id": "f", "label": "investigate.py", "file_type": "code",
+         "source_file": sf, "source_location": "L1",
+         "script": True, "script_kind": "top_level",
+         "script_entries": [18, 19]},
+        {"id": "fn1", "label": "analyze()", "file_type": "code",
+         "source_file": sf, "source_location": "L5"},
+        {"id": "fn2", "label": "report()", "file_type": "code",
+         "source_file": sf, "source_location": "L10"},
+    ]
+    links = [
+        {"source": "f", "target": "fn1", "relation": "contains",
+         "confidence": "EXTRACTED"},
+        {"source": "f", "target": "fn2", "relation": "contains",
+         "confidence": "EXTRACTED"},
+    ]
+    _write_graph(tmp_path / "graphify-out", nodes, links)
+    monkeypatch.chdir(tmp_path)
+    G, _comm = load_graph(tmp_path / "graphify-out" / "graph.json")
+    data = shape_file(G, "f")
+    # The shape result carries the script metadata for the renderer.
+    assert data.get("script_kind") == "top_level"
+    assert data.get("script_entries") == [18, 19]
+    # Normal entry_points list is empty (no external callers).
+    assert not data.get("entry_points")
+    # Renderer falls back to the script-entries line.
+    rendered = _render_shape_text(data)
+    assert "entry points: L18, L19 [top-level]" in rendered, (
+        f"renderer should print script-fallback entry-points line:\n{rendered}"
+    )
+
+
+def test_shape_file_main_block_renders_clear_label(tmp_path, monkeypatch):
+    """`main_block` kind should render `[from __main__]` so the agent
+    knows the entry came from the canonical Python idiom (vs `top-level`
+    or `shebang` which carry weaker semantics)."""
+    from graphify.navigate import shape_file, _render_shape_text, load_graph
+    sf = str(tmp_path / "tool.py")
+    nodes = [
+        {"id": "f", "label": "tool.py", "file_type": "code",
+         "source_file": sf, "source_location": "L1",
+         "script": True, "script_kind": "main_block",
+         "script_entries": [42]},
+        {"id": "main", "label": "main()", "file_type": "code",
+         "source_file": sf, "source_location": "L20"},
+    ]
+    links = [
+        {"source": "f", "target": "main", "relation": "contains",
+         "confidence": "EXTRACTED"},
+    ]
+    _write_graph(tmp_path / "graphify-out", nodes, links)
+    monkeypatch.chdir(tmp_path)
+    G, _comm = load_graph(tmp_path / "graphify-out" / "graph.json")
+    data = shape_file(G, "f")
+    rendered = _render_shape_text(data)
+    assert "entry points: L42 [from __main__]" in rendered, rendered
+
+
+def test_shape_file_external_callers_take_precedence_over_script(tmp_path, monkeypatch):
+    """When a file has BOTH a script signature AND external callers, the
+    real call-graph entry points win — the script fallback only fires
+    when there's nothing better. (A library that happens to have a
+    convenience `__main__` block should still surface its API surface
+    when someone runs `shape` on it.)"""
+    from graphify.navigate import shape_file, _render_shape_text, load_graph
+    sf = str(tmp_path / "lib.py")
+    other = str(tmp_path / "consumer.py")
+    nodes = [
+        {"id": "f", "label": "lib.py", "file_type": "code",
+         "source_file": sf, "source_location": "L1",
+         "script": True, "script_kind": "main_block",
+         "script_entries": [50]},
+        {"id": "fn1", "label": "popular()", "file_type": "code",
+         "source_file": sf, "source_location": "L5"},
+        {"id": "caller", "label": "caller()", "file_type": "code",
+         "source_file": other, "source_location": "L1"},
+    ]
+    links = [
+        {"source": "f", "target": "fn1", "relation": "contains",
+         "confidence": "EXTRACTED"},
+        {"source": "caller", "target": "fn1", "relation": "calls",
+         "confidence": "EXTRACTED"},
+    ]
+    _write_graph(tmp_path / "graphify-out", nodes, links)
+    monkeypatch.chdir(tmp_path)
+    G, _comm = load_graph(tmp_path / "graphify-out" / "graph.json")
+    data = shape_file(G, "f")
+    rendered = _render_shape_text(data)
+    assert "popular() (×1)" in rendered, rendered
+    # No script-fallback line.
+    assert "[from __main__]" not in rendered, rendered
+    assert "[top-level]" not in rendered, rendered
+
+
 def test_shape_file_surfaces_top_of_file_docstring(tmp_path, monkeypatch):
     """Lap-24 follow-up: shape inlines up to ~5 lines of the file's
     leading docstring or comment block. Empirical from session-benchmark
