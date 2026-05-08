@@ -3853,9 +3853,12 @@ def main() -> None:
                 ds_range = (0, 0)
                 if strip_docstring and body:
                     ds_range = _find_leading_docstring_range(body)
+                from graphify.navigate import _compute_owner_class
                 data = {
                     "type": "body",
                     "label": nattrs.get("label", chosen),
+                    "owner_class": _compute_owner_class(
+                        G, chosen, nattrs.get("label")),
                     "source_file": sf,
                     "source_location": loc,
                     "lines": body,

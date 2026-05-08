@@ -734,6 +734,38 @@ def _is_test_path(src: str | None) -> bool:
             or name.endswith(".spec.js"))
 
 
+def _compute_owner_class(G: nx.DiGraph, nid: str, label: str | None = None) -> str:
+    """Walk method/contains predecessors and return the owning class
+    label when `nid` is a method-shape node (`.foo()`).
+
+    Lap-21 #1 (sub-agent head-to-head): when label is method-shape
+    (`.foo()`), find its owning class via the `method` predecessor so
+    renderers can disambiguate `.compute() in Cursor` from
+    `.compute() in CursorMock` without forcing a `parent` pivot. Walk
+    both `method` and `contains` since some extractors emit methods
+    via contains rather than method. Returns "" when not method-shape
+    or no class predecessor.
+
+    Pulled out as a helper so peek/blast/body renderers can stamp the
+    same owner_class that listing rows already carry — closes the
+    gripe where `peek MobiusS3Geometry.compute_metrics` resolved
+    correctly but the rendered header showed `read @.compute_metrics()`
+    with no class qualifier.
+    """
+    if label is None:
+        label = G.nodes[nid].get("label", nid)
+    if not (isinstance(label, str) and label.startswith(".") and label.endswith("()")):
+        return ""
+    for u in G.predecessors(nid):
+        rel = G.edges[u, nid].get("relation") or ""
+        if rel not in ("method", "contains"):
+            continue
+        u_kind = G.nodes[u].get("node_kind") or ""
+        if u_kind in ("class", "interface"):
+            return G.nodes[u].get("label", "") or ""
+    return ""
+
+
 def _node_summary(G: nx.DiGraph, nid: str) -> dict:
     a = G.nodes[nid]
     src = a.get("source_file")
@@ -742,22 +774,7 @@ def _node_summary(G: nx.DiGraph, nid: str) -> dict:
     labels = (G.graph.get("community_labels") if hasattr(G, "graph") else None) or {}
     hubs = (G.graph.get("community_hubs") if hasattr(G, "graph") else None) or {}
     label = a.get("label", nid)
-    # Lap-21 #1 (sub-agent head-to-head): when label is method-shape
-    # (`.foo()`), find its owning class via the `method` predecessor
-    # so the renderer can disambiguate `.compute() in Cursor` from
-    # `.compute() in CursorMock` without forcing a `parent` pivot.
-    # Walk both `method` and `contains` since some extractors emit
-    # methods via contains rather than method.
-    owner_class = ""
-    if isinstance(label, str) and label.startswith(".") and label.endswith("()"):
-        for u in G.predecessors(nid):
-            rel = G.edges[u, nid].get("relation") or ""
-            if rel not in ("method", "contains"):
-                continue
-            u_kind = G.nodes[u].get("node_kind") or ""
-            if u_kind in ("class", "interface"):
-                owner_class = G.nodes[u].get("label", "") or ""
-                break
+    owner_class = _compute_owner_class(G, nid, label)
     return {
         "id": nid,
         "label": label,
@@ -1700,7 +1717,20 @@ def _render_body_text(data: dict, *, md: bool = False) -> str:
     ln = data.get("start_line") or 0
     body_lines = data.get("lines") or []
     truncated = data.get("truncated")
-    linked_label = _maybe_link(label, data.get("source_file"),
+    # Lap-27 long-running-Claude follow-up: when the resolved node is
+    # a method-shape label (`.foo()`), prepend the owning class so the
+    # rendered header carries the same context the agent typed when
+    # they reached for `peek Class.method`. Without this the resolver
+    # fix lands the right node but the header reads `read @.foo()`
+    # with no class qualifier — agent has to mentally reconstruct
+    # which `.foo()` they ended up on.
+    owner_class = data.get("owner_class") or ""
+    if owner_class and isinstance(label, str) and label.startswith(".") \
+            and label.endswith("()"):
+        display_label = f"{owner_class}{label}"
+    else:
+        display_label = label
+    linked_label = _maybe_link(display_label, data.get("source_file"),
                                 data.get("source_location"), md)
     if not body_lines:
         return f"  read @{linked_label}: no body at {sf}:{ln} (missing source or unparseable location)"
@@ -4588,6 +4618,8 @@ def navigate(ops: list[str] | str, *,
                     last_data = {
                         "type": "body",
                         "label": nattrs.get("label", cursor.current),
+                        "owner_class": _compute_owner_class(
+                            G, cursor.current, nattrs.get("label")),
                         "source_file": sf,
                         "source_location": loc,
                         "lines": body,

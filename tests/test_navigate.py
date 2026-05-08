@@ -7409,3 +7409,68 @@ def test_summarize_class_methods_ordered_by_degree(tmp_path, monkeypatch):
     assert render_idx < helper_idx < init_idx, (
         f"expected degree-desc order render → helper → __init__:\n{out}"
     )
+
+
+def test_peek_method_header_carries_owner_class(tmp_path, monkeypatch):
+    """Lap-27 long-running-Claude follow-up: when peek resolves to a
+    method-shape node (`.compute_metrics()`), the rendered body header
+    used to drop the class qualifier and read `read @.compute_metrics()`
+    — leaving the agent to reconstruct which class they landed on.
+    The header now prepends the owning class label when one is found
+    on a `method`/`contains` predecessor."""
+    import subprocess
+    target = tmp_path / "sample.py"
+    target.write_text(
+        "class MobiusS3Geometry:\n"
+        "    def compute_metrics(self):\n"
+        "        return 42\n"
+    )
+    nodes = [
+        {"id": "cls", "label": "MobiusS3Geometry", "file_type": "code",
+         "node_kind": "class",
+         "source_file": str(target), "source_location": "L1-3"},
+        {"id": "meth", "label": ".compute_metrics()", "file_type": "code",
+         "node_kind": "method",
+         "source_file": str(target), "source_location": "L2-3"},
+    ]
+    links = [{"source": "cls", "target": "meth", "relation": "method"}]
+    _write_graph(tmp_path / "graphify-out", nodes, links)
+    monkeypatch.chdir(tmp_path)
+    res = subprocess.run(
+        ["python", "-m", "graphify", "peek", "MobiusS3Geometry.compute_metrics"],
+        capture_output=True, text=True, cwd=str(tmp_path), timeout=15,
+    )
+    assert res.returncode == 0, f"peek failed: {res.stderr}"
+    out = res.stdout
+    assert "read @MobiusS3Geometry.compute_metrics()" in out, (
+        f"header should carry the owner class qualifier:\n{out}"
+    )
+    # Negative: bare `@.compute_metrics()` would mean we lost context.
+    assert "read @.compute_metrics()" not in out
+
+
+def test_peek_free_function_header_unchanged(tmp_path, monkeypatch):
+    """Free functions (no class predecessor) must not gain a phantom
+    owner prefix. Only method-shape labels (`.foo()`) get prepended."""
+    import subprocess
+    target = tmp_path / "lib.py"
+    target.write_text(
+        "def utility_fn():\n"
+        "    return 42\n"
+    )
+    nodes = [
+        {"id": "fn", "label": "utility_fn()", "file_type": "code",
+         "node_kind": "function",
+         "source_file": str(target), "source_location": "L1-2"},
+    ]
+    _write_graph(tmp_path / "graphify-out", nodes, [])
+    monkeypatch.chdir(tmp_path)
+    res = subprocess.run(
+        ["python", "-m", "graphify", "peek", "utility_fn"],
+        capture_output=True, text=True, cwd=str(tmp_path), timeout=15,
+    )
+    assert res.returncode == 0, f"peek failed: {res.stderr}"
+    out = res.stdout
+    assert "read @utility_fn()" in out, (
+        f"free-function header should be bare:\n{out}"
+    )
