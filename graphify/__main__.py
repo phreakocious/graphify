@@ -3353,6 +3353,44 @@ def main() -> None:
             mix = " · ".join(f"{ext} ({c})" for ext, c in top_exts)
             print(f"  Languages: {mix}")
 
+        # Lap-27 follow-up (post-marquee dogfood): advertise the markdown
+        # surface explicitly. The Languages line shows `.md (N)` but the
+        # agent doesn't know graphify resolves backtick refs in those
+        # files into `references` edges — they ASK for "where is X
+        # mentioned" via grep instead of reaching for `wu @X`. One line
+        # that names the count split + the verb closes the gap.
+        ext_refs = sum(1 for _, _, d in G.edges(data=True)
+                       if d.get("relation") == "references"
+                       and d.get("confidence") == "EXTRACTED")
+        inf_refs = sum(1 for _, _, d in G.edges(data=True)
+                       if d.get("relation") == "references"
+                       and d.get("confidence") == "INFERRED")
+        if ext_refs or inf_refs:
+            bits = []
+            if ext_refs:
+                bits.append(f"{ext_refs} EXTRACTED")
+            if inf_refs:
+                bits.append(f"{inf_refs} INFERRED")
+            print(f"  Doc refs: {' + '.join(bits)} "
+                  f"(`wu @<symbol>` surfaces .md/.mdx mentions of code)")
+
+        # Lap-27 follow-up: surface CLI-script counts so agents know to
+        # reach for `graphify scripts` instead of `grep -rn "if __name__"`.
+        # Skip kinds with 0 to keep the line short.
+        from collections import Counter as _ScriptCounter
+        script_counts: _ScriptCounter = _ScriptCounter()
+        for _, attrs in G.nodes(data=True):
+            if attrs.get("node_kind") != "file":
+                continue
+            sk = attrs.get("script_kind")
+            if sk:
+                script_counts[sk] += 1
+        if script_counts:
+            order = ("main_block", "top_level", "shebang")
+            parts = [f"{script_counts[k]} {k}" for k in order if script_counts[k]]
+            print(f"  Scripts: {' · '.join(parts)}  "
+                  f"(`graphify scripts` to list)")
+
         # Lap-24 (no-arg redesign): "Suggested next" footer points the
         # agent at the busiest file in the repo (top entry point's
         # source file). Without this, the agent has top-5 entry points

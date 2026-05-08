@@ -7135,6 +7135,62 @@ def test_summarize_no_target_keeps_repo_overview(tmp_path, monkeypatch):
     )
 
 
+def test_summarize_no_target_advertises_doc_refs_and_scripts(tmp_path, monkeypatch):
+    """Lap-27 follow-up: the no-arg summarize is the agent's primer surface
+    on first contact. It must advertise the markdown reference surface and
+    the `scripts` verb so agents don't fall back to grep `__name__` /
+    grep through `.md` files. One line per capability, fires only when
+    relevant data is present.
+    """
+    import subprocess
+    nodes = [
+        {"id": "f", "label": "lib.py", "file_type": "code",
+         "source_file": "lib.py", "source_location": "L1",
+         "node_kind": "file", "script_kind": "main_block",
+         "script_entries": [50]},
+        {"id": "fn", "label": "do_work()", "file_type": "code",
+         "source_file": "lib.py", "source_location": "L5-10",
+         "node_kind": "function"},
+        {"id": "doc", "label": "README.md", "file_type": "document",
+         "source_file": "README.md", "source_location": "L1",
+         "node_kind": "file"},
+        {"id": "head", "label": "API", "file_type": "document",
+         "source_file": "README.md", "source_location": "L1"},
+    ]
+    links = [
+        {"source": "f", "target": "fn", "relation": "contains",
+         "confidence": "EXTRACTED"},
+        {"source": "doc", "target": "head", "relation": "contains",
+         "confidence": "EXTRACTED"},
+        # Single-match (post-fix) — surfaces by default in `wu`.
+        {"source": "head", "target": "fn", "relation": "references",
+         "confidence": "EXTRACTED", "confidence_score": 1.0,
+         "source_file": "README.md", "source_location": "L1"},
+    ]
+    _write_graph(tmp_path / "graphify-out", nodes, links)
+    monkeypatch.chdir(tmp_path)
+    res = subprocess.run(
+        ["python", "-m", "graphify", "summarize"],
+        capture_output=True, text=True, cwd=str(tmp_path), timeout=15,
+    )
+    assert res.returncode == 0, f"summarize failed: stderr={res.stderr}"
+    out = res.stdout
+    assert "Doc refs:" in out, (
+        f"no-arg summarize must advertise the markdown ref surface:\n{out}"
+    )
+    assert "wu @<symbol>" in out, (
+        f"Doc refs line must name the `wu` verb so the agent knows how to "
+        f"reach it:\n{out}"
+    )
+    assert "Scripts:" in out and "main_block" in out, (
+        f"no-arg summarize must surface script counts so agents reach for "
+        f"`graphify scripts`:\n{out}"
+    )
+    assert "graphify scripts" in out, (
+        f"Scripts line must name the verb:\n{out}"
+    )
+
+
 def test_scripts_lists_all_script_tagged_files(tmp_path, monkeypatch):
     """Lap-27 sub-agent A/B follow-up: `scripts` lists every file node
     carrying a `script_kind` attribute. Closes the friction surfaced by
