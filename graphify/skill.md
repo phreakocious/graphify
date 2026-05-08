@@ -78,6 +78,7 @@ Sub-agents run with their own system prompts that hard-code `find` / `grep` / `g
 > - Where is X defined? → `graphify locate X` (multi-symbol: `locate X Y Z`)
 > - What's in this file? → `graphify shape <file>` (multi: `shape f1.py f2.py` or `shape {a,b}.py`)
 > - Which files match a pattern? → `graphify files "<glob>"` (e.g. `*test*.py`, `tools/*.py`)
+> - Which files run as CLI scripts? → `graphify scripts` (or `scripts "<glob>"`, `scripts --kind main|tl|sh`) — every file with a main/top-level/shebang entry, including the no-`__main__` investigation style that grep can't catch
 > - Who calls X? → `graphify navigate "@X" in --kind=calls`
 > - Who uses X (incl. typed dispatch + doc mentions)? → `graphify navigate "@X" wu` — also surfaces backtick-quoted refs in `.md`/`.mdx` (README, ARCHITECTURE, design docs) as `references` edges
 > - What strings match? → `graphify search "<pat>"` — add `--idents` for cross-casing, `--files-only` for grep -l, `--in-files "<glob>"` for grep -r --include. Searches code bodies AND markdown headings/paragraphs.

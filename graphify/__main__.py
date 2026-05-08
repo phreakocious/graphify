@@ -100,6 +100,14 @@ _HELP_BLOCKS: dict[str, list[str]] = {
         "    Bare patterns (`*test*.py`, `*.rs`) match basename. Path patterns (`tools/*.py`, `tests/test_*.py`) match the full source_file. fnmatch syntax — `*`, `?`, `[seq]` — case-sensitive.",
         "    Use when you'd otherwise run `find -name <glob>` to scope which files exist before pivoting. Pairs with `shape <file>` (orient on one) and `@<dir>/` (list a directory). Exits 1 on no-match so callers can branch.",
     ],
+    "scripts": [
+        "  scripts [<glob>]        list CLI-script files (script_kind tagged) with entry-point line(s)",
+        "    --kind <name>           filter by kind: main_block / main, top_level / tl, shebang / sh",
+        "    --graph <path>          path to graph.json (default graphify-out/graph.json)",
+        "    Output: one row per script-tagged file, kind-grouped (main first, then tl, then sh) with `<path>  script:<short>  L<entry-lines>`. Short kinds: `main` (canonical `if __name__ == \"__main__\":` / `require.main` / `import.meta.main`), `tl` (top-level statement / call to an own-defined fn — the no-clunky-main investigation style), `sh` (shebang only).",
+        "    Optional glob filter same as `files`: bare = basename (`*.py`), path = full path (`tools/*.py`).",
+        "    Use when you'd otherwise run `grep -rn \"if __name__\"` or scan a directory for runnable scripts. One call returns every CLI script in the indexed corpus — including the `top_level` style that no `__main__` grep would catch.",
+    ],
     "blast": [
         "  blast <symbol>          one-shot blast radius — callers + callees of a symbol, side-by-side, cursor-free",
         "    --limit N               max items per side (default 30)",
@@ -245,7 +253,7 @@ def _print_top_help_short() -> None:
     # (flag entries) are filtered.
     print("Commands:")
     for verb in ("navigate", "peek", "shape", "doc", "blast", "locate",
-                 "files", "summarize", "search", "path", "explain", "changed"):
+                 "files", "scripts", "summarize", "search", "path", "explain", "changed"):
         block = _HELP_BLOCKS.get(verb, [])
         for line in block:
             if line.startswith("    "):
@@ -3997,6 +4005,109 @@ def main() -> None:
         # subsequent Read of any of them is a quiet passthrough.
         # Cap at 50 entries to bound the dedup-log size.
         _stamp_recent_files(gp, [sf for sf, _label in hits[:50]])
+
+    elif cmd == "scripts":
+        # Lap-27 sub-agent A/B follow-up: A/B test (n=3 per cell) showed
+        # the script_kind tag on file nodes goes unreached-for. Both arms
+        # tied at 5.67 calls on "list every CLI script under graphify/" —
+        # condition B (with paste-prompt) didn't reach for `navigate
+        # "@graphify/"` (which would surface `· script:main` badges) and
+        # fell back to grep "if __name__" alongside condition A.
+        # `scripts` is the verb-fusion answer: one call lists every
+        # script-tagged file with kind + entry line(s), including the
+        # `top_level` style (no canonical __name__ block) that no grep
+        # would catch.
+        if any(a in ("-h", "--help") for a in sys.argv[2:]):
+            _print_subcmd_help("scripts")
+            return
+        import fnmatch as _fnmatch
+        from graphify.navigate import DEFAULT_GRAPH_PATH, load_graph
+        args = sys.argv[2:]
+        graph_path = DEFAULT_GRAPH_PATH
+        pattern: str | None = None
+        kind_filter: str | None = None
+        i = 0
+        while i < len(args):
+            a = args[i]
+            if a == "--graph" and i + 1 < len(args):
+                graph_path = args[i + 1]; i += 2
+            elif a.startswith("--graph="):
+                graph_path = a.split("=", 1)[1]; i += 1
+            elif a == "--kind" and i + 1 < len(args):
+                kind_filter = args[i + 1]; i += 2
+            elif a.startswith("--kind="):
+                kind_filter = a.split("=", 1)[1]; i += 1
+            elif pattern is None:
+                pattern = a; i += 1
+            else:
+                print(f"warning: ignoring extra arg `{a}`. scripts takes a single glob.",
+                      file=sys.stderr)
+                i += 1
+        gp = Path(graph_path)
+        if not gp.exists():
+            print(f"error: graph not found at {gp}. run `graphify update <path>` first.",
+                  file=sys.stderr)
+            sys.exit(1)
+        # Short-form aliases mirror the frontier `_meta_tag` rendering
+        # so `--kind main` matches the badge agents see in listings.
+        KIND_SHORT = {"main_block": "main", "top_level": "tl", "shebang": "sh"}
+        SHORT_TO_LONG = {v: k for k, v in KIND_SHORT.items()}
+        KIND_ORDER = {"main_block": 0, "top_level": 1, "shebang": 2}
+        if kind_filter:
+            if kind_filter in SHORT_TO_LONG:
+                kind_filter = SHORT_TO_LONG[kind_filter]
+            elif kind_filter not in KIND_SHORT:
+                print(
+                    f"error: unknown --kind `{kind_filter}` (one of: "
+                    "main_block/main, top_level/tl, shebang/sh)",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
+        G, _comm = load_graph(gp)
+        path_glob = pattern is not None and "/" in pattern
+        hits: list[tuple[int, str, str, list[int]]] = []
+        for nid, attrs in G.nodes(data=True):
+            if attrs.get("node_kind") != "file":
+                continue
+            kind = attrs.get("script_kind")
+            if not kind:
+                continue
+            if kind_filter and kind != kind_filter:
+                continue
+            sf = attrs.get("source_file") or ""
+            if not sf:
+                continue
+            if pattern:
+                target = sf if path_glob else sf.rsplit("/", 1)[-1]
+                if not _fnmatch.fnmatch(target, pattern):
+                    continue
+            entries = list(attrs.get("script_entries") or [])
+            hits.append((KIND_ORDER.get(kind, 99), sf, kind, entries))
+        if not hits:
+            msg = "no script-tagged files"
+            if pattern:
+                msg += f" match `{pattern}`"
+            if kind_filter:
+                tail = "" if not pattern else " and"
+                msg += f"{tail} kind=`{kind_filter}`"
+            print(f"{msg}.", file=sys.stderr)
+            sys.exit(1)
+        hits.sort(key=lambda t: (t[0], t[1]))
+        pad = max(len(sf) for _, sf, _, _ in hits) + 2
+        header = f"scripts: {len(hits)} found"
+        bits: list[str] = []
+        if pattern:
+            bits.append(f"matching `{pattern}`")
+        if kind_filter:
+            bits.append(f"kind={kind_filter}")
+        if bits:
+            header += " (" + ", ".join(bits) + ")"
+        print(header)
+        for _, sf, kind, entries in hits:
+            short = KIND_SHORT.get(kind, kind)
+            line_str = ", ".join(f"L{ln}" for ln in entries) if entries else "—"
+            print(f"  {sf:<{pad}}script:{short:<5} {line_str}")
+        _stamp_recent_files(gp, [sf for _, sf, _, _ in hits[:50]])
 
     elif cmd == "blast":
         # Lap-22 (meta-harness friction corpus): one-shot callers + callees

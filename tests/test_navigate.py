@@ -7091,3 +7091,133 @@ def test_summarize_no_target_keeps_repo_overview(tmp_path, monkeypatch):
     assert "nodes" in out and "edges" in out and "communities" in out, (
         f"no-arg summarize should emit top-line stats:\n{out}"
     )
+
+
+def test_scripts_lists_all_script_tagged_files(tmp_path, monkeypatch):
+    """Lap-27 sub-agent A/B follow-up: `scripts` lists every file node
+    carrying a `script_kind` attribute. Closes the friction surfaced by
+    the n=3 A/B (T2 zero delta) — paste-prompt agents fell back to grep
+    "if __name__" because no verb surfaced the script_kind tag in one
+    call."""
+    import subprocess
+    nodes = [
+        {"id": "f1", "label": "main_app.py", "file_type": "code",
+         "source_file": "src/main_app.py", "source_location": "L1",
+         "node_kind": "file", "script_kind": "main_block",
+         "script_entries": [120]},
+        {"id": "f2", "label": "investigate.py", "file_type": "code",
+         "source_file": "tools/investigate.py", "source_location": "L1",
+         "node_kind": "file", "script_kind": "top_level",
+         "script_entries": [42]},
+        {"id": "f3", "label": "wrapper.sh.py", "file_type": "code",
+         "source_file": "tools/wrapper.sh.py", "source_location": "L1",
+         "node_kind": "file", "script_kind": "shebang",
+         "script_entries": []},
+        {"id": "f4", "label": "library.py", "file_type": "code",
+         "source_file": "src/library.py", "source_location": "L1",
+         "node_kind": "file"},
+    ]
+    _write_graph(tmp_path / "graphify-out", nodes, [])
+    monkeypatch.chdir(tmp_path)
+    res = subprocess.run(
+        ["python", "-m", "graphify", "scripts"],
+        capture_output=True, text=True, cwd=str(tmp_path), timeout=15,
+    )
+    assert res.returncode == 0, f"scripts failed: {res.stderr}"
+    out = res.stdout
+    assert "scripts: 3 found" in out, f"expected 3-found header:\n{out}"
+    assert "src/main_app.py" in out
+    assert "tools/investigate.py" in out
+    assert "tools/wrapper.sh.py" in out
+    assert "src/library.py" not in out, (
+        f"non-script file should not appear:\n{out}"
+    )
+    # Kind-grouped order: main_block first, then top_level, then shebang.
+    main_idx = out.index("src/main_app.py")
+    tl_idx = out.index("tools/investigate.py")
+    sh_idx = out.index("tools/wrapper.sh.py")
+    assert main_idx < tl_idx < sh_idx, (
+        f"expected kind-grouped order main→tl→sh:\n{out}"
+    )
+    # Entry lines surface for the kinds that have them.
+    assert "L120" in out and "L42" in out
+    # Short kind labels.
+    assert "script:main" in out and "script:tl" in out and "script:sh" in out
+
+
+def test_scripts_kind_filter_short_alias(tmp_path, monkeypatch):
+    """`scripts --kind main` accepts the short alias from the meta_tag
+    badge (`· script:main`) — agents copy-paste from listings without
+    having to translate to the long internal form."""
+    import subprocess
+    nodes = [
+        {"id": "f1", "label": "a.py", "file_type": "code",
+         "source_file": "a.py", "source_location": "L1",
+         "node_kind": "file", "script_kind": "main_block",
+         "script_entries": [50]},
+        {"id": "f2", "label": "b.py", "file_type": "code",
+         "source_file": "b.py", "source_location": "L1",
+         "node_kind": "file", "script_kind": "top_level",
+         "script_entries": [10]},
+    ]
+    _write_graph(tmp_path / "graphify-out", nodes, [])
+    monkeypatch.chdir(tmp_path)
+    res = subprocess.run(
+        ["python", "-m", "graphify", "scripts", "--kind", "main"],
+        capture_output=True, text=True, cwd=str(tmp_path), timeout=15,
+    )
+    assert res.returncode == 0, f"scripts --kind failed: {res.stderr}"
+    out = res.stdout
+    assert "a.py" in out
+    assert "b.py" not in out, (
+        f"--kind=main should exclude top_level rows:\n{out}"
+    )
+    assert "kind=main_block" in out, f"header should name resolved kind:\n{out}"
+
+
+def test_scripts_glob_filter_path_pattern(tmp_path, monkeypatch):
+    """A glob containing `/` matches the full path; bare globs match
+    basename. Mirrors `files` semantics so callers can swap one verb
+    for the other on shared filtering syntax."""
+    import subprocess
+    nodes = [
+        {"id": "f1", "label": "tool.py", "file_type": "code",
+         "source_file": "tools/tool.py", "source_location": "L1",
+         "node_kind": "file", "script_kind": "main_block",
+         "script_entries": [50]},
+        {"id": "f2", "label": "tool.py", "file_type": "code",
+         "source_file": "archive/tool.py", "source_location": "L1",
+         "node_kind": "file", "script_kind": "main_block",
+         "script_entries": [20]},
+    ]
+    _write_graph(tmp_path / "graphify-out", nodes, [])
+    monkeypatch.chdir(tmp_path)
+    res = subprocess.run(
+        ["python", "-m", "graphify", "scripts", "tools/*.py"],
+        capture_output=True, text=True, cwd=str(tmp_path), timeout=15,
+    )
+    assert res.returncode == 0, f"scripts <glob> failed: {res.stderr}"
+    out = res.stdout
+    assert "tools/tool.py" in out
+    assert "archive/tool.py" not in out, (
+        f"path glob should not pull in archive/tool.py:\n{out}"
+    )
+
+
+def test_scripts_no_match_exits_one(tmp_path, monkeypatch):
+    """No script-tagged files → exit 1 so callers can branch the same
+    way `files` does on empty match."""
+    import subprocess
+    nodes = [
+        {"id": "f1", "label": "library.py", "file_type": "code",
+         "source_file": "src/library.py", "source_location": "L1",
+         "node_kind": "file"},
+    ]
+    _write_graph(tmp_path / "graphify-out", nodes, [])
+    monkeypatch.chdir(tmp_path)
+    res = subprocess.run(
+        ["python", "-m", "graphify", "scripts"],
+        capture_output=True, text=True, cwd=str(tmp_path), timeout=15,
+    )
+    assert res.returncode == 1, f"expected exit 1 on no matches: {res.stderr}"
+    assert "no script-tagged files" in res.stderr
