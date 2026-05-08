@@ -6547,6 +6547,62 @@ def test_global_hint_dedup_skipped_with_no_session(tmp_path, monkeypatch):
                 / "_global_hints.json").exists()
 
 
+def test_body_walker_warns_when_returns_far_short_of_stamped_range(tmp_path, monkeypatch):
+    """When the graph stamps `source_location: L<a>-<b>` covering N lines but
+    the indent-walker bails after just 1-3 lines, the most likely cause is a
+    stale graph: file content shifted but the cached line range didn't.
+    Without a warning, the agent reads "1 lines" and concludes the function
+    is one line long. Surface a `⚠` line that names the gap and points at
+    `graphify update .`."""
+    from graphify.navigate import navigate
+    # Write a source file where the line at L10 is a top-level comment
+    # (not a `def` opener), so the indent walker bails immediately.
+    src = tmp_path / "stale.py"
+    # L10 is a comment at indent 0; L11 is also indent 0 (non-blank).
+    # The walker hits L11, sees it's at the header's indent, and bails
+    # without ever entering the body — returns just the L10 header line.
+    src.write_text(
+        "\n" * 9
+        + "# was a function; refactor moved it elsewhere\n"
+        + "x = 1  # next top-level statement, walker bails here\n"
+    )
+    nodes = [
+        {"id": "f", "label": "old_fn()", "node_kind": "function",
+         "file_type": "code", "source_file": "stale.py",
+         "source_location": "L10-26"},
+    ]
+    _write_graph(tmp_path / "graphify-out", nodes, [])
+    monkeypatch.chdir(tmp_path)
+    out = navigate(["@old_fn", "read"], session=False, fmt="text")
+    assert "stale graph" in out, (
+        f"body walker should warn when bailing far short of stamped range:\n{out}"
+    )
+    assert "graphify update" in out, (
+        f"warning should name the next op:\n{out}"
+    )
+
+
+def test_body_walker_no_stale_warning_on_truncated_or_well_matched(tmp_path, monkeypatch):
+    """Sanity: the stale-graph warning must NOT fire on benign truncation
+    (--lines cap) or when the walker returned roughly what was promised."""
+    from graphify.navigate import navigate
+    # 12-line function — walker should return ~12 lines, matching the stamp.
+    src = tmp_path / "ok.py"
+    body = "def fn():\n" + "\n".join(f"    x_{i} = {i}" for i in range(11))
+    src.write_text(body + "\n")
+    nodes = [
+        {"id": "f", "label": "fn()", "node_kind": "function",
+         "file_type": "code", "source_file": "ok.py",
+         "source_location": "L1-12"},
+    ]
+    _write_graph(tmp_path / "graphify-out", nodes, [])
+    monkeypatch.chdir(tmp_path)
+    out = navigate(["@fn", "read"], session=False, fmt="text")
+    assert "stale graph" not in out, (
+        f"warning should NOT fire when walker returned the expected lines:\n{out}"
+    )
+
+
 def test_global_hint_dedup_does_not_suppress_structural_hints(tmp_path, monkeypatch):
     """Structural hints (drill_via_contains, class_shape_via_methods, etc.)
     name a focus-specific structural cause and must continue to fire every

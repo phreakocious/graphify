@@ -1749,6 +1749,38 @@ def _render_body_text(data: dict, *, md: bool = False) -> str:
         header += f" · −{docstring_stripped} docstring"
     header += ")"
     out = [header]
+    # Lap-27 dogfood-friction fix: when the indent-walker bails far short
+    # of the line range stamped on the node (e.g. graph says L1796-L1812
+    # → 17 lines, walker returned 1), the body is misleading — the
+    # agent reads "1 lines" and concludes the function is one line long.
+    # Real cause is a stale graph: the file content shifted but the
+    # cached source_location wasn't refreshed, so the walker landed on a
+    # comment/blank line and bailed at the first dedent. Surface the
+    # mismatch with a hint that names the next op (`graphify update .`).
+    loc = data.get("source_location") or ""
+    if loc.startswith("L") and "-" in loc[1:]:
+        try:
+            lo_str, hi_str = loc[1:].split("-", 1)
+            lo = int(lo_str.split(":", 1)[0])
+            hi = int(hi_str.split(":", 1)[0])
+            n_expected = max(0, hi - lo + 1)
+        except ValueError:
+            n_expected = 0
+        # Threshold: only warn when the gap is large enough that staleness
+        # is the most plausible explanation. <50% of expected and <=3
+        # actual lines is the noisy case (1-line "function" headers,
+        # single-line dedent-bails). Truncation by --lines is benign and
+        # already surfaced by the truncated banner; suppress the warning
+        # in that case.
+        if (not truncated and n_expected >= 6
+                and visible_count <= 3
+                and visible_count < n_expected // 2):
+            out.append(
+                f"  ⚠ body walker returned {visible_count} line(s) but the "
+                f"graph said {n_expected} (L{lo}-{hi}). most likely a "
+                f"stale graph — the file shifted since extract. run "
+                f"`graphify update .` then retry."
+            )
     for i, raw in enumerate(body_lines):
         if ds_lo <= i < ds_hi:
             if i == ds_lo:
