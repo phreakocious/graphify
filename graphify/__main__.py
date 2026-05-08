@@ -2996,15 +2996,26 @@ def main() -> None:
                     continue
                 method_ids.append(v)
 
-            def _start_line(nid: str) -> int:
+            def _method_rank(nid: str) -> tuple[int, int]:
+                """Lap-27 long-running-Claude field report: summarize
+                used to order methods by source line, putting
+                `__init__`/`constructor` at the top while the
+                actually-loaded API surface (get/post/render) sat
+                below the fold or got truncated past `--methods`.
+                The agent's question — "what should I look at
+                first?" — is what `summarize` exists to answer;
+                degree is the surface signal. Source line is the
+                stable tiebreaker so equal-degree pairs don't
+                shuffle between runs."""
                 vloc = G.nodes[nid].get("source_location") or ""
+                line = 1 << 30
                 if vloc.startswith("L"):
                     try:
-                        return int(vloc[1:].split("-", 1)[0].split(":", 1)[0])
+                        line = int(vloc[1:].split("-", 1)[0].split(":", 1)[0])
                     except ValueError:
-                        return 1 << 30
-                return 1 << 30
-            method_ids.sort(key=_start_line)
+                        pass
+                return (-G.degree(nid), line)
+            method_ids.sort(key=_method_rank)
 
             # Cross-file callers: predecessors via call edges where the
             # source file differs. This matches `blast`'s callers semantics
@@ -3076,7 +3087,9 @@ def main() -> None:
                 print()
 
             # Methods: signature line only (no body — that's what peek
-            # is for). Each row: label + line range. Sorted in source order.
+            # is for). Each row: label + line range. Sorted by degree
+            # desc (most-loaded API surface first), source line asc as
+            # tiebreaker. Lap-27 field-report fix.
             print(f"## Methods ({len(method_ids)})")
             if method_ids:
                 shown = method_ids[:method_limit] if method_limit > 0 else method_ids
@@ -3947,8 +3960,8 @@ def main() -> None:
         if any(a in ("-h", "--help") for a in sys.argv[2:]):
             _print_subcmd_help("files")
             return
-        import fnmatch as _fnmatch
         from graphify.navigate import DEFAULT_GRAPH_PATH, load_graph
+        from graphify.resolve import path_glob_match
         args = sys.argv[2:]
         graph_path = DEFAULT_GRAPH_PATH
         pattern: str | None = None
@@ -3990,7 +4003,7 @@ def main() -> None:
             if not sf:
                 continue
             target = sf if path_glob else sf.rsplit("/", 1)[-1]
-            if _fnmatch.fnmatch(target, pattern):
+            if path_glob_match(target, pattern):
                 hits.append((sf, attrs.get("label") or ""))
         if not hits:
             print(f"no files match `{pattern}`.", file=sys.stderr)
@@ -4020,8 +4033,8 @@ def main() -> None:
         if any(a in ("-h", "--help") for a in sys.argv[2:]):
             _print_subcmd_help("scripts")
             return
-        import fnmatch as _fnmatch
         from graphify.navigate import DEFAULT_GRAPH_PATH, load_graph
+        from graphify.resolve import path_glob_match
         args = sys.argv[2:]
         graph_path = DEFAULT_GRAPH_PATH
         pattern: str | None = None
@@ -4079,7 +4092,7 @@ def main() -> None:
                 continue
             if pattern:
                 target = sf if path_glob else sf.rsplit("/", 1)[-1]
-                if not _fnmatch.fnmatch(target, pattern):
+                if not path_glob_match(target, pattern):
                     continue
             entries = list(attrs.get("script_entries") or [])
             hits.append((KIND_ORDER.get(kind, 99), sf, kind, entries))

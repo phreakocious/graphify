@@ -3225,7 +3225,7 @@ def search_bodies(G: nx.DiGraph,
     surfaced in the result so the agent knows whether their `[(` would
     be treated as regex or substring.
     """
-    import fnmatch as _fnmatch
+    from graphify.resolve import path_glob_match
     in_files_path_glob = bool(in_files and "/" in in_files)
     try:
         rx = re.compile(pattern, re.IGNORECASE)
@@ -3256,7 +3256,7 @@ def search_bodies(G: nx.DiGraph,
             continue
         if in_files:
             target = sf if in_files_path_glob else sf.rsplit("/", 1)[-1]
-            if not _fnmatch.fnmatch(target, in_files):
+            if not path_glob_match(target, in_files):
                 continue
         if not loc.startswith("L"):
             continue

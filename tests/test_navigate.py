@@ -7221,3 +7221,191 @@ def test_scripts_no_match_exits_one(tmp_path, monkeypatch):
     )
     assert res.returncode == 1, f"expected exit 1 on no matches: {res.stderr}"
     assert "no script-tagged files" in res.stderr
+
+
+def test_resolve_file_stem_dot_symbol():
+    """Lap-27 long-running-Claude field report: `peek mobius_s3_deep.main`
+    used to fall through to fuzzy and land on the file `mobius_s3_deep.py`
+    (because difflib similarity on `mobius_s3_deep.main` vs
+    `mobius_s3_deep.py` is high), producing a 200-line truncated file
+    dump instead of the function `main()` at L67. Class.method only
+    fires when `mobius_s3_deep` is actually a class label; the natural
+    Python convention `<file>.<symbol>` had no resolver path. Now
+    resolves to the symbol within the matching file."""
+    G = nx.DiGraph()
+    G.add_node("file_node", label="mobius_s3_deep.py", node_kind="file",
+               source_file="tools/mobius_s3_deep.py", source_location="L1")
+    G.add_node("main_fn", label="main()", file_type="code",
+               source_file="tools/mobius_s3_deep.py", source_location="L67")
+    G.add_node("init_fn", label="init_data()", file_type="code",
+               source_file="tools/mobius_s3_deep.py", source_location="L23")
+    idx = label_index(G)
+    chosen, candidates, match_type, _ = resolve_focus(G, idx, "mobius_s3_deep.main")
+    assert chosen == "main_fn", (
+        f"file_stem.symbol should resolve to the function, not the file; "
+        f"got chosen={chosen!r}, match_type={match_type!r}"
+    )
+    assert match_type == "exact"
+
+
+def test_resolve_file_stem_dot_symbol_disambig_across_files():
+    """Same stem in two directories (e.g. `tools/foo.py` and
+    `archive/foo.py`) → disambig, not silent pick. The agent gets to
+    choose; we don't auto-pick the wrong one."""
+    G = nx.DiGraph()
+    G.add_node("a_file", label="mobius.py", node_kind="file",
+               source_file="tools/mobius.py", source_location="L1")
+    G.add_node("b_file", label="mobius.py", node_kind="file",
+               source_file="archive/mobius.py", source_location="L1")
+    G.add_node("a_main", label="main()", file_type="code",
+               source_file="tools/mobius.py", source_location="L67")
+    G.add_node("b_main", label="main()", file_type="code",
+               source_file="archive/mobius.py", source_location="L20")
+    idx = label_index(G)
+    chosen, candidates, match_type, _ = resolve_focus(G, idx, "mobius.main")
+    assert chosen is None, (
+        f"same stem in 2 dirs should disambig; got {chosen!r}"
+    )
+    assert match_type == "exact"
+    assert set(candidates) == {"a_main", "b_main"}
+
+
+def test_resolve_class_method_takes_precedence_over_file_stem():
+    """When a real class `Foo` AND a file `Foo.py` both exist, dotted
+    resolution should pick the class method first. Class-method is the
+    typed-receiver semantics that matches what most agents mean."""
+    G = nx.DiGraph()
+    G.add_node("the_class", label="Foo", file_type="code",
+               source_file="src/Foo.py", source_location="L1")
+    G.add_node("class_method", label=".bar()", file_type="code",
+               source_file="src/Foo.py", source_location="L20")
+    G.add_edge("the_class", "class_method", relation="method")
+    G.add_node("the_file", label="Foo.py", node_kind="file",
+               source_file="src/Foo.py", source_location="L1")
+    G.add_node("module_bar", label="bar()", file_type="code",
+               source_file="src/Foo.py", source_location="L80")
+    idx = label_index(G)
+    chosen, _, match_type, _ = resolve_focus(G, idx, "Foo.bar")
+    assert chosen == "class_method", (
+        f"class.method should win over file_stem.symbol when both match; "
+        f"got chosen={chosen!r}"
+    )
+    assert match_type == "exact"
+
+
+def test_path_glob_match_absolute_path_tolerance():
+    """Lap-27 long-running-Claude field report: `--in-files
+    "tools/mobius_s3*.py"` returned 0 hits with "no files scanned —
+    graph may have no source-located nodes" on a corpus that clearly
+    has matching files. Cause: `fnmatch.fnmatch` is anchored. When the
+    graph stored absolute paths (extract from a different cwd) the
+    relative pattern silently missed every node. The helper now also
+    tries `*/<pattern>` so any leading directory is permitted before
+    the pattern's first segment."""
+    from graphify.resolve import path_glob_match
+    # Verbatim relative match still works.
+    assert path_glob_match("tools/foo.py", "tools/foo*.py")
+    # Absolute path with relative pattern now matches.
+    assert path_glob_match("/abs/x/tools/foo.py", "tools/foo*.py")
+    # Different leading dir doesn't false-match.
+    assert not path_glob_match("/abs/archive/tools/foo.py", "src/foo*.py")
+    # Wrong dir still fails.
+    assert not path_glob_match("archive/foo.py", "tools/foo*.py")
+    # Unrelated pattern still fails.
+    assert not path_glob_match("tools/bar.py", "foo*.py")
+    # Bare-glob behavior unchanged: no `/`, no suffix branch.
+    assert path_glob_match("foo.py", "foo*.py")
+
+
+def test_search_in_files_matches_absolute_path(tmp_path, monkeypatch):
+    """`search --in-files "tools/foo*.py"` should find hits in
+    `/abs/.../tools/foo.py`. Without the path-glob fix the agent saw
+    "no files scanned" and bailed to grep — exactly the fallback the
+    verb existed to avoid."""
+    import subprocess
+    src_dir = tmp_path / "deep" / "tools"
+    src_dir.mkdir(parents=True)
+    target = src_dir / "investigation_main.py"
+    target.write_text(
+        "def main():\n"
+        "    print('hello')\n"
+        "    return 0\n"
+    )
+    nodes = [
+        {"id": "f1", "label": "investigation_main.py", "file_type": "code",
+         "source_file": str(target), "source_location": "L1",
+         "node_kind": "file"},
+        {"id": "fn1", "label": "main()", "file_type": "code",
+         "source_file": str(target), "source_location": "L1"},
+    ]
+    _write_graph(tmp_path / "graphify-out", nodes, [])
+    monkeypatch.chdir(tmp_path)
+    res = subprocess.run(
+        ["python", "-m", "graphify", "search", "hello",
+         "--in-files", "tools/investigation_*.py"],
+        capture_output=True, text=True, cwd=str(tmp_path), timeout=15,
+    )
+    assert res.returncode == 0, f"search failed: {res.stderr}"
+    out = res.stdout
+    assert "no files scanned" not in out, (
+        f"absolute-path source_file should match relative glob:\n{out}"
+    )
+    assert "hello" in out, f"expected hit text 'hello' in output:\n{out}"
+
+
+def test_summarize_class_methods_ordered_by_degree(tmp_path, monkeypatch):
+    """Lap-27 long-running-Claude field report: summarize used to render
+    class methods in source order, putting `__init__`/`constructor` at
+    the top while the actually-loaded API surface (get/post) sat below
+    the fold. Now degree-desc with source line as a stable tiebreaker —
+    the question summarize answers ("what should I look at first?")
+    matches degree as the surface signal."""
+    import subprocess
+    nodes = [
+        {"id": "Cls", "label": "MyClass", "file_type": "code",
+         "node_kind": "class",
+         "source_file": "src/mod.py", "source_location": "L5"},
+        # constructor at the top of source — would come first in source-line order
+        {"id": "ctor", "label": "__init__()", "file_type": "code",
+         "node_kind": "method",
+         "source_file": "src/mod.py", "source_location": "L6-8"},
+        # high-degree API method, lower in the file
+        {"id": "loaded", "label": ".render()", "file_type": "code",
+         "node_kind": "method",
+         "source_file": "src/mod.py", "source_location": "L40-50"},
+        {"id": "rare", "label": ".helper()", "file_type": "code",
+         "node_kind": "method",
+         "source_file": "src/mod.py", "source_location": "L20-25"},
+        # External callers driving up degree on `loaded`
+        {"id": "caller_a", "label": "caller_a()", "file_type": "code",
+         "source_file": "src/other.py", "source_location": "L1"},
+        {"id": "caller_b", "label": "caller_b()", "file_type": "code",
+         "source_file": "src/other.py", "source_location": "L5"},
+        {"id": "caller_c", "label": "caller_c()", "file_type": "code",
+         "source_file": "src/other.py", "source_location": "L10"},
+    ]
+    links = [
+        {"source": "Cls", "target": "ctor", "relation": "method"},
+        {"source": "Cls", "target": "loaded", "relation": "method"},
+        {"source": "Cls", "target": "rare", "relation": "method"},
+        # Three calls into .render() — degree=3 (plus 1 from method edge)
+        {"source": "caller_a", "target": "loaded", "relation": "calls"},
+        {"source": "caller_b", "target": "loaded", "relation": "calls"},
+        {"source": "caller_c", "target": "loaded", "relation": "calls"},
+        # One call into .helper() — degree=1 (plus 1 from method edge)
+        {"source": "caller_a", "target": "rare", "relation": "calls"},
+    ]
+    _write_graph(tmp_path / "graphify-out", nodes, links)
+    monkeypatch.chdir(tmp_path)
+    res = subprocess.run(
+        ["python", "-m", "graphify", "summarize", "@MyClass"],
+        capture_output=True, text=True, cwd=str(tmp_path), timeout=15,
+    )
+    assert res.returncode == 0, f"summarize failed: {res.stderr}"
+    out = res.stdout
+    render_idx = out.index("render()")
+    helper_idx = out.index("helper()")
+    init_idx = out.index("__init__()")
+    assert render_idx < helper_idx < init_idx, (
+        f"expected degree-desc order render → helper → __init__:\n{out}"
+    )

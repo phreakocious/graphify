@@ -424,6 +424,35 @@ def _files_in_directory(G: nx.DiGraph, dir_prefix: str) -> list[str]:
     return hits
 
 
+def path_glob_match(target: str, pattern: str) -> bool:
+    """fnmatch with absolute-path tolerance for path-globs.
+
+    Lap-27 field-report fix: `fnmatch.fnmatch` is anchored — pattern
+    `tools/foo*.py` matches `tools/foo.py` but NOT
+    `/abs/path/tools/foo.py`. When the agent types a relative pattern
+    they see day-to-day but the graph stores absolute source_files
+    (extract was run with absolute paths, or via watch from a
+    different cwd), the verbatim match misses and `--in-files` /
+    `files` / `scripts` return "0 hits — graph may have no
+    source-located nodes" on a corpus that clearly has matching
+    files. The agent then bails to grep — exactly the fallback the
+    verb existed to avoid.
+
+    For path-globs (pattern contains `/`), also try a `*/`-prepended
+    variant so any leading directory is permitted before the
+    pattern's first segment. Bare-glob (no `/`) behavior is
+    unchanged: callers strip to basename before calling, so the
+    prefix branch is only meaningful when the pattern itself
+    expresses a path shape.
+    """
+    import fnmatch as _fnmatch
+    if _fnmatch.fnmatch(target, pattern):
+        return True
+    if "/" in pattern and _fnmatch.fnmatch(target, "*/" + pattern):
+        return True
+    return False
+
+
 def resolve_focus(G: nx.DiGraph, idx: dict[str, list[str]],
                   target: str) -> tuple[str | None, list[str], str, list[str]]:
     """Resolve `@<label>` → (chosen_id_or_None, candidates, match_type, alternatives).
@@ -693,6 +722,48 @@ def resolve_focus(G: nx.DiGraph, idx: dict[str, list[str]],
                 if len(method_hits) > 1:
                     method_hits.sort(key=lambda n: _rank_match(G, key, n))
                     return None, method_hits, "exact", []
+
+            # 1c'. file_stem.symbol fallback (lap-27 long-running-Claude
+            # field report). Class.method didn't resolve, but the dotted
+            # form is also the natural shape for `<file_stem>.<symbol>`
+            # — a Python user types `peek mobius_s3_deep.main` to mean
+            # the function `main()` in `mobius_s3_deep.py`. Without this
+            # branch the form falls through to fuzzy and lands on the
+            # file node itself (label `mobius_s3_deep.py` is the closest
+            # difflib match to `mobius_s3_deep.main`), producing a
+            # 200-line truncated file dump where the agent expected the
+            # 5-line function body. Find file nodes whose label is
+            # `<cls_part>.<ext>` (any ext), then look for symbols inside
+            # those files matching `meth_part`. Limit to file nodes —
+            # not every node with a stem-matching label — so we don't
+            # accidentally pick up unrelated symbols that happen to share
+            # the user's first segment.
+            file_stem_hits: list[str] = []
+            file_sfs: set[str] = set()
+            for nid, attrs in G.nodes(data=True):
+                if attrs.get("node_kind") != "file":
+                    continue
+                label = _norm(attrs.get("label", nid))
+                stem, dot, _ext = label.partition(".")
+                if dot and stem == cls_part:
+                    sf = attrs.get("source_file") or ""
+                    if sf:
+                        file_sfs.add(sf)
+            if file_sfs:
+                for nid, attrs in G.nodes(data=True):
+                    if attrs.get("source_file") not in file_sfs:
+                        continue
+                    if attrs.get("node_kind") == "file":
+                        continue
+                    sym_label = _norm(attrs.get("label", nid))
+                    sym_stripped = sym_label.rstrip("()").lstrip(".").lstrip("_")
+                    if sym_stripped == meth_target or sym_label == meth_part:
+                        file_stem_hits.append(nid)
+                if len(file_stem_hits) == 1:
+                    return file_stem_hits[0], [], "exact", []
+                if len(file_stem_hits) > 1:
+                    file_stem_hits.sort(key=lambda n: _rank_match(G, key, n))
+                    return None, file_stem_hits, "exact", []
 
     # 2. substring fallback (rank: public-first, shorter, higher degree).
     # Distinguish "prefix" (label starts with key) from generic "substring" so
