@@ -128,6 +128,12 @@ Agents need ground truth to plan and to commit. Numbers beat words.
   edges — `wu @MyClass` returns call sites *and* doc mentions in one
   pass; `search "<pat>"` matches code bodies *and* markdown bodies.
   Eliminates the "where is this discussed?" grep fallback (lap-27).
+  Single-match resolutions tag EXTRACTED (deterministic — backtick +
+  unique symbol = unambiguous, same shape as a Python `import`) so they
+  surface in default `wu` / `in` / `out` output without `--include-inferred`.
+  Multi-match (2-3 candidates) stays INFERRED — the resolver is genuinely
+  guessing which symbol the doc means; `--include-inferred` widens the
+  net when you want to see all candidates.
 - `script_kind` tag on Python / JS / TS file nodes — `main_block`
   (canonical `if __name__ == "__main__":` / `require.main` /
   `import.meta.main`), `top_level` (bare-identifier call to an
