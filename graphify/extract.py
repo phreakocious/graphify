@@ -4767,12 +4767,19 @@ def collect_files(target: Path, *, follow_symlinks: bool = False, root: Path | N
     if target.is_file():
         return [target]
     _EXTENSIONS = set(_DISPATCH.keys())
-    from graphify.detect import _load_graphifyignore, _is_ignored
+    from graphify.detect import _load_graphifyignore, _is_ignored, _is_noise_dir
     ignore_root = root if root is not None else target
     patterns = _load_graphifyignore(ignore_root)
 
     def _ignored(p: Path) -> bool:
         return bool(patterns and _is_ignored(p, ignore_root, patterns))
+
+    def _in_noise_dir(p: Path) -> bool:
+        # Skip build artefacts / venvs / dep trees. detect.py already filters
+        # these for the SKILL flow; collect_files must do the same so AST-only
+        # update / hook / add flows don't pull a vendored `build/lib/` copy of
+        # the source into the graph as duplicate nodes.
+        return any(_is_noise_dir(part) for part in p.parts)
 
     if not follow_symlinks:
         results: list[Path] = []
@@ -4780,6 +4787,7 @@ def collect_files(target: Path, *, follow_symlinks: bool = False, root: Path | N
             results.extend(
                 p for p in target.rglob(f"*{ext}")
                 if not any(part.startswith(".") for part in p.parts)
+                and not _in_noise_dir(p)
                 and not _ignored(p)
             )
         return sorted(results)
@@ -4796,6 +4804,8 @@ def collect_files(target: Path, *, follow_symlinks: bool = False, root: Path | N
         if any(part.startswith(".") for part in dp.parts):
             dirnames.clear()
             continue
+        # Prune _SKIP_DIRS in-place so os.walk doesn't descend into them.
+        dirnames[:] = [d for d in dirnames if not _is_noise_dir(d)]
         for fname in filenames:
             p = dp / fname
             if p.suffix in _EXTENSIONS and not fname.startswith(".") and not _ignored(p):

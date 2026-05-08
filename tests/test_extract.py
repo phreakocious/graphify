@@ -93,6 +93,33 @@ def test_collect_files_handles_circular_symlinks(tmp_path):
     assert any(f.name == "mod.py" for f in files)
 
 
+def test_collect_files_skips_build_artifacts(tmp_path):
+    """build/ dist/ node_modules/ etc. are derived dirs, not source. They
+    must not appear in the graph — without this, `pip install -e .`
+    populates build/lib/<pkg>/*.py and every backtick reference in docs
+    matches both real and vendored copies, polluting `references` edges
+    as multi-match.
+    """
+    src = tmp_path / "real.py"
+    src.write_text("class Real: pass\n")
+    # Common Python build artefact location.
+    (tmp_path / "build" / "lib" / "pkg").mkdir(parents=True)
+    (tmp_path / "build" / "lib" / "pkg" / "real.py").write_text("class Real: pass\n")
+    # Common JS dep dir.
+    (tmp_path / "node_modules" / "lib").mkdir(parents=True)
+    (tmp_path / "node_modules" / "lib" / "index.js").write_text("export const x = 1;\n")
+    # __pycache__ should also be skipped.
+    (tmp_path / "__pycache__").mkdir()
+    (tmp_path / "__pycache__" / "real.cpython-312.pyc").write_text("")
+
+    files = collect_files(tmp_path)
+    rels = {str(f.relative_to(tmp_path)) for f in files}
+    assert "real.py" in rels, f"top-level real.py should be present: {rels}"
+    assert not any(p.startswith("build/") for p in rels), f"build/ leaked: {rels}"
+    assert not any(p.startswith("node_modules/") for p in rels), f"node_modules/ leaked: {rels}"
+    assert not any("__pycache__" in p for p in rels), f"__pycache__/ leaked: {rels}"
+
+
 def test_no_dangling_edges_on_extract():
     """After merging multiple files, no internal edges should be dangling."""
     files = list(FIXTURES.glob("*.py"))
