@@ -4961,6 +4961,48 @@ def test_where_used_alias_wu_works(tmp_path, monkeypatch):
     )
 
 
+def test_where_used_surfaces_markdown_references_by_default(tmp_path, monkeypatch):
+    """Lap-27 marquee: backtick references in `.md` files resolve to
+    `references` edges. Single-match resolutions are tagged EXTRACTED so
+    `wu @<symbol>` shows doc mentions WITHOUT requiring --include-inferred.
+
+    Regression guard: pre-fix, all references edges were INFERRED 0.90,
+    which the default extracted-only filter hid. Marquee feature shipped
+    invisible.
+    """
+    from graphify.extract import extract
+    from graphify.build import build_from_json
+    from graphify.cluster import cluster
+    from graphify.export import to_json
+    from graphify.navigate import navigate
+
+    (tmp_path / "core.py").write_text(
+        "def emit_signal():\n    pass\n"
+    )
+    (tmp_path / "DESIGN.md").write_text(
+        "# Architecture\n\n"
+        "## Signals\n\n"
+        "The `emit_signal` function is the canonical entry point.\n"
+    )
+    extraction = extract(
+        [tmp_path / "core.py", tmp_path / "DESIGN.md"], cache_root=tmp_path
+    )
+    G = build_from_json(extraction)
+    communities = cluster(G)
+    (tmp_path / "graphify-out").mkdir(exist_ok=True)
+    to_json(G, communities, str(tmp_path / "graphify-out" / "graph.json"))
+    monkeypatch.chdir(tmp_path)
+
+    # Default surface — no --include-inferred. Doc reference must show.
+    out = navigate(["@emit_signal", "wu"], session=False, fmt="text")
+    assert "Signals" in out or "DESIGN.md" in out, (
+        f"markdown reference should surface in default `wu` output (no --include-inferred):\n{out}"
+    )
+    assert "[references/ext]" in out, (
+        f"single-match reference must render as EXTRACTED, not INFERRED:\n{out}"
+    )
+
+
 def test_shape_file_returns_counts_and_longest_fn(tmp_path, monkeypatch):
     """`shape_file` summarizes a file's structure: N classes / M fns /
     K consts / X imports / longest fn (line span). Saves a `contains`

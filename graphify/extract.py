@@ -3691,7 +3691,15 @@ def _resolve_markdown_refs(per_file: list[dict], all_nodes: list[dict]) -> list[
             # Drop ambiguous wide matches — edges with 4+ targets are noise.
             if len(candidates) > 3:
                 continue
-            score = 0.90 if len(candidates) == 1 else 0.70
+            # Single-match resolution is deterministic from explicit author
+            # syntax (backtick → unique symbol), the same shape as a Python
+            # `import` statement. Tag EXTRACTED so the default agent surface
+            # (extracted-only) shows doc references in `wu` / `in` / `out`
+            # without forcing `--include-inferred`. Multi-match (2-3) is a
+            # genuine guess about which symbol the doc means → INFERRED.
+            single_match = len(candidates) == 1
+            confidence = "EXTRACTED" if single_match else "INFERRED"
+            score = 1.0 if single_match else 0.70
 
             for tgt in candidates:
                 if tgt == source:  # self-reference (heading mentioning itself)
@@ -3704,7 +3712,7 @@ def _resolve_markdown_refs(per_file: list[dict], all_nodes: list[dict]) -> list[
                     "source": source,
                     "target": tgt,
                     "relation": "references",
-                    "confidence": "INFERRED",
+                    "confidence": confidence,
                     "confidence_score": score,
                     "source_file": ref.get("source_file", ""),
                     "source_location": ref.get("source_location", ""),

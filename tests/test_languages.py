@@ -709,7 +709,11 @@ def test_markdown_skips_short_and_path_tokens(tmp_path):
 def test_markdown_refs_resolve_to_code_symbols(tmp_path):
     """End-to-end: a python class is referenced by name in a sibling
     markdown file; extract() emits a `references` edge from the md
-    heading to the class node."""
+    heading to the class node.
+
+    Single-match resolutions are tagged EXTRACTED (deterministic — backtick
+    + unique symbol = unambiguous). Multi-match cases stay INFERRED.
+    """
     from graphify.extract import extract
     (tmp_path / "auth.py").write_text(
         "class Authenticator:\n"
@@ -724,16 +728,44 @@ def test_markdown_refs_resolve_to_code_symbols(tmp_path):
     result = extract([tmp_path / "auth.py", tmp_path / "README.md"], cache_root=tmp_path)
     refs = [e for e in result["edges"] if e.get("relation") == "references"]
     targets = {e["target"] for e in refs}
-    # Both the class and its method get matched. Heading-scoped, so the
-    # source is the `## Auth` heading node, not the file.
     assert any("authenticator" in t and "login" not in t for t in targets), (
         f"expected reference to Authenticator class in {targets}"
     )
     assert any("login" in t for t in targets), (
         f"expected reference to login method in {targets}"
     )
-    # All emitted as INFERRED — textual match, not structural.
+    # Both labels are unique in this corpus → single-match → EXTRACTED. The
+    # default `wu` / `in` filter (extracted-only) MUST surface these without
+    # forcing --include-inferred; that's the whole point of the markdown
+    # surface.
+    assert all(e["confidence"] == "EXTRACTED" for e in refs), (
+        f"single-match refs must be EXTRACTED so default filter surfaces them; got {refs}"
+    )
+    assert all(e.get("confidence_score") == 1.0 for e in refs)
+
+
+def test_markdown_refs_multi_match_stays_inferred(tmp_path):
+    """When 2-3 nodes share a backtick'd label, the resolution is a genuine
+    guess about which symbol the doc means → INFERRED, score 0.70.
+    """
+    from graphify.extract import extract
+    # Two distinct classes both named `Validator`.
+    (tmp_path / "auth_validator.py").write_text("class Validator:\n    pass\n")
+    (tmp_path / "schema_validator.py").write_text("class Validator:\n    pass\n")
+    (tmp_path / "DESIGN.md").write_text(
+        "# Validation\n\nThe `Validator` class enforces invariants.\n"
+    )
+    result = extract(
+        [tmp_path / "auth_validator.py", tmp_path / "schema_validator.py",
+         tmp_path / "DESIGN.md"],
+        cache_root=tmp_path,
+    )
+    refs = [e for e in result["edges"]
+            if e.get("relation") == "references" and "validator" in e.get("target", "")]
+    # 2 candidates → emit edges to both, INFERRED.
+    assert len(refs) == 2, f"expected 2 multi-match refs, got {refs}"
     assert all(e["confidence"] == "INFERRED" for e in refs)
+    assert all(e.get("confidence_score") == 0.70 for e in refs)
 
 
 def test_markdown_refs_skip_stopwords_and_unknowns(tmp_path):
