@@ -6547,6 +6547,36 @@ def test_global_hint_dedup_skipped_with_no_session(tmp_path, monkeypatch):
                 / "_global_hints.json").exists()
 
 
+def test_chain_paused_message_names_session_flag(tmp_path, monkeypatch):
+    """When a chain pauses on an ambiguous @-target with queued ops, the
+    "next call:" hint must name `--session <id>` — bare `[N]` errors out
+    because the next call gets a fresh ephemeral cursor with no listing
+    to pick from. The session id is printed at the end of this same call;
+    the chain-paused message at the top has to point the agent at it
+    explicitly. Without the flag in the upper hint, agents read
+    "just [N]" first and try it without the session, hitting the failure
+    mode the cursor-id-always-print fix in lap-22 was supposed to close."""
+    import json as _json
+    from graphify.navigate import navigate
+    nodes = [
+        {"id": "c1", "label": "compile()", "file_type": "code",
+         "source_file": "a.ts", "source_location": "L1", "community": 0},
+        {"id": "c2", "label": "compile()", "file_type": "code",
+         "source_file": "b.ts", "source_location": "L1", "community": 0},
+    ]
+    graph_dir = tmp_path / "graphify-out"
+    graph_dir.mkdir()
+    (graph_dir / "graph.json").write_text(_json.dumps(
+        {"nodes": nodes, "links": []}), encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+    out = navigate(["@compile", "in"], fmt="text")
+    assert "chain paused" in out
+    assert "--session" in out, (
+        f"chain-paused message must name `--session <id>` so the agent "
+        f"threads it on the pick call; bare `[N]` won't work:\n{out}"
+    )
+
+
 def test_render_body_truncated_message_names_correct_flag_per_entry_point():
     """The body renderer is shared between `navigate ... read` (positional
     `read N`) and `peek <symbol>` (`--lines N`). The truncated banner must

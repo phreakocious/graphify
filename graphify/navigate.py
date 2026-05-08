@@ -5058,11 +5058,23 @@ def navigate(ops: list[str] | str, *,
                 # the next session call (with just `N`) replays them.
                 # Note: `ops[op_i:]` is the tail AFTER the @-op (the
                 # current iter has already advanced op_i past it).
+                #
+                # Lap-27 dogfood: said "just `[N]`" but bare `[N]` without
+                # `--session <id>` errors out ("no listing to pick from")
+                # because the next call gets a fresh ephemeral cursor that
+                # can't see the disambig listing this call wrote. The
+                # session id is printed at the end of this same call;
+                # name `--session <id>` here so the agent threads it.
+                # The bottom-of-output `to pick a row:` line names the
+                # full command but the chain-paused message at the top
+                # is what the agent reads first when scanning a long
+                # disambig listing.
                 remaining = ops[op_i:]
                 if remaining:
                     cursor.queued_ops = list(remaining)
                     trace.append(
-                        f"  chain paused at `{op_str}` — next call: just `[N]` "
+                        f"  chain paused at `{op_str}` — next call: "
+                        f"`[N] --session <id>` "
                         f"(queued ops `{' '.join(remaining)}` will replay automatically)"
                     )
                 break
