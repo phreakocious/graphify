@@ -81,9 +81,17 @@ from .cache import load_cached, save_cached
 #          line when external in-edges = 0 so investigation scripts
 #          stop reading as dead-end leaves. Cached cells from v8 lack
 #          the metadata; bump forces re-extract.
+#   "v10" — lap-28 cherry-pick of upstream 9bc79ef: drop `string` /
+#          `template_string` / `number` from `_js_extra_walk` const-
+#          types list. Module-level scalar consts (`const NAME =
+#          "foo"`, `const N = 42`, `const TAG = \`...\``) no longer
+#          surface as graph nodes — they're per-file leaves that
+#          inflate node count without giving the agent anything to
+#          pivot on. Cached cells from v9 still carry those const
+#          nodes; bump forces re-extract so they drop.
 # Note: lap-15's phantom-node resolution runs at MERGE time over the
 # combined per-file results, so it fires on cached output too — no bump.
-AST_CACHE_VERSION = "v9"
+AST_CACHE_VERSION = "v10"
 
 
 # AST node types that represent a member-expression callee
@@ -710,8 +718,7 @@ def _js_extra_walk(node, source: bytes, file_nid: str, stem: str, str_path: str,
                         if body:
                             function_bodies.append((func_nid, body))
                 elif value and value.type in (
-                    "object", "array", "as_expression", "call_expression",
-                    "new_expression", "string", "template_string", "number",
+                    "object", "array", "as_expression", "call_expression", "new_expression",
                 ):
                     # Module-level const with literal/object/array/factory value
                     name_node = child.child_by_field_name("name")
