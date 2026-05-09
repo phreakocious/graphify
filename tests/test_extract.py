@@ -547,3 +547,48 @@ def test_extract_tsx_uses_tsx_grammar():
     from graphify.extract import _TSX_CONFIG, _TS_CONFIG
     assert _TSX_CONFIG.ts_language_fn == "language_tsx"
     assert _TS_CONFIG.ts_language_fn == "language_typescript"
+
+
+# ── CommonJS require() imports ───────────────────────────────────────────────
+
+def test_extract_js_destructured_require_imports_from():
+    """`const { foo } = require('./mod')` must emit imports_from to the resolved module path."""
+    from graphify.extract import extract_js
+    result = extract_js(FIXTURES / "cjs_require.js")
+    imports_from = [e for e in result["edges"] if e["relation"] == "imports_from"]
+    targets = [e["target"] for e in imports_from]
+    assert any("foundation" in t for t in targets), f"No foundation import_from: {targets}"
+    assert any("utils" in t for t in targets), f"No utils import_from: {targets}"
+    assert any("helpers" in t for t in targets), f"No helpers import_from: {targets}"
+    for e in imports_from:
+        assert e["confidence"] == "EXTRACTED"
+
+
+def test_extract_js_destructured_require_named_symbols():
+    """Destructured CJS requires must emit symbol-level `imports` edges per binder."""
+    from graphify.extract import extract_js, _make_id, _file_stem
+    result = extract_js(FIXTURES / "cjs_require.js")
+    sym_targets = [e["target"] for e in result["edges"] if e["relation"] == "imports"]
+    foundation_stem = _file_stem(FIXTURES / "foundation.js")
+    assert _make_id(foundation_stem, "loadFoundation") in sym_targets
+    assert _make_id(foundation_stem, "validateConfig") in sym_targets
+
+
+def test_extract_js_member_require_emits_property_symbol():
+    """`const x = require('./m').y` must emit symbol edge for `y`."""
+    from graphify.extract import extract_js, _make_id, _file_stem
+    result = extract_js(FIXTURES / "cjs_require.js")
+    sym_targets = [e["target"] for e in result["edges"] if e["relation"] == "imports"]
+    helpers_stem = _file_stem(FIXTURES / "helpers.js")
+    assert _make_id(helpers_stem, "helperFn") in sym_targets
+
+
+def test_extract_js_arrow_function_still_extracted(tmp_path):
+    """Regression: arrow functions in lexical_declaration must still produce nodes
+    after the require() handler was added to _js_extra_walk."""
+    from graphify.extract import extract_js
+    p = tmp_path / "arrow_only.js"
+    p.write_text("const greet = () => console.log('hi');\n")
+    result = extract_js(p)
+    labels = [n["label"] for n in result["nodes"]]
+    assert "greet()" in labels

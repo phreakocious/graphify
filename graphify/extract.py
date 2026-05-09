@@ -97,9 +97,24 @@ from .cache import load_cached, save_cached
 #          `{fmtDate(now)}`). Upstream validation: +104% nodes /
 #          +62% edges on a 13-file Tauri app. Bump forces re-extract
 #          so .tsx cells pick up the missing declarations.
+#   "v12" — lap-28 cherry-pick of upstream c902ae9: CommonJS
+#          `require()` now produces EXTRACTED `imports_from` edges
+#          (and per-symbol `imports` edges for destructured /
+#          accessor binders), matching what ES `import` statements
+#          have always emitted. Pre-v12 the extractor ignored
+#          require entirely, so cross-file calls in CJS Node.js
+#          codebases (NestJS, classic Express, monorepo glue) were
+#          silently downgraded to INFERRED with no resolver
+#          evidence. Upstream validation: 5 previously-INFERRED
+#          edges from runExecute() resolve to EXTRACTED on a
+#          92-file orchestrator. Companion refactor: shared
+#          `_resolve_js_import_target` helper now serves
+#          static `import`, dynamic `import()`, and `require()`
+#          alike. Bump forces re-extract so existing CJS cells
+#          gain the require edges.
 # Note: lap-15's phantom-node resolution runs at MERGE time over the
 # combined per-file results, so it fires on cached output too — no bump.
-AST_CACHE_VERSION = "v11"
+AST_CACHE_VERSION = "v12"
 
 
 # AST node types that represent a member-expression callee
@@ -359,44 +374,44 @@ def _import_python(node, source: bytes, file_nid: str, stem: str, edges: list, s
             })
 
 
+def _resolve_js_import_target(raw: str, str_path: str) -> "tuple[str, Path | None] | None":
+    """Resolve a JS/TS import path string to (target_nid, resolved_path).
+
+    Handles relative paths, tsconfig path aliases, and bare/scoped imports.
+    Returns None if `raw` is empty. Used by static `import` (`_import_js`),
+    dynamic `import()` (`_dynamic_import_js`), and CommonJS `require()`
+    (`_require_imports_js`) so the resolver fixups in `_resolve_js_module_path`
+    (PR #717: bare-path / index / multi-dot / Svelte rune) apply uniformly.
+    """
+    if not raw:
+        return None
+    if raw.startswith("."):
+        resolved = Path(os.path.normpath(Path(str_path).parent / raw))
+        resolved = _resolve_js_module_path(resolved)
+        return _make_id(str(resolved)), resolved
+    aliases = _load_tsconfig_aliases(Path(str_path).parent)
+    for alias_prefix, alias_base in aliases.items():
+        if raw == alias_prefix or raw.startswith(alias_prefix + "/"):
+            rest = raw[len(alias_prefix):].lstrip("/")
+            resolved_alias = Path(os.path.normpath(Path(alias_base) / rest))
+            resolved_alias = _resolve_js_module_path(resolved_alias)
+            return _make_id(str(resolved_alias)), resolved_alias
+    # Bare/scoped import (node_modules) - use last segment; dropped as external
+    module_name = raw.split("/")[-1]
+    if not module_name:
+        return None
+    return _make_id(module_name), None
+
+
 def _import_js(node, source: bytes, file_nid: str, stem: str, edges: list, str_path: str) -> None:
     resolved_path: "Path | None" = None
     for child in node.children:
         if child.type == "string":
             raw = _read_text(child, source).strip("'\"` ")
-            if not raw:
+            resolved = _resolve_js_import_target(raw, str_path)
+            if resolved is None:
                 break
-            if raw.startswith("."):
-                # Relative import - resolve to full path so IDs match file node IDs
-                # normpath removes ".." segments so the ID matches the target file's own node ID
-                resolved = Path(os.path.normpath(Path(str_path).parent / raw))
-                # TS / SvelteKit resolver: bare-path / .svelte.ts / index.{ts,…}
-                # / multi-dot helper imports land on real file nodes (#716).
-                # Subsumes the prior .js→.ts and .jsx→.tsx rewrites.
-                resolved = _resolve_js_module_path(resolved)
-                tgt_nid = _make_id(str(resolved))
-                resolved_path = resolved
-            else:
-                # Check tsconfig.json path aliases (e.g. "@/" → "src/") before treating as external (#575)
-                aliases = _load_tsconfig_aliases(Path(str_path).parent)
-                resolved_alias = None
-                for alias_prefix, alias_base in aliases.items():
-                    if raw == alias_prefix or raw.startswith(alias_prefix + "/"):
-                        rest = raw[len(alias_prefix):].lstrip("/")
-                        resolved_alias = Path(os.path.normpath(Path(alias_base) / rest))
-                        break
-                if resolved_alias is not None:
-                    # Same resolver fixups as the relative branch — alias targets
-                    # are equally likely to be bare paths / .svelte.ts / index.ts (#716).
-                    resolved_alias = _resolve_js_module_path(resolved_alias)
-                    tgt_nid = _make_id(str(resolved_alias))
-                    resolved_path = resolved_alias
-                else:
-                    # Bare/scoped import (node_modules) - use last segment; dropped as external
-                    module_name = raw.split("/")[-1]
-                    if not module_name:
-                        break
-                    tgt_nid = _make_id(module_name)
+            tgt_nid, resolved_path = resolved
             edges.append({
                 "source": file_nid,
                 "target": tgt_nid,
@@ -696,19 +711,127 @@ def _get_cpp_func_name(node, source: bytes) -> str | None:
     return None
 
 
+# ── CommonJS require() imports ────────────────────────────────────────────────
+
+def _find_require_call(value_node):
+    """Return the call_expression node if `value_node` is a `require(...)` call
+    or `require(...).x` member access. Otherwise None."""
+    if value_node is None:
+        return None
+    if value_node.type == "call_expression":
+        fn = value_node.child_by_field_name("function")
+        if fn is not None and fn.type == "identifier":
+            return value_node
+    if value_node.type == "member_expression":
+        obj = value_node.child_by_field_name("object")
+        return _find_require_call(obj)
+    return None
+
+
+def _require_imports_js(node, source: bytes, file_nid: str, stem: str, edges: list, str_path: str) -> bool:
+    """Detect CommonJS `require()` imports inside lexical_declaration / variable_declaration.
+
+    Handles three patterns:
+      const { foo, bar: alias } = require('./mod')   → file → mod (imports_from), file → foo, file → bar
+      const mod                 = require('./mod')   → file → mod (imports_from)
+      const x                   = require('./mod').y → file → mod (imports_from), file → y
+
+    Returns True if any require import was found.
+    """
+    if node.type not in ("lexical_declaration", "variable_declaration"):
+        return False
+    found = False
+    for child in node.children:
+        if child.type != "variable_declarator":
+            continue
+        value = child.child_by_field_name("value")
+        call = _find_require_call(value)
+        if call is None:
+            continue
+        fn = call.child_by_field_name("function")
+        if fn is None or _read_text(fn, source) != "require":
+            continue
+        args = call.child_by_field_name("arguments")
+        if args is None:
+            continue
+        raw = None
+        for arg in args.children:
+            if arg.type == "string":
+                raw = _read_text(arg, source).strip("'\"` ")
+                break
+        if not raw:
+            continue
+        resolved = _resolve_js_import_target(raw, str_path)
+        if resolved is None:
+            continue
+        tgt_nid, resolved_path = resolved
+        line = node.start_point[0] + 1
+        edges.append({
+            "source": file_nid,
+            "target": tgt_nid,
+            "relation": "imports_from",
+            "context": "import",
+            "confidence": "EXTRACTED",
+            "source_file": str_path,
+            "source_location": f"L{line}",
+            "weight": 1.0,
+        })
+        found = True
+
+        # Symbol-level edges for destructured / accessor binders. Mirrors
+        # the named-import emission in `_import_js` so cross-file call
+        # resolution can pick the right callee for `const { foo } =
+        # require('./m'); foo()` the same way it does for ES `import { foo }
+        # from './m'`.
+        target_stem = _file_stem(resolved_path) if resolved_path is not None else None
+        name_node = child.child_by_field_name("name")
+        sym_names: list[str] = []
+        if name_node is not None and name_node.type == "object_pattern":
+            for prop in name_node.children:
+                if prop.type == "shorthand_property_identifier_pattern":
+                    sym_names.append(_read_text(prop, source))
+                elif prop.type == "pair_pattern":
+                    key = prop.child_by_field_name("key")
+                    if key is not None:
+                        sym_names.append(_read_text(key, source))
+        elif value is not None and value.type == "member_expression":
+            prop = value.child_by_field_name("property")
+            if prop is not None:
+                sym_names.append(_read_text(prop, source))
+        if target_stem is not None:
+            for sym in sym_names:
+                edges.append({
+                    "source": file_nid,
+                    "target": _make_id(target_stem, sym),
+                    "relation": "imports",
+                    "context": "import",
+                    "confidence": "EXTRACTED",
+                    "source_file": str_path,
+                    "source_location": f"L{line}",
+                    "weight": 1.0,
+                })
+    return found
+
+
 # ── JS/TS extra walk for arrow functions ──────────────────────────────────────
 
 def _js_extra_walk(node, source: bytes, file_nid: str, stem: str, str_path: str,
                    nodes: list, edges: list, seen_ids: set, function_bodies: list,
                    parent_class_nid: str | None, add_node_fn, add_edge_fn) -> bool:
-    """Handle lexical_declaration for JS/TS:
-       - arrow functions / function expressions (existing behaviour)
-       - module-level const literals (object/array/string/call/new/etc.) — TS codebases
+    """Handle lexical_declaration / variable_declaration for JS/TS:
+       - CommonJS require() imports — emit imports_from + named imports
+       - arrow functions / function expressions (lexical_declaration only)
+       - module-level const literals (object/array/call/new/etc.) — TS codebases
          use these for configs, route maps, DI tokens, enum-like unions.
        - object-literal method properties: `const X = { run() {}, helper: function() {} }`
          — research/experiment/config files keep the actual logic in object methods that
          would otherwise be invisible to the graph.
     Returns True if handled."""
+    # CJS require() imports — emit edges from both lexical_declaration and
+    # `var`-style variable_declaration. Doesn't block other handlers in the
+    # lexical_declaration branch (arrow fn / const literal can co-exist on
+    # different declarators in the same statement, theoretically).
+    require_found = _require_imports_js(node, source, file_nid, stem, edges, str_path)
     if node.type == "lexical_declaration":
         for child in node.children:
             if child.type == "variable_declarator":
@@ -756,6 +879,10 @@ def _js_extra_walk(node, source: bytes, file_nid: str, stem: str, str_path: str,
                                 obj_node, source, stem, const_nid,
                                 function_bodies, add_node_fn, add_edge_fn,
                             )
+        return True
+    if require_found:
+        # `var x = require('./m')` — variable_declaration (no lexical_declaration
+        # arrow / const-literal handling to fold in). Edges already emitted.
         return True
     return False
 
