@@ -76,6 +76,10 @@ def run_benchmark(
     Returns dict with: corpus_tokens, avg_query_tokens, reduction_ratio, per_question
     """
     data = json.loads(Path(graph_path).read_text(encoding="utf-8"))
+    # Mirror `edges` → `links` so node_link_graph(..., edges="links") works
+    # on graphs saved by newer NetworkX versions (upstream PR #768).
+    if "links" not in data and "edges" in data:
+        data = dict(data, links=data["edges"])
     try:
         G = json_graph.node_link_graph(data, edges="links")
     except TypeError:

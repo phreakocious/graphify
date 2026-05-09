@@ -4923,6 +4923,10 @@ def main() -> None:
             from networkx.readwrite import json_graph as _jg
             def _load_graph(p: Path) -> _nx.Graph:
                 raw = json.loads(p.read_text(encoding="utf-8"))
+                # Mirror `edges` → `links` so node_link_graph(..., edges="links")
+                # accepts graphs saved by newer NetworkX (upstream PR #768).
+                if "links" not in raw and "edges" in raw:
+                    raw = dict(raw, links=raw["edges"])
                 try:
                     return _jg.node_link_graph(raw, edges="links")
                 except TypeError:

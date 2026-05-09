@@ -17,6 +17,11 @@ def _load_graph(graph_path: str) -> nx.Graph:
             raise FileNotFoundError(f"Graph file not found: {resolved}")
         safe = resolved
         data = json.loads(safe.read_text(encoding="utf-8"))
+        # Some graphs are saved with the modern NetworkX `edges` key while
+        # node_link_graph(..., edges="links") expects `links`. Mirror the
+        # key when only one is present (upstream PR #768).
+        if "links" not in data and "edges" in data:
+            data = dict(data, links=data["edges"])
         try:
             return json_graph.node_link_graph(data, edges="links")
         except TypeError:
