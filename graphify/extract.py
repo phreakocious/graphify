@@ -89,9 +89,17 @@ from .cache import load_cached, save_cached
 #          inflate node count without giving the agent anything to
 #          pivot on. Cached cells from v9 still carry those const
 #          nodes; bump forces re-extract so they drop.
+#   "v11" — lap-28 cherry-pick of upstream 8489b26 (PR #766): .tsx
+#          files now use tree-sitter-typescript's `language_tsx`
+#          (JSX-aware) instead of plain `language_typescript`. Prior
+#          cells parsed JSX as ERROR nodes and silently dropped every
+#          fn / call_expression nested inside JSX trees (e.g.
+#          `{fmtDate(now)}`). Upstream validation: +104% nodes /
+#          +62% edges on a 13-file Tauri app. Bump forces re-extract
+#          so .tsx cells pick up the missing declarations.
 # Note: lap-15's phantom-node resolution runs at MERGE time over the
 # combined per-file results, so it fires on cached output too — no bump.
-AST_CACHE_VERSION = "v10"
+AST_CACHE_VERSION = "v11"
 
 
 # AST node types that represent a member-expression callee
@@ -935,6 +943,24 @@ _TS_CONFIG = LanguageConfig(
     call_accessor_field="property",
     function_boundary_types=frozenset({"function_declaration", "arrow_function", "method_definition"}),
     import_handler=_import_js,
+)
+
+# .tsx files must use the TSX grammar (JSX-aware), not the plain TypeScript grammar.
+# tree-sitter-typescript ships two languages: language_typescript (for .ts) and
+# language_tsx (for .tsx). Parsing .tsx with language_typescript silently fails on
+# JSX expressions, dropping any call_expression nested inside JSX (e.g. {fmtDate(x)}).
+_TSX_CONFIG = LanguageConfig(
+    ts_module="tree_sitter_typescript",
+    ts_language_fn="language_tsx",
+    class_types=_TS_CONFIG.class_types,
+    function_types=_TS_CONFIG.function_types,
+    import_types=_TS_CONFIG.import_types,
+    call_types=_TS_CONFIG.call_types,
+    call_function_field=_TS_CONFIG.call_function_field,
+    call_accessor_node_types=_TS_CONFIG.call_accessor_node_types,
+    call_accessor_field=_TS_CONFIG.call_accessor_field,
+    function_boundary_types=_TS_CONFIG.function_boundary_types,
+    import_handler=_TS_CONFIG.import_handler,
 )
 
 _JAVA_CONFIG = LanguageConfig(
@@ -2408,7 +2434,12 @@ def extract_python(path: Path) -> dict:
 
 def extract_js(path: Path) -> dict:
     """Extract classes, functions, arrow functions, and imports from a .js/.ts/.tsx file."""
-    config = _TS_CONFIG if path.suffix in (".ts", ".tsx") else _JS_CONFIG
+    if path.suffix == ".tsx":
+        config = _TSX_CONFIG
+    elif path.suffix == ".ts":
+        config = _TS_CONFIG
+    else:
+        config = _JS_CONFIG
     return _extract_generic(path, config)
 
 
