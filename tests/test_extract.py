@@ -592,3 +592,65 @@ def test_extract_js_arrow_function_still_extracted(tmp_path):
     result = extract_js(p)
     labels = [n["label"] for n in result["nodes"]]
     assert "greet()" in labels
+
+
+# ── Cross-file call import-evidence promotion ─────────────────────────────────
+
+def test_cross_file_call_promoted_to_extracted_with_import_evidence(tmp_path):
+    """When the caller's file has an `imports` edge to the callee symbol,
+    the cross-file `calls` edge must be EXTRACTED with confidence_score 1.0."""
+    caller = tmp_path / "caller.js"
+    callee = tmp_path / "lib.js"
+    caller.write_text(
+        "const { doWork } = require('./lib');\n"
+        "function run() { doWork(); }\n"
+    )
+    callee.write_text(
+        "function doWork() { return 1; }\n"
+        "module.exports = { doWork };\n"
+    )
+    result = extract([caller, callee], cache_root=tmp_path)
+    nodes = {n["id"]: n for n in result["nodes"]}
+    call_edges = [
+        e for e in result["edges"]
+        if e["relation"] == "calls"
+        and nodes[e["source"]]["label"] == "run()"
+        and nodes[e["target"]]["label"] == "doWork()"
+    ]
+    assert len(call_edges) == 1
+    assert call_edges[0]["confidence"] == "EXTRACTED"
+    assert call_edges[0]["confidence_score"] == 1.0
+
+
+def test_multi_candidate_disambiguated_by_import_evidence(tmp_path):
+    """When two files both define `doWork`, but the caller imports from
+    only one, the resolver must pick that one as EXTRACTED — not last-wins
+    INFERRED. This is the navigator-specific multi-candidate path that
+    upstream's single-branch resolver doesn't exercise."""
+    caller = tmp_path / "caller.js"
+    lib_a = tmp_path / "libA.js"
+    lib_b = tmp_path / "libB.js"
+    caller.write_text(
+        "const { doWork } = require('./libA');\n"
+        "function run() { doWork(); }\n"
+    )
+    lib_a.write_text(
+        "function doWork() { return 'A'; }\n"
+        "module.exports = { doWork };\n"
+    )
+    lib_b.write_text(
+        "function doWork() { return 'B'; }\n"
+        "module.exports = { doWork };\n"
+    )
+    result = extract([caller, lib_a, lib_b], cache_root=tmp_path)
+    nodes = {n["id"]: n for n in result["nodes"]}
+    call_edges = [
+        e for e in result["edges"]
+        if e["relation"] == "calls"
+        and nodes[e["source"]]["label"] == "run()"
+    ]
+    assert len(call_edges) == 1, f"Expected 1 call edge, got: {call_edges}"
+    edge = call_edges[0]
+    assert edge["confidence"] == "EXTRACTED"
+    # Picked candidate must be libA's doWork, not libB's
+    assert nodes[edge["target"]]["source_file"].endswith("libA.js")

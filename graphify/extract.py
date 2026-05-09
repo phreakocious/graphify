@@ -4752,6 +4752,50 @@ def extract(paths: list[Path], cache_root: Path | None = None) -> dict:
     # member-expression gate can inspect `closure_exposed` on the
     # candidate before allowing the cross-file link.
     nodes_by_id = {n["id"]: n for n in all_nodes}
+    # Lap-28 cherry-pick of upstream 2dd6ee6: import-evidence promotion.
+    # Build per-file indices of explicit `imports` / `imports_from` edges so
+    # the resolver can ask "did the caller's file import the callee (or the
+    # callee's file)?" When the answer is yes, the cross-file call is no
+    # longer a name-match guess — it's backed by a tree-sitter-extracted
+    # import statement. That promotes the edge from INFERRED 0.8 to
+    # EXTRACTED 1.0 and disambiguates multi-candidate cases (when exactly
+    # one of N candidates has import evidence, that's the right binding).
+    file_to_symbol_imports: dict[str, set[str]] = {}
+    file_to_module_imports: dict[str, set[str]] = {}
+    for e in all_edges:
+        rel = e.get("relation")
+        if rel == "imports":
+            file_to_symbol_imports.setdefault(e["source"], set()).add(e["target"])
+        elif rel == "imports_from":
+            file_to_module_imports.setdefault(e["source"], set()).add(e["target"])
+    # Map each node back to its containing file_id so we can ask
+    # "did the caller's file import the callee's file?" Every code node's
+    # source_file matches the str(path) used to build that file's _make_id,
+    # so this round-trip is consistent without needing a path remap.
+    nid_to_file_nid: dict[str, str] = {}
+    for n in all_nodes:
+        sf = n.get("source_file")
+        if sf:
+            nid_to_file_nid[n["id"]] = _make_id(sf)
+
+    def _evidence_pick(caller_nid: str, cands: list[str]) -> "str | None":
+        """Return the unique candidate backed by an import edge from the
+        caller's file; None if zero or more than one match."""
+        caller_file_nid = nid_to_file_nid.get(caller_nid)
+        if caller_file_nid is None:
+            return None
+        sym_imports = file_to_symbol_imports.get(caller_file_nid, set())
+        mod_imports = file_to_module_imports.get(caller_file_nid, set())
+        backed: list[str] = []
+        for c in cands:
+            if c in sym_imports:
+                backed.append(c)
+                continue
+            cand_file_nid = nid_to_file_nid.get(c)
+            if cand_file_nid is not None and cand_file_nid in mod_imports:
+                backed.append(c)
+        return backed[0] if len(backed) == 1 else None
+
     for result in per_file:
         for rc in result.get("raw_calls", []):
             callee = rc.get("callee", "")
@@ -4770,34 +4814,54 @@ def extract(paths: list[Path], cache_root: Path | None = None) -> dict:
                 # `Logger.log(...)` collapsing onto a one-off
                 # `function log(...)` from a smoke-test script).
                 #
-                # Lap-27 closure-shorthand fix: allow the link ONLY when the
-                # callee resolves to a SINGLE candidate AND that candidate
-                # was `closure_exposed` (referenced via JS/TS object-literal
-                # property shorthand `{ name }` in its defining file). The
-                # closure pattern is the lap-9 factory shape — `function f()
-                # {} ; return { f }` — where `obj.f()` callers from other
-                # files are genuinely calling that function. Phantom-god
-                # names like `log` typically collide on multiple candidates
-                # (or aren't shorthand-exposed) so this gate stays tight.
-                if len(candidates) != 1:
-                    continue
-                cand_attrs = nodes_by_id.get(candidates[0]) or {}
-                if not cand_attrs.get("closure_exposed"):
-                    continue
-                tgt = candidates[0]
-                confidence = "EXTRACTED"
-                confidence_score = 1.0
+                # Lap-28 import evidence: when the caller's file explicitly
+                # imports the callee symbol or the callee's file, we have
+                # ground-truth attribution — no receiver-type analysis
+                # needed. Use this first because it's stricter than the
+                # closure-shorthand heuristic and applies across all
+                # languages.
+                pick = _evidence_pick(caller, candidates)
+                if pick is not None:
+                    tgt = pick
+                    confidence = "EXTRACTED"
+                    confidence_score = 1.0
+                else:
+                    # Lap-27 closure-shorthand fix: allow the link ONLY when
+                    # the callee resolves to a SINGLE candidate AND that
+                    # candidate was `closure_exposed` (referenced via JS/TS
+                    # object-literal property shorthand `{ name }` in its
+                    # defining file). The closure pattern is the lap-9
+                    # factory shape — `function f() {} ; return { f }` —
+                    # where `obj.f()` callers from other files are genuinely
+                    # calling that function. Phantom-god names like `log`
+                    # typically collide on multiple candidates (or aren't
+                    # shorthand-exposed) so this gate stays tight.
+                    if len(candidates) != 1:
+                        continue
+                    cand_attrs = nodes_by_id.get(candidates[0]) or {}
+                    if not cand_attrs.get("closure_exposed"):
+                        continue
+                    tgt = candidates[0]
+                    confidence = "EXTRACTED"
+                    confidence_score = 1.0
             elif len(candidates) == 1:
                 tgt = candidates[0]
                 confidence = "EXTRACTED"
                 confidence_score = 1.0
             else:
-                # Ambiguous name — keep the original "last registered wins"
-                # behavior at INFERRED grade. The agent reads INFERRED as
-                # "needs verification" which is correct here.
-                tgt = candidates[-1]
-                confidence = "INFERRED"
-                confidence_score = 0.8
+                # Ambiguous name — try import evidence to disambiguate. If
+                # exactly one candidate is backed by an explicit import from
+                # the caller's file, that's the right binding (EXTRACTED).
+                # Otherwise fall back to "last registered wins" at INFERRED.
+                pick = _evidence_pick(caller, candidates)
+                if pick is not None:
+                    tgt = pick
+                    confidence = "EXTRACTED"
+                    confidence_score = 1.0
+                else:
+                    tgt = candidates[-1]
+                    confidence = "INFERRED"
+                    confidence_score = 0.8
             if tgt and tgt != caller and (caller, tgt) not in existing_pairs:
                 existing_pairs.add((caller, tgt))
                 all_edges.append({
