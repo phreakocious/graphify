@@ -665,7 +665,7 @@ def _handle_pretool_hook(payload: dict, root: Path) -> dict | None:
             f"--offset/--limit instead of dumping the whole file. For a "
             f"single declaration, `graphify peek \"@<symbol>\"` is a "
             f"cursor-free body dump. (Hook stays silent on follow-up "
-            f"Reads of this file.) See ~/.claude/skills/graphify/SKILL.md."
+            f"Reads of this file.)"
         )
     elif tool == "Grep":
         pat = (inp.get("pattern") or "").strip()
@@ -674,15 +674,13 @@ def _handle_pretool_hook(payload: dict, root: Path) -> dict | None:
                 f"`graphify search \"{pat}\"` runs the same regex but "
                 f"returns hits with symbol attribution (file:line + "
                 f"enclosing fn/class) and ±1 line of context — strictly "
-                f"more info for the same query. See "
-                f"~/.claude/skills/graphify/SKILL.md."
+                f"more info for the same query."
             )
         else:
             msg = (
                 "`graphify search \"<pattern>\"` runs the same regex but "
                 "returns hits with symbol attribution (file:line + "
-                "enclosing fn/class) and ±1 line of context. See "
-                "~/.claude/skills/graphify/SKILL.md."
+                "enclosing fn/class) and ±1 line of context."
             )
     elif tool == "Glob":
         pat = (inp.get("pattern") or "").strip()
@@ -690,15 +688,13 @@ def _handle_pretool_hook(payload: dict, root: Path) -> dict | None:
             msg = (
                 f"`graphify files \"{pat}\"` mirrors the glob over the "
                 f"indexed file set — each match is a graph node you can "
-                f"`shape`/`navigate` from in one more call. See "
-                f"~/.claude/skills/graphify/SKILL.md."
+                f"`shape`/`navigate` from in one more call."
             )
         else:
             msg = (
                 "`graphify files \"<glob>\"` mirrors a glob over the "
                 "indexed file set — each match is a graph node you can "
-                "`shape`/`navigate` from. See "
-                "~/.claude/skills/graphify/SKILL.md."
+                "`shape`/`navigate` from."
             )
     else:
         # Defensive fallback — the gate above should already exclude this.
@@ -769,80 +765,58 @@ def _handle_pretool_hook(payload: dict, root: Path) -> dict | None:
         "additionalContext": msg,
     }}
 
-_SKILL_REGISTRATION = (
-    "\n# graphify\n"
-    "- **graphify** (`~/.claude/skills/graphify/SKILL.md`) "
-    "- any input to knowledge graph. Trigger: `/graphify`\n"
-    "When the user types `/graphify`, invoke the Skill tool "
-    "with `skill: \"graphify\"` before doing anything else.\n"
-)
-
-
 _PLATFORM_CONFIG: dict[str, dict] = {
     "claude": {
         "skill_file": "skill.md",
         "skill_dst": Path(".claude") / "skills" / "graphify" / "SKILL.md",
-        "claude_md": True,
     },
     "codex": {
         "skill_file": "skill-codex.md",
         "skill_dst": Path(".agents") / "skills" / "graphify" / "SKILL.md",
-        "claude_md": False,
     },
     "opencode": {
         "skill_file": "skill-opencode.md",
         "skill_dst": Path(".config") / "opencode" / "skills" / "graphify" / "SKILL.md",
-        "claude_md": False,
     },
     "aider": {
         "skill_file": "skill-aider.md",
         "skill_dst": Path(".aider") / "graphify" / "SKILL.md",
-        "claude_md": False,
     },
     "copilot": {
         "skill_file": "skill-copilot.md",
         "skill_dst": Path(".copilot") / "skills" / "graphify" / "SKILL.md",
-        "claude_md": False,
     },
     "claw": {
         "skill_file": "skill-claw.md",
         "skill_dst": Path(".openclaw") / "skills" / "graphify" / "SKILL.md",
-        "claude_md": False,
     },
     "droid": {
         "skill_file": "skill-droid.md",
         "skill_dst": Path(".factory") / "skills" / "graphify" / "SKILL.md",
-        "claude_md": False,
     },
     "trae": {
         "skill_file": "skill-trae.md",
         "skill_dst": Path(".trae") / "skills" / "graphify" / "SKILL.md",
-        "claude_md": False,
     },
     "trae-cn": {
         "skill_file": "skill-trae.md",
         "skill_dst": Path(".trae-cn") / "skills" / "graphify" / "SKILL.md",
-        "claude_md": False,
     },
     "hermes": {
         "skill_file": "skill-claw.md",
         "skill_dst": Path(".hermes") / "skills" / "graphify" / "SKILL.md",
-        "claude_md": False,
     },
     "kiro": {
         "skill_file": "skill-kiro.md",
         "skill_dst": Path(".kiro") / "skills" / "graphify" / "SKILL.md",
-        "claude_md": False,
     },
     "antigravity": {
         "skill_file": "skill.md",
         "skill_dst": Path(".agent") / "skills" / "graphify" / "SKILL.md",
-        "claude_md": False,
     },
     "windows": {
         "skill_file": "skill-windows.md",
         "skill_dst": Path(".claude") / "skills" / "graphify" / "SKILL.md",
-        "claude_md": True,
     },
 }
 
@@ -872,21 +846,6 @@ def install(platform: str = "claude") -> None:
     shutil.copy(skill_src, skill_dst)
     (skill_dst.parent / ".graphify_version").write_text(__version__, encoding="utf-8")
     print(f"  skill installed  ->  {skill_dst}")
-
-    if cfg["claude_md"]:
-        # Register in ~/.claude/CLAUDE.md (Claude Code only)
-        claude_md = Path.home() / ".claude" / "CLAUDE.md"
-        if claude_md.exists():
-            content = claude_md.read_text(encoding="utf-8")
-            if "graphify" in content:
-                print(f"  CLAUDE.md        ->  already registered (no change)")
-            else:
-                claude_md.write_text(content.rstrip() + _SKILL_REGISTRATION, encoding="utf-8")
-                print(f"  CLAUDE.md        ->  skill registered in {claude_md}")
-        else:
-            claude_md.parent.mkdir(parents=True, exist_ok=True)
-            claude_md.write_text(_SKILL_REGISTRATION.lstrip(), encoding="utf-8")
-            print(f"  CLAUDE.md        ->  created at {claude_md}")
 
     if platform == "opencode":
         _install_opencode_plugin(Path("."))

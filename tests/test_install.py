@@ -98,10 +98,15 @@ def test_all_skill_files_exist_in_package():
         assert (pkg / name).exists(), f"Missing: {name}"
 
 
-def test_claude_install_registers_claude_md(tmp_path):
-    """Claude platform install writes CLAUDE.md; others do not."""
+def test_claude_install_does_not_write_global_claude_md(tmp_path):
+    """`graphify install` (Claude default) installs the skill file but does NOT
+    touch the user's global ~/.claude/CLAUDE.md. Project-level guidance lives
+    in `<project>/.claude/graphify.md` via `graphify claude install`; the
+    home-level CLAUDE.md write was removed because Claude Code's skill
+    discovery picks up SKILL.md frontmatter directly."""
     _install(tmp_path, "claude")
-    assert (tmp_path / ".claude" / "CLAUDE.md").exists()
+    assert (tmp_path / ".claude" / "skills" / "graphify" / "SKILL.md").exists()
+    assert not (tmp_path / ".claude" / "CLAUDE.md").exists()
 
 
 def test_codex_install_does_not_write_claude_md(tmp_path):
