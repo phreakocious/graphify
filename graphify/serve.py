@@ -51,10 +51,23 @@ def _strip_diacritics(text: str) -> str:
     return "".join(c for c in nfkd if not unicodedata.combining(c))
 
 
-def _score_nodes(G: nx.Graph, terms: list[str]) -> list[tuple[float, str]]:
-    """Term-bag scoring with lap-7 ranking refinements:
+# Three-tier label-match precedence (upstream #828). A bare 1.0 substring score
+# tied a 25-char generic-fragment hit against a 4-char exact label match, so
+# `path "Foo" "Bar"` could resolve to a docstring-containing helper instead of
+# the `Foo` class itself. Tier gap keeps exact > prefix > substring no matter
+# how many archive/degree adjustments pile on below.
+_EXACT_MATCH_BONUS = 1000.0
+_PREFIX_MATCH_BONUS = 100.0
+_SUBSTRING_MATCH_BONUS = 1.0
+_SOURCE_MATCH_BONUS = 0.5
 
-    Base: 1.0 per term in the label, 0.5 per term in the source file path.
+
+def _score_nodes(G: nx.Graph, terms: list[str]) -> list[tuple[float, str]]:
+    """Term-bag scoring with lap-7 ranking refinements + #828 tier precedence:
+
+    Per-term bonus picks the strongest tier (exact > prefix > substring) so a
+    single term cannot double-count across tiers. Source-file match always
+    adds on top regardless of label tier.
 
     Adjustments:
       - Archive penalty (×0.5) for files under frozen/legacy/deprecated/
@@ -75,8 +88,18 @@ def _score_nodes(G: nx.Graph, terms: list[str]) -> list[tuple[float, str]]:
     norm_terms = [_strip_diacritics(t).lower() for t in terms]
     for nid, data in G.nodes(data=True):
         norm_label = data.get("norm_label") or _strip_diacritics(data.get("label") or "").lower()
+        bare_label = norm_label.rstrip("()")
         source = (data.get("source_file") or "").lower()
-        score = sum(1 for t in norm_terms if t in norm_label) + sum(0.5 for t in norm_terms if t in source)
+        score = 0.0
+        for t in norm_terms:
+            if t == norm_label or t == bare_label:
+                score += _EXACT_MATCH_BONUS
+            elif norm_label.startswith(t) or bare_label.startswith(t):
+                score += _PREFIX_MATCH_BONUS
+            elif t in norm_label:
+                score += _SUBSTRING_MATCH_BONUS
+            if t in source:
+                score += _SOURCE_MATCH_BONUS
         if score > 0:
             if _is_archived_path(source):
                 score *= 0.5
@@ -169,11 +192,24 @@ def _subgraph_to_text(G: nx.Graph, nodes: set[str], edges: list[tuple],
 
 
 def _find_node(G: nx.Graph, label: str) -> list[str]:
-    """Return node IDs whose label or ID matches the search term (diacritic-insensitive)."""
+    """Return node IDs matching the search term, ordered by three-tier precedence:
+    exact (label or node-id) → prefix → substring (upstream #828).
+    """
     term = _strip_diacritics(label).lower()
-    return [nid for nid, d in G.nodes(data=True)
-            if term in (d.get("norm_label") or _strip_diacritics(d.get("label") or "").lower())
-            or term == nid.lower()]
+    exact: list[str] = []
+    prefix: list[str] = []
+    substring: list[str] = []
+    for nid, d in G.nodes(data=True):
+        norm_label = d.get("norm_label") or _strip_diacritics(d.get("label") or "").lower()
+        bare_label = norm_label.rstrip("()")
+        nid_lower = nid.lower()
+        if term == norm_label or term == bare_label or term == nid_lower:
+            exact.append(nid)
+        elif norm_label.startswith(term) or bare_label.startswith(term) or nid_lower.startswith(term):
+            prefix.append(nid)
+        elif term in norm_label:
+            substring.append(nid)
+    return exact + prefix + substring
 
 
 def _filter_blank_stdin() -> None:
@@ -447,6 +483,23 @@ def serve(graph_path: str = "graphify-out/graph.json") -> None:
         if not tgt_scored:
             return f"No node matching target '{arguments['target']}' found."
         src_nid, tgt_nid = src_scored[0][1], tgt_scored[0][1]
+        # Ambiguity guard (upstream #828): when both queries resolve to the same
+        # node, the shortest path is trivially zero hops, which is almost never
+        # what the caller wanted.
+        if src_nid == tgt_nid:
+            return (
+                f"'{arguments['source']}' and '{arguments['target']}' both resolved to "
+                f"the same node '{src_nid}'. Use a more specific label or the exact node ID."
+            )
+        warnings: list[str] = []
+        for name, scored in (("source", src_scored), ("target", tgt_scored)):
+            if len(scored) >= 2:
+                top, runner = scored[0][0], scored[1][0]
+                if top > 0 and (top - runner) / top < 0.10:
+                    warnings.append(
+                        f"warning: {name} match was ambiguous "
+                        f"(top score {top:g}, runner-up {runner:g})"
+                    )
         max_hops = int(arguments.get("max_hops", 8))
         try:
             path_nodes = nx.shortest_path(G, src_nid, tgt_nid)
@@ -465,7 +518,8 @@ def serve(graph_path: str = "graphify-out/graph.json") -> None:
             if i == 0:
                 segments.append(G.nodes[u].get("label", u))
             segments.append(f"--{rel}{conf_str}--> {G.nodes[v].get('label', v)}")
-        return f"Shortest path ({hops} hops):\n  " + " ".join(segments)
+        prefix = ("\n".join(warnings) + "\n") if warnings else ""
+        return prefix + f"Shortest path ({hops} hops):\n  " + " ".join(segments)
 
     def _tool_navigate(arguments: dict) -> str:
         from graphify.navigate import navigate as _navigate, LIST_LIMIT
