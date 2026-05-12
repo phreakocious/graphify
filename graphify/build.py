@@ -23,18 +23,23 @@
 from __future__ import annotations
 import re
 import sys
+import unicodedata
 import networkx as nx
 from .validate import validate_extraction
 
 
 def _normalize_id(s: str) -> str:
-    """Normalize an ID string the same way extract._make_id does.
+    r"""Normalize an ID string the same way extract._make_id does.
 
     Used to reconcile edge endpoints when the LLM generates IDs with slightly
-    different punctuation or casing than the AST extractor.
+    different punctuation or casing than the AST extractor. Must stay in sync
+    with extract._make_id — NFKC normalization, \w with re.UNICODE, underscore
+    collapse, and casefold must all match (upstream #811).
     """
-    cleaned = re.sub(r"[^a-zA-Z0-9]+", "_", s)
-    return cleaned.strip("_").lower()
+    s = unicodedata.normalize("NFKC", s)
+    cleaned = re.sub(r"[^\w]+", "_", s, flags=re.UNICODE)
+    cleaned = re.sub(r"_+", "_", cleaned)
+    return cleaned.strip("_").casefold()
 
 
 def build_from_json(extraction: dict, *, directed: bool = False) -> nx.Graph:

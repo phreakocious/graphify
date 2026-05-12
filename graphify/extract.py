@@ -5,6 +5,7 @@ import json
 import os
 import re
 import sys
+import unicodedata
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Any
@@ -112,9 +113,18 @@ from .cache import load_cached, save_cached
 #          static `import`, dynamic `import()`, and `require()`
 #          alike. Bump forces re-extract so existing CJS cells
 #          gain the require edges.
+#   "v13" — lap-29 cherry-pick of upstream 95e2c5e (#811): `_make_id` /
+#          `_normalize_id` now NFKC-normalize, use `\w` with re.UNICODE,
+#          and casefold instead of `.lower()` + `[a-zA-Z0-9]`. Non-ASCII
+#          identifiers (CJK, Cyrillic, Arabic, accented Latin) previously
+#          stripped to empty and collapsed to a single per-file node;
+#          they now produce distinct IDs. Composed/decomposed forms of
+#          the same character (é vs e+combining-acute) hash to the same
+#          ID. Bump forces re-extract so non-ASCII corpora pick up the
+#          distinct node IDs.
 # Note: lap-15's phantom-node resolution runs at MERGE time over the
 # combined per-file results, so it fires on cached output too — no bump.
-AST_CACHE_VERSION = "v12"
+AST_CACHE_VERSION = "v13"
 
 
 # AST node types that represent a member-expression callee
@@ -141,10 +151,19 @@ _MEMBER_CALL_NODE_TYPES = frozenset({
 
 
 def _make_id(*parts: str) -> str:
-    """Build a stable node ID from one or more name parts."""
+    r"""Build a stable node ID from one or more name parts.
+
+    Preserves Unicode letters/digits (CJK, Cyrillic, Arabic, accented Latin,
+    etc.) so non-ASCII identifiers produce distinct IDs and don't collapse to
+    a single per-file node (upstream #811). NFKC normalization ensures composed
+    and decomposed forms of the same character (e.g. é vs e+combining-acute)
+    produce the same ID. Must stay in sync with build._normalize_id.
+    """
     combined = "_".join(p.strip("_.") for p in parts if p)
-    cleaned = re.sub(r"[^a-zA-Z0-9]+", "_", combined)
-    return cleaned.strip("_").lower()
+    combined = unicodedata.normalize("NFKC", combined)
+    cleaned = re.sub(r"[^\w]+", "_", combined, flags=re.UNICODE)
+    cleaned = re.sub(r"_+", "_", cleaned)
+    return cleaned.strip("_").casefold()
 
 
 def _file_stem(path: Path) -> str:
