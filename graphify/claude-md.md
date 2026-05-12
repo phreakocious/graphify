@@ -2,33 +2,45 @@
 
 This project has a graphify knowledge graph at `graphify-out/graph.json`. Use it to keep your context window from collapsing under a heavy codebase.
 
-### When you should reach for graphify
+### When to reach for graphify
 
 Before any of these moves, scout the graph first — it's 50–500x cheaper than the alternative:
 
-- **About to `Read` a source-code file you don't already know.** Run `graphify shape "<file>"` for a one-screen summary, or `graphify navigate "@<symbol>"` for the affordance frame. The frontier shows you whether the file is a leaf, hub, or router, and what shape of context you actually need.
-- **About to chain `Grep` / `Glob` calls to trace a call graph or find who-uses-X.** That's literally what `graphify navigate` `in`/`out`/`path` are for.
-- **About to grep for a string in source code.** Reach for `graphify search "<pattern>"` over `grep -n` when (a) you don't already know the containing symbol, or (b) you want to see parallel definitions across the repo. Search returns hits with symbol attribution (label, file:line, container, community) and ±1 line of context, repo-wide by default. Use raw `grep` for non-source files (markdown, JSON, configs) and right after recent edits when the graph is stale.
-- **About to read a single function to remind yourself what it does.** `graphify peek "<symbol>"` is a one-shot body dump — no cursor, no session.
-- **About to implement, change, or debug something in unfamiliar territory.** Map the blast radius first: focus the entry point, run `in --depth=2 --kind=calls` to see callers two hops out, decide what's actually load-bearing.
-- **You don't know where to start.** `graphify navigate "@<best-guess-label>"` is a free probe — a hit returns a frontier, a miss returns real names you can grab onto.
+- **Reading a source file you don't know.** `graphify shape "<file>"` or `graphify navigate "@<symbol>"` first — the frontier shows whether it's a leaf, hub, or router.
+- **Tracing a call graph or who-uses-X.** That's `navigate in / out / wu / path`.
+- **String search in source.** `graphify search "<pat>"` over `grep -n` — hits come attributed to symbol (label, file:line, container, community) with ±1 line of context.
+- **One-function reminder.** `graphify peek "<symbol>"` — one-shot body dump, no cursor, no session.
+- **Implementing in unfamiliar code.** Map the blast radius first — focus the entry point, run `in --depth=2 --kind=calls` to see callers two hops out.
+- **Don't know where to start.** `graphify navigate "@<best-guess>"` is a free probe — a hit returns a frontier, a miss returns real names you can grab onto.
 
-**Don't reach for graphify when reading**: `.json` / `.yaml` / `.toml` / `.csv` / `.md` / `.txt` / `.log` / lockfiles / build output / your own memory or scratch files. graphify only indexes source code — for data, configs, prose, and machine output, just `Read` directly.
+### When NOT to reach for graphify
+
+Skip graphify when reading raw content of `.json` / `.yaml` / `.toml` / `.csv` / `.txt` / `.log` / lockfiles / build output / scratch files — graphify doesn't index their content. Also when you want to absorb prose flow in a `.md`/`.mdx` you'll read end-to-end: `Read` is right for that. graphify is for finding *where* something is mentioned, not for absorbing a document.
+
+### graphify indexes markdown too
+
+`.md` and `.mdx` are first-class file/heading/code-block nodes. Backtick refs to code symbols (`MyClass`, `compile()`) become `references` edges. So `navigate "@MyClass" wu` surfaces source call sites *and* doc mentions in one call; `search "<pat>"` matches code bodies AND markdown bodies. Kills the "where is this discussed?" grep fallback.
+
+### Don't bail after one empty graphify call
+
+Empty `search` is usually a regex/casing miss — try `shape <file>` or `navigate "@<best-guess>"` before falling back to grep. `@`-targets do prefix → substring → fuzzy fallback automatically; the trust-signal line in the output names which mode matched. One miss isn't a signal to switch tools.
 
 ### Verbs
 
 ```
 graphify navigate "@<symbol>"                       # focus + frontier (~200 tok)
 graphify navigate "@<symbol>" methods 6 in          # chain: focus, list methods, pick 6th, show callers
-graphify peek "<symbol>"                            # one-shot body dump, no cursor
+graphify peek "<symbol>"                            # one-shot body dump, no cursor (brace-expand: @C.{m1,m2,m3})
 graphify shape "<file>" [<file> ...]                # N classes / M fns / longest fn (multi-target + brace-expand `{a,b}.py`)
-graphify search "<pattern>"                         # body-text grep, hits attributed to symbol
+graphify summarize "@<Class>"                       # sig + methods + cross-file callers + inheritance — one call instead of read_file on a huge class
+graphify blast "<symbol>"                           # callers + callees side-by-side, cursor-free (brace-expand: @C.{m1,m2})
+graphify search "<pattern>"                         # body-text grep, hits attributed to symbol (matches code AND markdown)
 graphify search "<pat>" --files-only                # grep -l analog: one row per file with match count (no per-line snippets)
 graphify search "<pat>" --in-files "<glob>"         # grep -r --include analog: restrict to source_files matching glob
 graphify files "<glob>"                             # list source-file nodes by basename or path glob (find -name analog)
+graphify scripts                                    # files runnable as CLI: `scripts "<glob>"` or `--kind main|tl|sh`
 graphify locate <s1> <s2> ...                       # multi-symbol file:line, no body
-graphify blast "<symbol>"                           # callers + callees side-by-side, cursor-free
-graphify doc "<symbol>"                             # signature + docstring/rationale dump
+graphify doc "<symbol>"                             # signature + docstring/rationale dump (brace-expand: @C.{m1,m2})
 graphify path "A" "B"                               # reachability between two nodes (~50 tok)
 graphify explain "<symbol>"                         # one-shot summary of one node (~350 tok)
 graphify diff old.json new.json                     # what changed: added/removed nodes/edges
@@ -58,7 +70,11 @@ graphify changed [git-ref]                          # files added/modified since
 | `--show-session <id>` | peek a saved session's frontier without mutating it (great for parallel exploration) |
 | `--limit N` | raise per-listing cap from 25 |
 
-Per-id cursor files mean parallel calls don't race. The session id only prints when chaining is in flight (chain paused at disambig, `--session` was passed, or cursor walked >1 step) — pass it via `--session <id>` to resume.
+### Sessions and the cursor
+
+`navigate` is cursor-based — chains compose left-to-right (`navigate "@X" methods 6 in` is 4 ops in one call; the cursor walks each step). A `session: <id>` line appears at the bottom **only when chaining is live** — cursor walked >1 step, chain paused on a disambig, or `--session` was passed. Resume with `--session <id>`. One-shot focus calls stay quiet. Cursor files live at `graphify-out/.navigate/<id>.json` (per-id, so parallel calls don't race); swept after 30 min.
+
+Sibling verbs (`peek` / `blast` / `summarize` / `shape` / `search` / `locate` / `doc`) are **cursor-free by design** — no session, no side effects. Use them when you want a one-shot answer without committing to a chain.
 
 ### Dispatching sub-agents (Agent / Explore / Plan)
 
@@ -70,10 +86,14 @@ When you dispatch a sub-agent in this directory, paste this into the prompt:
 > - Where is X defined? → `graphify locate X` (multi-symbol: `locate X Y Z`)
 > - What's in this file? → `graphify shape <file>` (multi: `shape f1.py f2.py`)
 > - Which files match a pattern? → `graphify files "<glob>"` (e.g. `*test*.py`, `tools/*.py`)
+> - Which files run as CLI scripts? → `graphify scripts` (or `--kind main|tl|sh`)
+> - Tell me about class X → `graphify summarize "@X"`
 > - Who calls X? → `graphify navigate "@X" in --kind=calls`
-> - Who uses X (incl. typed dispatch)? → `graphify navigate "@X" wu`
+> - Who uses X (incl. typed dispatch + doc mentions)? → `graphify navigate "@X" wu`
 > - What strings match? → `graphify search "<pat>"` — add `--idents` for cross-casing, `--files-only` for grep-l, `--in-files "<glob>"` for grep-r --include
 > - What's in this directory? → `graphify navigate "@<dir>/"` (trailing slash matters)
+>
+> **graphify indexes `.md`/`.mdx` too**, not just code. `wu` surfaces doc mentions; `search` matches markdown bodies.
 >
 > **Don't bail after one empty graphify call.** Empty `search` is usually a regex/casing miss — try `shape <file>` or `navigate "@<best-guess-symbol>"` before falling back to grep. graphify is 50–500x cheaper than chained find/grep when the question is about source-code structure.
 
