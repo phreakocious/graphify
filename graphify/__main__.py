@@ -1803,9 +1803,10 @@ def main() -> None:
         for skill_dst in {Path.home() / cfg["skill_dst"] for cfg in _PLATFORM_CONFIG.values()}:
             _check_skill_version(skill_dst)
 
-    # `graphify --version` / `-V` — standard CLI convention. Without this,
-    # `--version` falls through to "unknown command".
-    if len(sys.argv) >= 2 and sys.argv[1] in ("--version", "-V"):
+    # `graphify --version` / `-v` / `-V` / `version` — standard CLI convention.
+    # Without this, `--version` falls through to "unknown command".
+    # Both `-v` (upstream #818) and `-V` (navigator) accepted.
+    if len(sys.argv) >= 2 and sys.argv[1] in ("--version", "-v", "-V", "version"):
         print(f"graphify {__version__}")
         return
 
@@ -1952,6 +1953,23 @@ def main() -> None:
         return
 
     cmd = sys.argv[1]
+
+    # Universal help guard (upstream #821): -h/--help/-? anywhere after the
+    # command shows help and stops — prevents flags from silently triggering
+    # destructive subcommands (e.g. "cursor install --help" was silently
+    # installing into Cursor). Exempt verbs that own their --help via
+    # _HELP_BLOCKS (the per-subcommand help block at line 1815 handles the
+    # `<verb> --help` shape) and free-text commands (the user string may
+    # contain --help-like tokens). Install commands (install/claude/cursor
+    # /vscode/...) are NOT exempt — that's the bug this guard fixes.
+    _HELP_GUARD_EXEMPT = (
+        set(_HELP_BLOCKS.keys())
+        | {"nav", "query", "save-result", "hook"}
+    )
+    if cmd not in _HELP_GUARD_EXEMPT and any(a in {"-h", "--help", "-?"} for a in sys.argv[2:]):
+        print(f"Run 'graphify --help' for full usage.")
+        return
+
     if cmd == "_hook":
         # PreToolUse hook handler — delegate to a testable function so
         # the gating logic can be unit-tested without a subprocess.
