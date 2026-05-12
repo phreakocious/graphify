@@ -2,6 +2,8 @@
 from __future__ import annotations
 import networkx as nx
 
+from graphify.build import edge_data
+
 
 def _node_community_map(communities: dict[int, list[str]]) -> dict[str, int]:
     """Invert communities dict: node_id -> community_id."""
@@ -294,7 +296,7 @@ def _cross_community_surprises(
         top_edges = sorted(betweenness.items(), key=lambda x: x[1], reverse=True)[:top_n]
         result = []
         for (u, v), score in top_edges:
-            data = G.edges[u, v]
+            data = edge_data(G, u, v)
             result.append({
                 "source": G.nodes[u].get("label", u),
                 "target": G.nodes[v].get("label", v),

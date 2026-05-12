@@ -42,6 +42,28 @@ def _normalize_id(s: str) -> str:
     return cleaned.strip("_").casefold()
 
 
+def edge_data(G: nx.Graph, u: str, v: str) -> dict:
+    """Return one edge attribute dict for (u, v), tolerating MultiGraph.
+
+    For MultiGraph/MultiDiGraph there can be multiple parallel edges; this
+    returns the first one (sufficient for callers that only need
+    relation/confidence for rendering). Replaces bare `G.edges[u, v]` access
+    which raises MultiGraphError on multi-edge graphs (upstream #796).
+    """
+    raw = G[u][v]
+    if isinstance(G, (nx.MultiGraph, nx.MultiDiGraph)):
+        return next(iter(raw.values()), {})
+    return raw
+
+
+def edge_datas(G: nx.Graph, u: str, v: str) -> list[dict]:
+    """Return every edge attribute dict for (u, v); always a list."""
+    raw = G[u][v]
+    if isinstance(G, (nx.MultiGraph, nx.MultiDiGraph)):
+        return list(raw.values())
+    return [raw]
+
+
 def build_from_json(extraction: dict, *, directed: bool = False) -> nx.Graph:
     """Build a NetworkX graph from an extraction dict.
 

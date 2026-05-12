@@ -20,6 +20,8 @@ from pathlib import Path
 
 import networkx as nx
 
+from graphify.build import edge_data
+
 
 # --- caches ----------------------------------------------------------------
 
@@ -709,7 +711,7 @@ def resolve_focus(G: nx.DiGraph, idx: dict[str, list[str]],
                 method_hits: list[str] = []
                 for cls_nid in cls_matches:
                     for v in G.successors(cls_nid):
-                        e = G.edges[cls_nid, v]
+                        e = edge_data(G, cls_nid, v)
                         rel = e.get("relation") or ""
                         if rel not in ("method", "contains"):
                             continue

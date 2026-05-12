@@ -2318,7 +2318,7 @@ def main() -> None:
         # directionally tagged), which broke `resolve_focus`'s lap-20c
         # dotted Class.method walk via `G.successors` — undirected
         # Graphs don't have that method.
-        from graphify.build import build_from_json
+        from graphify.build import build_from_json, edge_data
         G = build_from_json(_raw, directed=True)
         # Filter the graph to EXTRACTED edges by default — INFERRED edges
         # produce string-match shortcuts (path through a docstring fragment
@@ -2422,7 +2422,7 @@ def main() -> None:
             # path" and fall through to the descriptive fallback. Without
             # this, a type_ref-only chain reports as a real path.
             via_blocked = blocked and any(
-                G.edges[path_nodes[i], path_nodes[i + 1]].get("relation") in blocked
+                edge_data(G, path_nodes[i], path_nodes[i + 1]).get("relation") in blocked
                 for i in range(len(path_nodes) - 1)
             )
             if via_blocked:
@@ -2437,7 +2437,7 @@ def main() -> None:
                     )
                 try:
                     via = _nx.shortest_path(G, src_nid, tgt_nid, weight="_path_weight")
-                    rels = [G.edges[via[i], via[i + 1]].get("relation", "")
+                    rels = [edge_data(G, via[i], via[i + 1]).get("relation", "")
                             for i in range(len(via) - 1)]
                     blocked_rels = {r for r in rels if r in blocked}
                     if blocked_rels & FILE_RELS:
@@ -2462,7 +2462,7 @@ def main() -> None:
         segments = []
         for i in range(len(path_nodes) - 1):
             u, v = path_nodes[i], path_nodes[i + 1]
-            edata = G.edges[u, v]
+            edata = edge_data(G, u, v)
             rel = edata.get("relation", "")
             relations.append(rel)
             conf = edata.get("confidence", "")
@@ -2544,7 +2544,7 @@ def main() -> None:
             print(f"error: graph file not found: {gp}", file=sys.stderr)
             sys.exit(1)
         _raw = json.loads(gp.read_text(encoding="utf-8"))
-        from graphify.build import build_from_json
+        from graphify.build import build_from_json, edge_data
         # Lap-21: build_from_json restores edge direction from _src/_tgt
         # — see the path-cmd comment for why node_link_graph isn't safe.
         G = build_from_json(_raw, directed=True)
@@ -2585,7 +2585,7 @@ def main() -> None:
             DG = G if G.is_directed() else None
             outgoing = []
             for nb in G.neighbors(nid):
-                e = G.edges[nid, nb]
+                e = edge_data(G, nid, nb)
                 if not include_inferred and e.get("confidence") != "EXTRACTED":
                     continue
                 outgoing.append((nb, e))
@@ -2628,12 +2628,12 @@ def main() -> None:
         # EXTRACTED-first so the trustworthy edges aren't buried under
         # bulk-tagged INFERRED noise.
         def _edge_sort_key(nb):
-            e = G.edges[nid, nb]
+            e = edge_data(G, nid, nb)
             ext = 0 if e.get("confidence") == "EXTRACTED" else 1
             return (ext, -G.degree(nb))
         neighbors_filtered = [
             nb for nb in neighbors
-            if include_inferred or G.edges[nid, nb].get("confidence") == "EXTRACTED"
+            if include_inferred or edge_data(G, nid, nb).get("confidence") == "EXTRACTED"
         ]
         dropped = len(neighbors) - len(neighbors_filtered)
         if neighbors_filtered:
@@ -2651,7 +2651,7 @@ def main() -> None:
             # nodes.
             from graphify.navigate import _DUPE_COLLAPSE_THRESHOLD
             def _row(nb):
-                e = G.edges[nid, nb]
+                e = edge_data(G, nid, nb)
                 return (G.nodes[nb].get("label", nb),
                         e.get("relation", ""), e.get("confidence", ""))
             collapsed_rows: list[tuple[str, str, str, int]] = []
@@ -2713,6 +2713,7 @@ def main() -> None:
             _print_subcmd_help("summarize")
             return
         from graphify.navigate import DEFAULT_GRAPH_PATH, load_graph, _read_body_full
+        from graphify.build import edge_data
         from collections import Counter as _Counter
         graph_path = DEFAULT_GRAPH_PATH
         target: str | None = None
@@ -2857,7 +2858,7 @@ def main() -> None:
             # sorted by start line so output reads top-to-bottom.
             method_ids: list[str] = []
             for v in G.successors(chosen):
-                rel = G.edges[chosen, v].get("relation") or ""
+                rel = edge_data(G, chosen, v).get("relation") or ""
                 if rel not in ("method", "contains"):
                     continue
                 v_kind = G.nodes[v].get("node_kind") or ""
@@ -2898,7 +2899,7 @@ def main() -> None:
             caller_rows: list[tuple[str, str, str, int]] = []
             seen_callers: set[str] = set()
             for u in G.predecessors(chosen):
-                rel = G.edges[u, chosen].get("relation") or ""
+                rel = edge_data(G, u, chosen).get("relation") or ""
                 if rel in _STRUCTURAL:
                     continue
                 u_attrs = G.nodes[u]
@@ -2923,15 +2924,15 @@ def main() -> None:
             # pred edges with relation==inherits → children. Siblings = other
             # children of the same parent (excluding self), capped.
             parent_ids = [v for v in G.successors(chosen)
-                          if G.edges[chosen, v].get("relation") == "inherits"]
+                          if edge_data(G, chosen, v).get("relation") == "inherits"]
             child_ids = [u for u in G.predecessors(chosen)
-                         if G.edges[u, chosen].get("relation") == "inherits"]
+                         if edge_data(G, u, chosen).get("relation") == "inherits"]
             sibling_labels: list[str] = []
             for pid in parent_ids:
                 for u in G.predecessors(pid):
                     if u == chosen:
                         continue
-                    if G.edges[u, pid].get("relation") != "inherits":
+                    if edge_data(G, u, pid).get("relation") != "inherits":
                         continue
                     s_label = G.nodes[u].get("label", u)
                     if s_label not in sibling_labels:
@@ -3122,7 +3123,7 @@ def main() -> None:
                 ufile = G.nodes[u].get("source_file") or ""
                 if not ufile or ufile == sf:
                     continue
-                if G.edges[u, nid].get("relation") in _STRUCTURAL:
+                if edge_data(G, u, nid).get("relation") in _STRUCTURAL:
                     continue
                 ext_in += 1
             if ext_in > 0:
@@ -3502,6 +3503,7 @@ def main() -> None:
         )
         from graphify.resolve import label_index, resolve_focus
         from graphify.analyze import _is_file_node
+        from graphify.build import edge_data
         args = sys.argv[2:]
         graph_path = DEFAULT_GRAPH_PATH
         max_lines = 200
@@ -3651,7 +3653,7 @@ def main() -> None:
                 # bottom in source order — matches an agent reading the file.
                 method_ids: list[str] = []
                 for v in G.successors(chosen):
-                    rel = G.edges[chosen, v].get("relation") or ""
+                    rel = edge_data(G, chosen, v).get("relation") or ""
                     if rel not in ("method", "contains"):
                         continue
                     v_kind = G.nodes[v].get("node_kind") or ""
